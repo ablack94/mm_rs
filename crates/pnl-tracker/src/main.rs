@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
     };
 
     tracing::info!(url = ws_url, "Connecting to proxy WS for execution feed...");
-    let mut ws = WsConnection::connect(&ws_url).await?;
+    let mut ws = WsConnection::connect_with_token(&ws_url, &args.proxy_token).await?;
 
     // Subscribe to executions with snap_trades for recent history
     let token = proxy_client.get_ws_token().await?;

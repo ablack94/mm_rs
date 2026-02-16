@@ -59,7 +59,11 @@ impl LiveExchange {
             config.exchange.ws_private_url.clone()
         };
         tracing::info!(url = ws_url, "Connecting private WS...");
-        let priv_ws = WsConnection::connect(&ws_url).await?;
+        let priv_ws = if config.exchange.proxy_mode {
+            WsConnection::connect_with_token(&ws_url, &config.exchange.proxy_token).await?
+        } else {
+            WsConnection::connect(&ws_url).await?
+        };
 
         // Split into read/write halves
         let (mut writer, mut reader) = priv_ws.into_split();

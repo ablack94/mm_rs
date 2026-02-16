@@ -502,11 +502,15 @@ impl Engine {
                 qty = %position.qty,
                 min_qty = %min_qty,
                 min_cost = %min_cost,
-                "Cannot liquidate — below exchange minimums. Clearing liquidation state."
+                "Cannot liquidate — below exchange minimums. Removing dust position."
             );
             self.pending_liquidation.remove(symbol);
             self.disabled_pairs.remove(symbol);
             self.liq_retry_count.remove(symbol);
+            // Remove dust position so stop-loss doesn't re-trigger every tick
+            tracing::info!(symbol, qty = %position.qty, "Removing dust position from state");
+            self.state.positions.remove(symbol);
+            cmds.push(EngineCommand::PersistState(self.state.clone()));
             return cmds;
         }
 
@@ -1081,33 +1085,39 @@ impl Engine {
         };
 
         if let Some(ref bid_id) = quoter.bid_cl_ord_id {
-            let acked = self.state.open_orders.get(bid_id).map_or(false, |o| o.acked);
-            if acked {
-                cmds.push(EngineCommand::AmendOrder {
-                    cl_ord_id: bid_id.clone(),
-                    new_price: Some(bid_price),
-                    new_qty: None,
-                });
-                if let Some(order) = self.state.open_orders.get_mut(bid_id) {
-                    order.price = bid_price;
+            if let Some(order) = self.state.open_orders.get(bid_id) {
+                if !order.acked {
+                    tracing::debug!(symbol, cl_ord_id = bid_id.as_str(), "Skipping bid amend — not yet acked");
+                } else if order.price == bid_price {
+                    tracing::debug!(symbol, cl_ord_id = bid_id.as_str(), "Skipping bid amend — price unchanged");
+                } else {
+                    cmds.push(EngineCommand::AmendOrder {
+                        cl_ord_id: bid_id.clone(),
+                        new_price: Some(bid_price),
+                        new_qty: None,
+                    });
+                    if let Some(order) = self.state.open_orders.get_mut(bid_id) {
+                        order.price = bid_price;
+                    }
                 }
-            } else {
-                tracing::debug!(symbol, cl_ord_id = bid_id.as_str(), "Skipping bid amend — not yet acked");
             }
         }
         if let Some(ref ask_id) = quoter.ask_cl_ord_id {
-            let acked = self.state.open_orders.get(ask_id).map_or(false, |o| o.acked);
-            if acked {
-                cmds.push(EngineCommand::AmendOrder {
-                    cl_ord_id: ask_id.clone(),
-                    new_price: Some(ask_price),
-                    new_qty: None,
-                });
-                if let Some(order) = self.state.open_orders.get_mut(ask_id) {
-                    order.price = ask_price;
+            if let Some(order) = self.state.open_orders.get(ask_id) {
+                if !order.acked {
+                    tracing::debug!(symbol, cl_ord_id = ask_id.as_str(), "Skipping ask amend — not yet acked");
+                } else if order.price == ask_price {
+                    tracing::debug!(symbol, cl_ord_id = ask_id.as_str(), "Skipping ask amend — price unchanged");
+                } else {
+                    cmds.push(EngineCommand::AmendOrder {
+                        cl_ord_id: ask_id.clone(),
+                        new_price: Some(ask_price),
+                        new_qty: None,
+                    });
+                    if let Some(order) = self.state.open_orders.get_mut(ask_id) {
+                        order.price = ask_price;
+                    }
                 }
-            } else {
-                tracing::debug!(symbol, cl_ord_id = ask_id.as_str(), "Skipping ask amend — not yet acked");
             }
         }
 

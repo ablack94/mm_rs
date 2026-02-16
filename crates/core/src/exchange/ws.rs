@@ -3,6 +3,7 @@ use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use crate::exchange::messages::*;
 use crate::types::*;
 
@@ -27,6 +28,19 @@ pub struct WsReader {
 impl WsConnection {
     pub async fn connect(url: &str) -> Result<Self> {
         let (ws, _) = connect_async(url).await?;
+        let (write, read) = ws.split();
+        Ok(Self { write, read })
+    }
+
+    /// Connect with a bearer token passed via Authorization header.
+    /// Used for proxy mode where the WS endpoint requires auth.
+    pub async fn connect_with_token(url: &str, token: &str) -> Result<Self> {
+        let mut request = url.into_client_request()?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", token).parse()?,
+        );
+        let (ws, _) = connect_async(request).await?;
         let (write, read) = ws.split();
         Ok(Self { write, read })
     }
