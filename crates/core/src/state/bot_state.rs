@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::types::{OrderSide, Position};
 
 /// An order the engine is tracking.
@@ -30,6 +30,12 @@ pub struct BotState {
     pub started_at: DateTime<Utc>,
     #[serde(default)]
     pub paused: bool,
+    /// Pairs on post-liquidation cooldown: symbol → cooldown expiry time.
+    #[serde(default)]
+    pub cooldown_until: HashMap<String, DateTime<Utc>>,
+    /// Pairs explicitly disabled (via API or liquidation).
+    #[serde(default)]
+    pub disabled_pairs: HashSet<String>,
 }
 
 impl BotState {

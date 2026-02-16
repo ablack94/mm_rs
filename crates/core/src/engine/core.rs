@@ -35,6 +35,7 @@ pub struct Engine {
     sell_only_pairs: HashSet<String>,
     pending_liquidation: HashSet<String>,
     liq_retry_count: HashMap<String, u32>,
+    cooldown_until: HashMap<String, DateTime<Utc>>,
     cl_ord_counter: u64,
     last_dms_refresh: Option<DateTime<Utc>>,
 }
@@ -50,6 +51,15 @@ impl Engine {
             .map(|s| (s.clone(), Quoter::new(s.clone())))
             .collect();
         let rate_limiter = RateLimiter::new(&config.risk);
+        // Restore persisted disabled pairs and cooldowns
+        let disabled_pairs = state.disabled_pairs.clone();
+        let cooldown_until = state.cooldown_until.clone();
+        if !disabled_pairs.is_empty() {
+            tracing::info!(pairs = ?disabled_pairs, "Restored disabled pairs from state");
+        }
+        if !cooldown_until.is_empty() {
+            tracing::info!(cooldowns = ?cooldown_until, "Restored cooldowns from state");
+        }
         Self {
             config,
             books: HashMap::new(),
@@ -59,10 +69,11 @@ impl Engine {
             kill_switch: KillSwitch::default(),
             rate_limiter,
             prices: HashMap::new(),
-            disabled_pairs: HashSet::new(),
+            disabled_pairs,
             sell_only_pairs: HashSet::new(),
             pending_liquidation: HashSet::new(),
             liq_retry_count: HashMap::new(),
+            cooldown_until,
             cl_ord_counter: 0,
             last_dms_refresh: None,
         }
@@ -134,6 +145,7 @@ impl Engine {
                 if reason.contains("restricted") || reason.contains("Invalid permissions") {
                     tracing::warn!(symbol = sym, reason, "Pair restricted — disabling permanently");
                     self.disabled_pairs.insert(sym.clone());
+                    self.state.disabled_pairs.insert(sym.clone());
                     // Cancel any remaining orders for this pair
                     let mut cmds = self.cancel_pair_quotes(&sym);
                     cmds.extend(self.on_order_cancelled(&cl_ord_id, &sym));
@@ -221,6 +233,55 @@ impl Engine {
             ApiAction::Liquidate { symbol } => {
                 tracing::info!(symbol, "API: Liquidate position");
                 self.on_liquidate(&symbol)
+            }
+            ApiAction::DisablePair { symbol } => {
+                tracing::info!(symbol, "API: Disable pair");
+                self.disabled_pairs.insert(symbol.clone());
+                self.state.disabled_pairs.insert(symbol.clone());
+                let mut cmds = self.cancel_pair_quotes(&symbol);
+                cmds.push(EngineCommand::PersistState(self.state.clone()));
+                cmds
+            }
+            ApiAction::EnablePair { symbol } => {
+                tracing::info!(symbol, "API: Enable pair (manual override)");
+                self.disabled_pairs.remove(&symbol);
+                self.cooldown_until.remove(&symbol);
+                self.state.disabled_pairs.remove(&symbol);
+                self.state.cooldown_until.remove(&symbol);
+                vec![EngineCommand::PersistState(self.state.clone())]
+            }
+            ApiAction::AddPair { symbol } => {
+                tracing::info!(symbol, "API: Add pair");
+                if self.quoters.contains_key(&symbol) {
+                    tracing::warn!(symbol, "Pair already exists");
+                    return vec![];
+                }
+                // Create quoter — pair_info must be fetched externally and
+                // provided via a FetchPairInfo command. For now we just
+                // register the quoter; the bot's run loop should call
+                // exchange.get_asset_pairs() and feed pair_info before quoting.
+                self.quoters.insert(symbol.clone(), Quoter::new(symbol.clone()));
+                // Remove from disabled if it was previously disabled
+                self.disabled_pairs.remove(&symbol);
+                self.cooldown_until.remove(&symbol);
+                self.state.disabled_pairs.remove(&symbol);
+                self.state.cooldown_until.remove(&symbol);
+                vec![EngineCommand::PersistState(self.state.clone())]
+            }
+            ApiAction::RemovePair { symbol } => {
+                tracing::info!(symbol, "API: Remove pair — liquidating and disabling");
+                let mut cmds = vec![];
+                // If position exists, liquidate first
+                if !self.state.position(&symbol).is_empty() {
+                    cmds.extend(self.on_liquidate(&symbol));
+                } else {
+                    // No position — just disable and cancel orders
+                    self.disabled_pairs.insert(symbol.clone());
+                    self.state.disabled_pairs.insert(symbol.clone());
+                    cmds.extend(self.cancel_pair_quotes(&symbol));
+                }
+                cmds.push(EngineCommand::PersistState(self.state.clone()));
+                cmds
             }
         }
     }
@@ -336,11 +397,21 @@ impl Engine {
                 self.state.trade_count += 1;
                 if pos.is_empty() {
                     self.state.positions.remove(&fill.symbol);
-                    // Liquidation complete — allow pair to resume normal quoting
+                    // Liquidation complete — put pair on cooldown
                     if self.pending_liquidation.remove(&fill.symbol) {
-                        self.disabled_pairs.remove(&fill.symbol);
                         self.liq_retry_count.remove(&fill.symbol);
-                        tracing::info!(symbol = fill.symbol, "Liquidation complete — pair re-enabled");
+                        let cooldown_secs = self.config.risk.cooldown_after_liquidation_secs;
+                        let until = Utc::now() + chrono::Duration::seconds(cooldown_secs as i64);
+                        self.cooldown_until.insert(fill.symbol.clone(), until);
+                        // Keep pair in disabled_pairs — cooldown expiry will remove it
+                        self.state.cooldown_until.insert(fill.symbol.clone(), until);
+                        self.state.disabled_pairs.insert(fill.symbol.clone());
+                        tracing::info!(
+                            symbol = fill.symbol,
+                            cooldown_secs,
+                            until = %until.format("%H:%M:%S UTC"),
+                            "Liquidation complete — pair on cooldown"
+                        );
                     }
                 }
                 tracing::info!(pnl = %pnl, cumulative = %self.state.realized_pnl, "Round-trip P&L");
@@ -444,6 +515,7 @@ impl Engine {
         // Mark pair as pending liquidation and disabled (no new quoting)
         self.pending_liquidation.insert(symbol.to_string());
         self.disabled_pairs.insert(symbol.to_string());
+        self.state.disabled_pairs.insert(symbol.to_string());
         self.liq_retry_count.insert(symbol.to_string(), 0);
 
         cmds
@@ -476,6 +548,7 @@ impl Engine {
             tracing::info!(symbol, "Liquidation: position already empty — clearing state");
             self.pending_liquidation.remove(symbol);
             self.disabled_pairs.remove(symbol);
+            self.state.disabled_pairs.remove(symbol);
             self.liq_retry_count.remove(symbol);
             return cmds;
         }
@@ -506,6 +579,7 @@ impl Engine {
             );
             self.pending_liquidation.remove(symbol);
             self.disabled_pairs.remove(symbol);
+            self.state.disabled_pairs.remove(symbol);
             self.liq_retry_count.remove(symbol);
             // Remove dust position so stop-loss doesn't re-trigger every tick
             tracing::info!(symbol, qty = %position.qty, "Removing dust position from state");
@@ -591,6 +665,20 @@ impl Engine {
 
     fn on_tick(&mut self, timestamp: DateTime<Utc>) -> Vec<EngineCommand> {
         let mut cmds = vec![];
+
+        // Check for expired cooldowns — re-enable pairs whose cooldown has passed
+        let expired: Vec<String> = self.cooldown_until.iter()
+            .filter(|(_, &until)| timestamp >= until)
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+        for symbol in expired {
+            self.cooldown_until.remove(&symbol);
+            self.disabled_pairs.remove(&symbol);
+            self.state.cooldown_until.remove(&symbol);
+            self.state.disabled_pairs.remove(&symbol);
+            tracing::info!(symbol, "Cooldown expired — pair re-enabled");
+            cmds.push(EngineCommand::PersistState(self.state.clone()));
+        }
 
         // Liquidation phase 2: for pairs pending liquidation, check order state.
         // - If a liq order is already pending → wait for fill/rejection
@@ -1508,5 +1596,123 @@ mod tests {
             })
             .collect();
         assert!(sell_orders3.is_empty(), "Should NOT re-send while liq order pending");
+    }
+
+    #[test]
+    fn test_post_liquidation_cooldown() {
+        let mut cfg = test_config();
+        cfg.risk.stop_loss_pct = dec!(0.03);
+        cfg.risk.cooldown_after_liquidation_secs = 60; // 60s cooldown
+
+        let mut state = BotState::default();
+        state.positions.insert("TEST/USD".into(), Position {
+            qty: dec!(100),
+            avg_cost: dec!(0.10),
+        });
+
+        let mut engine = Engine::new(cfg, test_pair_info(), state);
+
+        // Set up book
+        engine.handle_event(EngineEvent::BookSnapshot {
+            symbol: "TEST/USD".into(),
+            bids: vec![LevelUpdate { price: dec!(0.095), qty: dec!(1000) }],
+            asks: vec![LevelUpdate { price: dec!(0.097), qty: dec!(1000) }],
+            timestamp: Utc::now(),
+        });
+
+        // Phase 1: trigger stop-loss
+        engine.handle_event(EngineEvent::Tick { timestamp: Utc::now() });
+        // Phase 2: send market sell
+        engine.handle_event(EngineEvent::Tick { timestamp: Utc::now() });
+        // Simulate fill — position goes to zero
+        engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "liq-fill".into(),
+            cl_ord_id: "liq-1".into(),
+            symbol: "TEST/USD".into(),
+            side: OrderSide::Sell,
+            price: dec!(0.095),
+            qty: dec!(100),
+            fee: dec!(0.02),
+            is_maker: false,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+
+        // Pair should be on cooldown, NOT re-enabled
+        assert!(engine.disabled_pairs.contains("TEST/USD"), "Pair should remain disabled during cooldown");
+        assert!(engine.cooldown_until.contains_key("TEST/USD"), "Pair should have a cooldown entry");
+        assert!(engine.state.disabled_pairs.contains("TEST/USD"), "Persisted state should show disabled");
+        assert!(engine.state.cooldown_until.contains_key("TEST/USD"), "Persisted state should show cooldown");
+
+        // Tick before cooldown expires — should stay disabled
+        let before_expiry = Utc::now() + chrono::Duration::seconds(30);
+        engine.handle_event(EngineEvent::Tick { timestamp: before_expiry });
+        assert!(engine.disabled_pairs.contains("TEST/USD"), "Pair should still be disabled before cooldown expires");
+
+        // Tick after cooldown expires — should be re-enabled
+        let after_expiry = Utc::now() + chrono::Duration::seconds(120);
+        engine.handle_event(EngineEvent::Tick { timestamp: after_expiry });
+        assert!(!engine.disabled_pairs.contains("TEST/USD"), "Pair should be re-enabled after cooldown");
+        assert!(!engine.cooldown_until.contains_key("TEST/USD"), "Cooldown entry should be removed");
+    }
+
+    #[test]
+    fn test_api_disable_enable_pair() {
+        let engine_cfg = test_config();
+        let mut engine = Engine::new(engine_cfg, test_pair_info(), BotState::default());
+
+        // Disable a pair via API
+        let cmds = engine.handle_event(EngineEvent::ApiCommand(
+            crate::types::event::ApiAction::DisablePair { symbol: "TEST/USD".into() }
+        ));
+        assert!(engine.disabled_pairs.contains("TEST/USD"));
+        assert!(engine.state.disabled_pairs.contains("TEST/USD"));
+        assert!(cmds.iter().any(|c| matches!(c, EngineCommand::PersistState(_))));
+
+        // Re-enable via API
+        let cmds = engine.handle_event(EngineEvent::ApiCommand(
+            crate::types::event::ApiAction::EnablePair { symbol: "TEST/USD".into() }
+        ));
+        assert!(!engine.disabled_pairs.contains("TEST/USD"));
+        assert!(!engine.state.disabled_pairs.contains("TEST/USD"));
+        assert!(cmds.iter().any(|c| matches!(c, EngineCommand::PersistState(_))));
+    }
+
+    #[test]
+    fn test_api_enable_clears_cooldown() {
+        let mut cfg = test_config();
+        cfg.risk.cooldown_after_liquidation_secs = 3600;
+        let mut engine = Engine::new(cfg, test_pair_info(), BotState::default());
+
+        // Simulate a cooldown being active
+        let until = Utc::now() + chrono::Duration::seconds(3600);
+        engine.cooldown_until.insert("TEST/USD".into(), until);
+        engine.disabled_pairs.insert("TEST/USD".into());
+        engine.state.cooldown_until.insert("TEST/USD".into(), until);
+        engine.state.disabled_pairs.insert("TEST/USD".into());
+
+        // Manual enable should clear cooldown
+        engine.handle_event(EngineEvent::ApiCommand(
+            crate::types::event::ApiAction::EnablePair { symbol: "TEST/USD".into() }
+        ));
+
+        assert!(!engine.disabled_pairs.contains("TEST/USD"));
+        assert!(!engine.cooldown_until.contains_key("TEST/USD"));
+        assert!(!engine.state.disabled_pairs.contains("TEST/USD"));
+        assert!(!engine.state.cooldown_until.contains_key("TEST/USD"));
+    }
+
+    #[test]
+    fn test_persisted_state_restores_disabled_and_cooldowns() {
+        let cfg = test_config();
+        let mut state = BotState::default();
+        let until = Utc::now() + chrono::Duration::seconds(3600);
+        state.disabled_pairs.insert("TEST/USD".into());
+        state.cooldown_until.insert("TEST/USD".into(), until);
+
+        let engine = Engine::new(cfg, test_pair_info(), state);
+
+        assert!(engine.disabled_pairs.contains("TEST/USD"), "Should restore disabled pairs from state");
+        assert!(engine.cooldown_until.contains_key("TEST/USD"), "Should restore cooldowns from state");
     }
 }

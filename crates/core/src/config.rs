@@ -57,6 +57,13 @@ pub struct RiskConfig {
     pub stop_loss_pct: Decimal,
     /// Take-profit threshold: liquidate if price rises this far above avg_cost.
     pub take_profit_pct: Decimal,
+    /// Seconds to keep a pair disabled after liquidation before re-enabling.
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_after_liquidation_secs: u64,
+}
+
+fn default_cooldown_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +107,7 @@ impl Default for Config {
                 rate_limit_max_counter: 60,
                 stop_loss_pct: dec!(0.03),
                 take_profit_pct: dec!(0.10), // 10% — liquidate on insane profit
+                cooldown_after_liquidation_secs: 3600,
             },
             persistence: PersistenceConfig {
                 state_file: "state.json".into(),

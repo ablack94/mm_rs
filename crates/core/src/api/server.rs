@@ -45,6 +45,11 @@ pub fn build_router(shared: Arc<SharedState>, api_token: String) -> Router {
         .route("/api/resume", post(resume))
         .route("/api/shutdown", post(shutdown))
         .route("/api/liquidate/{symbol}", post(liquidate))
+        .route("/api/pairs/{symbol}/disable", post(disable_pair))
+        .route("/api/pairs/{symbol}/enable", post(enable_pair))
+        .route("/api/pairs/{symbol}/add", post(add_pair))
+        .route("/api/pairs/{symbol}/remove", post(remove_pair))
+        .route("/api/pairs/status", get(get_pair_status))
         .with_state((shared, token))
 }
 
@@ -224,4 +229,96 @@ async fn liquidate(
     // URL-decode: convert CAMP_USD to CAMP/USD
     let symbol = symbol.replace('_', "/");
     send_api_action(&shared, ApiAction::Liquidate { symbol }).await
+}
+
+async fn disable_pair(
+    headers: HeaderMap,
+    State((shared, token)): State<AuthState>,
+    Path(symbol): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    require_auth!(headers, token);
+    let symbol = symbol.replace('_', "/");
+    send_api_action(&shared, ApiAction::DisablePair { symbol }).await
+}
+
+async fn enable_pair(
+    headers: HeaderMap,
+    State((shared, token)): State<AuthState>,
+    Path(symbol): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    require_auth!(headers, token);
+    let symbol = symbol.replace('_', "/");
+    send_api_action(&shared, ApiAction::EnablePair { symbol }).await
+}
+
+async fn add_pair(
+    headers: HeaderMap,
+    State((shared, token)): State<AuthState>,
+    Path(symbol): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    require_auth!(headers, token);
+    let symbol = symbol.replace('_', "/");
+    send_api_action(&shared, ApiAction::AddPair { symbol }).await
+}
+
+async fn remove_pair(
+    headers: HeaderMap,
+    State((shared, token)): State<AuthState>,
+    Path(symbol): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    require_auth!(headers, token);
+    let symbol = symbol.replace('_', "/");
+    send_api_action(&shared, ApiAction::RemovePair { symbol }).await
+}
+
+async fn get_pair_status(
+    headers: HeaderMap,
+    State((shared, token)): State<AuthState>,
+) -> (StatusCode, Json<Value>) {
+    require_auth!(headers, token);
+    let state = shared.bot_state.read().await;
+    let config = &shared.config;
+
+    let mut pairs = json!({});
+    let pairs_map = pairs.as_object_mut().unwrap();
+
+    for symbol in &config.trading.pairs {
+        let disabled = state.disabled_pairs.contains(symbol);
+        let cooldown = state.cooldown_until.get(symbol);
+        let has_position = state.positions.contains_key(symbol);
+
+        let status = if let Some(until) = cooldown {
+            format!("cooldown_until:{}", until.format("%H:%M:%S UTC"))
+        } else if disabled {
+            "disabled".to_string()
+        } else if state.paused {
+            "sell_only".to_string()
+        } else {
+            "active".to_string()
+        };
+
+        pairs_map.insert(symbol.clone(), json!({
+            "status": status,
+            "disabled": disabled,
+            "cooldown_until": cooldown.map(|t| t.to_rfc3339()),
+            "has_position": has_position,
+            "position": state.positions.get(symbol),
+        }));
+    }
+
+    // Also include any disabled pairs not in config (e.g. removed at runtime)
+    for symbol in &state.disabled_pairs {
+        if !pairs_map.contains_key(symbol) {
+            let cooldown = state.cooldown_until.get(symbol);
+            pairs_map.insert(symbol.clone(), json!({
+                "status": "disabled",
+                "disabled": true,
+                "cooldown_until": cooldown.map(|t| t.to_rfc3339()),
+                "has_position": state.positions.contains_key(symbol),
+                "position": state.positions.get(symbol),
+            }));
+        }
+    }
+
+    (StatusCode::OK, Json(json!({ "pairs": pairs })))
 }

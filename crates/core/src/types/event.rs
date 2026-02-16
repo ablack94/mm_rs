@@ -56,4 +56,12 @@ pub enum ApiAction {
     Resume,
     Shutdown,
     Liquidate { symbol: String },
+    /// Disable a pair: cancel its orders, stop quoting.
+    DisablePair { symbol: String },
+    /// Re-enable a disabled pair (clears cooldown too).
+    EnablePair { symbol: String },
+    /// Add a new pair at runtime.
+    AddPair { symbol: String },
+    /// Remove a pair: liquidate position + permanently disable.
+    RemovePair { symbol: String },
 }
