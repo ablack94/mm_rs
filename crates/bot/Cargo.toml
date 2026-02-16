@@ -1,0 +1,20 @@
+[package]
+name = "kraken-mm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kraken-mm"
+path = "src/main.rs"
+
+[dependencies]
+kraken-core = { path = "../core" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = "1"
+axum = "0.8"

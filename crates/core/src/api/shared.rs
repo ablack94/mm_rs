@@ -3,6 +3,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::config::Config;
 use crate::state::bot_state::BotState;
+use crate::traits::ExchangeClient;
 use crate::types::EngineEvent;
 
 pub struct SharedState {
@@ -10,4 +11,5 @@ pub struct SharedState {
     pub config: Arc<Config>,
     pub event_tx: mpsc::Sender<EngineEvent>,
     pub trade_log_path: String,
+    pub exchange: Arc<dyn ExchangeClient>,
 }

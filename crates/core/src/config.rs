@@ -18,6 +18,15 @@ pub struct ExchangeConfig {
     pub ws_private_url: String,
     pub rest_base_url: String,
     pub book_depth: u32,
+    /// Run through a proxy instead of connecting directly to Kraken.
+    #[serde(default)]
+    pub proxy_mode: bool,
+    /// Base URL of the proxy (e.g., "http://proxy:8080").
+    #[serde(default)]
+    pub proxy_url: String,
+    /// Bearer token for authenticating with the proxy.
+    #[serde(default)]
+    pub proxy_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +75,9 @@ impl Default for Config {
                 ws_private_url: "wss://ws-auth.kraken.com/v2".into(),
                 rest_base_url: "https://api.kraken.com".into(),
                 book_depth: 10,
+                proxy_mode: false,
+                proxy_url: String::new(),
+                proxy_token: String::new(),
             },
             trading: TradingConfig {
                 pairs: vec![],

@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tokio::time::{Duration, Instant};
 
-use kraken_mm::exchange::ws::*;
+use kraken_core::exchange::ws::*;
 
 
 #[derive(Parser)]

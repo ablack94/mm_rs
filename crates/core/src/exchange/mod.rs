@@ -4,3 +4,4 @@ pub mod ws;
 pub mod messages;
 pub mod live;
 pub mod replay;
+pub mod proxy_client;

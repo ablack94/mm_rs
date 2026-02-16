@@ -149,15 +149,8 @@ async fn get_ticker(
     Path(pair): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     require_auth!(headers, token);
-    let url = format!(
-        "{}/0/public/Ticker?pair={}",
-        shared.config.exchange.rest_base_url, pair
-    );
-    match reqwest::get(&url).await {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(data) => (StatusCode::OK, Json(data)),
-            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))),
-        },
+    match shared.exchange.get_ticker_raw(&pair).await {
+        Ok(data) => (StatusCode::OK, Json(data)),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))),
     }
 }
@@ -168,15 +161,8 @@ async fn get_ohlc(
     Path(pair): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     require_auth!(headers, token);
-    let url = format!(
-        "{}/0/public/OHLC?pair={}&interval=60",
-        shared.config.exchange.rest_base_url, pair
-    );
-    match reqwest::get(&url).await {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(data) => (StatusCode::OK, Json(data)),
-            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))),
-        },
+    match shared.exchange.get_ohlc_raw(&pair).await {
+        Ok(data) => (StatusCode::OK, Json(data)),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))),
     }
 }

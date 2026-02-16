@@ -9,15 +9,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use tokio::sync::mpsc;
 
-use kraken_mm::config::Config;
-use kraken_mm::engine::core::Engine;
-use kraken_mm::exchange::messages::{parse_ws_message, WsMessage};
-use kraken_mm::exchange::replay::ReplaySource;
-use kraken_mm::state::bot_state::BotState;
-use kraken_mm::traits::EventSource;
-use kraken_mm::types::*;
+use kraken_core::config::Config;
+use kraken_core::engine::core::Engine;
+use kraken_core::exchange::messages::{parse_ws_message, WsMessage};
+use kraken_core::exchange::replay::ReplaySource;
+use kraken_core::state::bot_state::BotState;
+use kraken_core::traits::EventSource;
+use kraken_core::types::*;
 
-const DATA_PATH: &str = "test_data/recorded.jsonl";
+const DATA_PATH: &str = "../../test_data/recorded.jsonl";
 
 fn test_config(pairs: Vec<String>) -> Config {
     let mut cfg = Config::default();

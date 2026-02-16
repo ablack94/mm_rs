@@ -3,17 +3,18 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-use kraken_mm::api::shared::SharedState;
-use kraken_mm::api::server::build_router;
-use kraken_mm::config::Config;
-use kraken_mm::engine::core::Engine;
-use kraken_mm::exchange::live::LiveExchange;
-use kraken_mm::exchange::rest::KrakenRest;
-use kraken_mm::state::bot_state::BotState;
-use kraken_mm::state::csv_logger::CsvTradeLogger;
-use kraken_mm::state::json_store::JsonStateStore;
-use kraken_mm::traits::*;
-use kraken_mm::types::*;
+use kraken_core::api::shared::SharedState;
+use kraken_core::api::server::build_router;
+use kraken_core::config::Config;
+use kraken_core::engine::core::Engine;
+use kraken_core::exchange::live::LiveExchange;
+use kraken_core::exchange::proxy_client::ProxyClient;
+use kraken_core::exchange::rest::KrakenRest;
+use kraken_core::state::bot_state::BotState;
+use kraken_core::state::csv_logger::CsvTradeLogger;
+use kraken_core::state::json_store::JsonStateStore;
+use kraken_core::traits::*;
+use kraken_core::types::*;
 
 #[derive(Parser)]
 #[command(name = "kraken-mm", about = "Kraken low-liquidity market making bot")]
@@ -46,6 +47,9 @@ async fn main() -> Result<()> {
     let mut config = Config::default();
     config.exchange.api_key = std::env::var("KRAKEN_API_KEY").unwrap_or_default();
     config.exchange.api_secret = std::env::var("KRAKEN_API_SECRET").unwrap_or_default();
+    config.exchange.proxy_mode = std::env::var("PROXY_MODE").unwrap_or_default() == "true";
+    config.exchange.proxy_url = std::env::var("PROXY_URL").unwrap_or_default();
+    config.exchange.proxy_token = std::env::var("PROXY_TOKEN").unwrap_or_default();
     config.trading.dry_run = args.dry_run;
 
     if !args.pairs.is_empty() {
@@ -82,16 +86,33 @@ async fn main() -> Result<()> {
     let mode = if config.trading.dry_run { "DRY-RUN" } else { "LIVE" };
     tracing::info!(mode, pairs = ?config.trading.pairs, "Starting Kraken Market Maker");
 
-    if !config.trading.dry_run
+    if !config.trading.dry_run && !config.exchange.proxy_mode
         && (config.exchange.api_key.is_empty() || config.exchange.api_secret.is_empty())
     {
         anyhow::bail!("Set KRAKEN_API_KEY and KRAKEN_API_SECRET environment variables");
     }
 
+    if config.exchange.proxy_mode && config.exchange.proxy_url.is_empty() {
+        anyhow::bail!("PROXY_MODE=true but PROXY_URL is not set");
+    }
+
+    // Build exchange client (direct or proxy)
+    let exchange: Arc<dyn ExchangeClient> = if config.exchange.proxy_mode {
+        tracing::info!(
+            proxy_url = config.exchange.proxy_url,
+            "Using proxy mode"
+        );
+        Arc::new(ProxyClient::new(
+            config.exchange.proxy_url.clone(),
+            config.exchange.proxy_token.clone(),
+        ))
+    } else {
+        Arc::new(KrakenRest::new(config.exchange.clone()))
+    };
+
     // Fetch pair info
     tracing::info!("Fetching pair info...");
-    let rest = KrakenRest::new(config.exchange.clone());
-    let pair_info = rest.get_pair_info(&config.trading.pairs).await?;
+    let pair_info = exchange.get_pair_info(&config.trading.pairs).await?;
 
     for (symbol, info) in &pair_info {
         tracing::info!(
@@ -107,7 +128,7 @@ async fn main() -> Result<()> {
     // Batch ticker filter: single request for all pairs, identify downtrends
     tracing::info!("Fetching 24h ticker data for all pairs...");
     let mut downtrend_pairs = std::collections::HashSet::new();
-    match rest.get_tickers(&pair_info).await {
+    match exchange.get_tickers(&pair_info).await {
         Ok(tickers) => {
             for (symbol, td) in &tickers {
                 if td.change_pct < config.trading.downtrend_threshold_pct {
@@ -161,7 +182,7 @@ async fn main() -> Result<()> {
     // Reconcile positions with actual Kraken balances (live mode only)
     if !config.trading.dry_run && !state.positions.is_empty() {
         tracing::info!("Reconciling state positions with Kraken balances...");
-        match rest.get_balances().await {
+        match exchange.get_balances().await {
             Ok(balances) => {
                 let symbols: Vec<String> = state.positions.keys().cloned().collect();
                 for symbol in symbols {
@@ -266,6 +287,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config.clone()),
         event_tx: event_tx.clone(),
         trade_log_path: config.persistence.trade_log_file.clone(),
+        exchange: exchange.clone(),
     });
 
     // Spawn API server if token is set
@@ -286,7 +308,7 @@ async fn main() -> Result<()> {
     let result = if config.trading.dry_run {
         run_dry(config, engine, event_tx, event_rx, cmd_tx, cmd_rx, store, logger, shared_state.clone()).await
     } else {
-        run_live(config, engine, event_tx, event_rx, cmd_tx, cmd_rx, store, logger, shared_state.clone()).await
+        run_live(config, engine, event_tx, event_rx, cmd_tx, cmd_rx, store, logger, shared_state.clone(), exchange).await
     };
 
     // Clean up API server
@@ -308,8 +330,8 @@ async fn run_dry(
     mut logger: CsvTradeLogger,
     shared: Arc<SharedState>,
 ) -> Result<()> {
-    use kraken_mm::exchange::ws::*;
-    use kraken_mm::exchange::messages::*;
+    use kraken_core::exchange::ws::*;
+    use kraken_core::exchange::messages::*;
     use chrono::Utc;
 
     // Connect public WS for book data
@@ -436,8 +458,9 @@ async fn run_live(
     store: JsonStateStore,
     mut logger: CsvTradeLogger,
     shared: Arc<SharedState>,
+    exchange: Arc<dyn ExchangeClient>,
 ) -> Result<()> {
-    let live = LiveExchange::connect(config.clone(), event_tx.clone()).await?;
+    let live = LiveExchange::connect(config.clone(), event_tx.clone(), exchange).await?;
     let live = std::sync::Arc::new(live);
 
     // Clear any ghost orders from previous sessions (one-time cleanup)

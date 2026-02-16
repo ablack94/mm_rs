@@ -8,9 +8,8 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::config::Config;
 use crate::exchange::messages::*;
-use crate::exchange::rest::KrakenRest;
 use crate::exchange::ws::*;
-use crate::traits::{DeadManSwitch, OrderManager};
+use crate::traits::{DeadManSwitch, ExchangeClient, OrderManager};
 use crate::types::*;
 
 /// A serialized WS write request sent through a channel.
@@ -38,19 +37,29 @@ impl LiveExchange {
     /// Connect to Kraken: opens one private WS connection, splits it into
     /// a write loop (for orders/DMS) and a read loop (for executions/responses).
     /// The read loop sends EngineEvents into `event_tx`.
+    ///
+    /// In proxy mode, connects to the proxy's WS endpoint and uses a placeholder
+    /// token (the proxy injects the real token on the upstream side).
     pub async fn connect(
         config: Config,
         event_tx: mpsc::Sender<EngineEvent>,
+        exchange: Arc<dyn ExchangeClient>,
     ) -> Result<Self> {
-        let rest = KrakenRest::new(config.exchange.clone());
-
-        // Get auth token
+        // Get auth token (proxy mode returns placeholder)
         tracing::info!("Fetching WS auth token...");
-        let token = rest.get_ws_token().await?;
+        let token = exchange.get_ws_token().await?;
 
         // Connect single private WS
-        tracing::info!("Connecting private WS...");
-        let priv_ws = WsConnection::connect(&config.exchange.ws_private_url).await?;
+        let ws_url = if config.exchange.proxy_mode {
+            // In proxy mode, connect to proxy's WS endpoint
+            let base = config.exchange.proxy_url.trim_end_matches('/');
+            let ws_base = base.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
+            format!("{}/ws/private", ws_base)
+        } else {
+            config.exchange.ws_private_url.clone()
+        };
+        tracing::info!(url = ws_url, "Connecting private WS...");
+        let priv_ws = WsConnection::connect(&ws_url).await?;
 
         // Split into read/write halves
         let (mut writer, mut reader) = priv_ws.into_split();

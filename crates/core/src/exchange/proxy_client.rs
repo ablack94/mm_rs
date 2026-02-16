@@ -1,67 +1,75 @@
 use anyhow::{bail, Result};
+use async_trait::async_trait;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use crate::config::ExchangeConfig;
-use crate::exchange::auth::sign_request;
-use crate::types::PairInfo;
 
-pub struct KrakenRest {
-    config: ExchangeConfig,
+use crate::traits::ExchangeClient;
+use crate::types::PairInfo;
+use crate::types::ticker::TickerData;
+
+/// Exchange client that routes requests through the kraken-proxy.
+/// The proxy holds the actual API keys and signs requests.
+pub struct ProxyClient {
+    proxy_base_url: String,
+    proxy_token: String,
     client: reqwest::Client,
 }
 
-impl KrakenRest {
-    pub fn new(config: ExchangeConfig) -> Self {
+impl ProxyClient {
+    pub fn new(proxy_base_url: String, proxy_token: String) -> Self {
         Self {
-            config,
+            proxy_base_url,
+            proxy_token,
             client: reqwest::Client::new(),
         }
     }
 
-    /// Get WebSocket authentication token.
-    pub async fn get_ws_token(&self) -> Result<String> {
-        let urlpath = "/0/private/GetWebSocketsToken";
-        let nonce = millis_nonce();
-        let post_data = format!("nonce={}", nonce);
-        let signature = sign_request(urlpath, &nonce, &post_data, &self.config.api_secret)?;
-
+    /// Send a POST to the proxy, which forwards to Kraken's private API.
+    async fn proxy_post(&self, path: &str, body: &str) -> Result<serde_json::Value> {
         let resp: serde_json::Value = self
             .client
-            .post(format!("{}{}", self.config.rest_base_url, urlpath))
-            .header("API-Key", &self.config.api_key)
-            .header("API-Sign", &signature)
+            .post(format!("{}{}", self.proxy_base_url, path))
+            .header("Authorization", format!("Bearer {}", self.proxy_token))
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(post_data)
+            .body(body.to_string())
             .send()
             .await?
             .json()
             .await?;
-
         check_error(&resp)?;
-        resp["result"]["token"]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("No token in response"))
+        Ok(resp)
     }
 
-    /// Fetch info for all asset pairs and return the ones matching our target symbols.
-    pub async fn get_pair_info(&self, target_symbols: &[String]) -> Result<HashMap<String, PairInfo>> {
+    /// Send a GET to the proxy, which forwards to Kraken's public API.
+    async fn proxy_get(&self, path: &str) -> Result<serde_json::Value> {
         let resp: serde_json::Value = self
             .client
-            .get(format!("{}/0/public/AssetPairs", self.config.rest_base_url))
+            .get(format!("{}{}", self.proxy_base_url, path))
+            .header("Authorization", format!("Bearer {}", self.proxy_token))
             .send()
             .await?
             .json()
             .await?;
+        Ok(resp)
+    }
+}
 
+#[async_trait]
+impl ExchangeClient for ProxyClient {
+    async fn get_ws_token(&self) -> Result<String> {
+        // In proxy mode, the WS proxy handles token injection.
+        // Return a placeholder — the proxy will replace it.
+        Ok("proxy-managed".to_string())
+    }
+
+    async fn get_pair_info(&self, target_symbols: &[String]) -> Result<HashMap<String, PairInfo>> {
+        let resp = self.proxy_get("/0/public/AssetPairs").await?;
         check_error(&resp)?;
 
         let result = resp["result"]
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Invalid AssetPairs response"))?;
 
-        // Build wsname -> info lookup
         let mut ws_lookup: HashMap<String, (&str, &serde_json::Value)> = HashMap::new();
         for (key, info) in result {
             if let Some(wsname) = info["wsname"].as_str() {
@@ -106,30 +114,19 @@ impl KrakenRest {
         Ok(pairs)
     }
 
-    /// Fetch ticker data for all pairs in a single batch request.
-    /// Returns 24h open/close/volume and computed change_pct for each pair.
-    pub async fn get_tickers(&self, pair_info: &HashMap<String, PairInfo>) -> Result<HashMap<String, TickerData>> {
+    async fn get_tickers(&self, pair_info: &HashMap<String, PairInfo>) -> Result<HashMap<String, TickerData>> {
         let rest_keys: Vec<&str> = pair_info.values().map(|pi| pi.rest_key.as_str()).collect();
         let pair_param = rest_keys.join(",");
 
-        let resp: serde_json::Value = self
-            .client
-            .get(format!(
-                "{}/0/public/Ticker?pair={}",
-                self.config.rest_base_url, pair_param
-            ))
-            .send()
-            .await?
-            .json()
+        let resp = self
+            .proxy_get(&format!("/0/public/Ticker?pair={}", pair_param))
             .await?;
-
         check_error(&resp)?;
 
         let result = resp["result"]
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Invalid Ticker response"))?;
 
-        // Build rest_key → ws_symbol reverse lookup
         let rest_to_ws: HashMap<&str, &str> = pair_info
             .iter()
             .map(|(ws_sym, pi)| (pi.rest_key.as_str(), ws_sym.as_str()))
@@ -176,27 +173,8 @@ impl KrakenRest {
         Ok(tickers)
     }
 
-    /// Fetch account balances from Kraken.
-    /// Returns a map of asset code (e.g. "HOUSE", "ZUSD") to balance.
-    pub async fn get_balances(&self) -> Result<HashMap<String, Decimal>> {
-        let urlpath = "/0/private/Balance";
-        let nonce = millis_nonce();
-        let post_data = format!("nonce={}", nonce);
-        let signature = sign_request(urlpath, &nonce, &post_data, &self.config.api_secret)?;
-
-        let resp: serde_json::Value = self
-            .client
-            .post(format!("{}{}", self.config.rest_base_url, urlpath))
-            .header("API-Key", &self.config.api_key)
-            .header("API-Sign", &signature)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(post_data)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        check_error(&resp)?;
+    async fn get_balances(&self) -> Result<HashMap<String, Decimal>> {
+        let resp = self.proxy_post("/0/private/Balance", "").await?;
 
         let result = resp["result"]
             .as_object()
@@ -213,22 +191,14 @@ impl KrakenRest {
 
         Ok(balances)
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct TickerData {
-    pub open: Decimal,
-    pub close: Decimal,
-    pub volume_24h: Decimal,
-    pub change_pct: Decimal,
-}
+    async fn get_ticker_raw(&self, pair: &str) -> Result<serde_json::Value> {
+        self.proxy_get(&format!("/0/public/Ticker?pair={}", pair)).await
+    }
 
-fn millis_nonce() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .to_string()
+    async fn get_ohlc_raw(&self, pair: &str) -> Result<serde_json::Value> {
+        self.proxy_get(&format!("/0/public/OHLC?pair={}&interval=60", pair)).await
+    }
 }
 
 fn check_error(resp: &serde_json::Value) -> Result<()> {

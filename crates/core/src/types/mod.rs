@@ -5,6 +5,7 @@ pub mod event;
 pub mod command;
 pub mod fill;
 pub mod position;
+pub mod ticker;
 
 pub use order::*;
 pub use book::OrderBook;
@@ -13,3 +14,4 @@ pub use event::*;
 pub use command::*;
 pub use fill::*;
 pub use position::Position;
+pub use ticker::TickerData;
