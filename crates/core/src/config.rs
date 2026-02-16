@@ -12,20 +12,17 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeConfig {
+    /// API key — only needed by proxy and scanner (bot never uses directly).
     pub api_key: String,
+    /// API secret — only needed by proxy and scanner (bot never uses directly).
     pub api_secret: String,
-    pub ws_public_url: String,
-    pub ws_private_url: String,
+    /// REST base URL — used by KrakenRest (proxy/scanner direct connections).
     pub rest_base_url: String,
     pub book_depth: u32,
-    /// Run through a proxy instead of connecting directly to Kraken.
-    #[serde(default)]
-    pub proxy_mode: bool,
-    /// Base URL of the proxy (e.g., "http://proxy:8080").
-    #[serde(default)]
+    /// Base URL of the proxy (e.g., "http://localhost:3053").
+    /// Bot always connects through proxy. WS URLs are derived from this.
     pub proxy_url: String,
     /// Bearer token for authenticating with the proxy.
-    #[serde(default)]
     pub proxy_token: String,
 }
 
@@ -68,7 +65,6 @@ fn default_cooldown_secs() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceConfig {
-    pub state_file: String,
     pub trade_log_file: String,
 }
 
@@ -78,11 +74,8 @@ impl Default for Config {
             exchange: ExchangeConfig {
                 api_key: String::new(),
                 api_secret: String::new(),
-                ws_public_url: "wss://ws.kraken.com/v2".into(),
-                ws_private_url: "wss://ws-auth.kraken.com/v2".into(),
                 rest_base_url: "https://api.kraken.com".into(),
                 book_depth: 10,
-                proxy_mode: false,
                 proxy_url: String::new(),
                 proxy_token: String::new(),
             },
@@ -110,7 +103,6 @@ impl Default for Config {
                 cooldown_after_liquidation_secs: 3600,
             },
             persistence: PersistenceConfig {
-                state_file: "state.json".into(),
                 trade_log_file: "logs/trades.csv".into(),
             },
         }

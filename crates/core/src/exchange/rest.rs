@@ -214,33 +214,6 @@ impl ExchangeClient for KrakenRest {
         Ok(balances)
     }
 
-    async fn get_ticker_raw(&self, pair: &str) -> Result<serde_json::Value> {
-        let resp: serde_json::Value = self
-            .client
-            .get(format!(
-                "{}/0/public/Ticker?pair={}",
-                self.config.rest_base_url, pair
-            ))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
-    }
-
-    async fn get_ohlc_raw(&self, pair: &str) -> Result<serde_json::Value> {
-        let resp: serde_json::Value = self
-            .client
-            .get(format!(
-                "{}/0/public/OHLC?pair={}&interval=60",
-                self.config.rest_base_url, pair
-            ))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(resp)
-    }
 }
 
 fn millis_nonce() -> String {

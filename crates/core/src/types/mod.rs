@@ -6,6 +6,7 @@ pub mod command;
 pub mod fill;
 pub mod position;
 pub mod ticker;
+pub mod managed_pair;
 
 pub use order::*;
 pub use book::OrderBook;
@@ -15,3 +16,4 @@ pub use command::*;
 pub use fill::*;
 pub use position::Position;
 pub use ticker::TickerData;
+pub use managed_pair::{PairState, PairConfig, GlobalDefaults, ResolvedConfig, ManagedPair};

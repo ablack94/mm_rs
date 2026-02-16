@@ -19,10 +19,4 @@ pub trait ExchangeClient: Send + Sync {
 
     /// Fetch account balances (asset code -> balance).
     async fn get_balances(&self) -> Result<HashMap<String, Decimal>>;
-
-    /// Fetch raw ticker JSON for a single pair (used by API proxy endpoints).
-    async fn get_ticker_raw(&self, pair: &str) -> Result<serde_json::Value>;
-
-    /// Fetch raw OHLC JSON for a single pair (used by API proxy endpoints).
-    async fn get_ohlc_raw(&self, pair: &str) -> Result<serde_json::Value>;
 }

@@ -1,10 +1,10 @@
 [package]
-name = "pnl-tracker"
+name = "pnl-analyzer"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "pnl-tracker"
+name = "pnl-analyzer"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,5 +15,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 axum = "0.8"
-rust_decimal = "1"
+rust_decimal = { version = "1", features = ["serde-with-float"] }
+rust_decimal_macros = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+chrono = { version = "0.4", features = ["serde"] }

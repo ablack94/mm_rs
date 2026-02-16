@@ -46,6 +46,8 @@ pub enum EngineEvent {
     },
     /// Command from the REST API.
     ApiCommand(ApiAction),
+    /// Command from the state store WS client.
+    StateStoreCommand(StateStoreAction),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,4 +66,20 @@ pub enum ApiAction {
     AddPair { symbol: String },
     /// Remove a pair: liquidate position + permanently disable.
     RemovePair { symbol: String },
+}
+
+/// Actions received from the state store WS client.
+#[derive(Debug, Clone)]
+pub enum StateStoreAction {
+    /// Full snapshot of all pairs and global defaults.
+    Snapshot {
+        pairs: Vec<crate::state_store::PairRecord>,
+        defaults: super::managed_pair::GlobalDefaults,
+    },
+    /// A single pair was created or updated.
+    PairUpdated(crate::state_store::PairRecord),
+    /// A pair was removed.
+    PairRemoved { symbol: String },
+    /// Global defaults were updated.
+    DefaultsUpdated(super::managed_pair::GlobalDefaults),
 }

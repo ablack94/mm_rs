@@ -2,12 +2,12 @@
 """
 Kraken MM Bot Dashboard
 ~~~~~~~~~~~~~~~~~~~~~~~
-Single-file web dashboard that shows portfolio, positions, PnL, and open orders.
+Single-file web dashboard that shows portfolio, positions, PnL, and pair states.
 
 Data sources:
-  - Bot REST API (localhost:3030) for state (positions, orders, realized PnL)
+  - State Store (localhost:3040) for pair configs/states, bot connection status
+  - PnL Analyzer (localhost:3031) for edge metrics, positions, realized PnL
   - Kraken proxy (10.255.255.254:8080) for live ticker prices
-  - logs/trades.csv for recent trade history
 
 Usage:
   python3 dashboard.py          # serves on port 8888
@@ -21,26 +21,19 @@ import time
 import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
 from decimal import Decimal, InvalidOperation
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BOT_API_URL = os.environ.get("BOT_API_URL", "http://localhost:3030")
-BOT_API_TOKEN = os.environ.get("BOT_API_TOKEN", "mcp-bot-token-2026")
+STATE_STORE_URL = os.environ.get("STATE_STORE_URL", "http://localhost:3040")
+STATE_STORE_TOKEN = os.environ.get("STATE_STORE_TOKEN", "")
+PNL_API_URL = os.environ.get("PNL_API_URL", "http://localhost:3031")
+PNL_API_TOKEN = os.environ.get("PNL_API_TOKEN", "")
 PROXY_URL = os.environ.get("PROXY_URL", "http://10.255.255.254:8080")
 PROXY_TOKEN = os.environ.get(
     "PROXY_TOKEN",
     "0ba154d4e4886b262f7752ebcb5213a57ea8161b88c4b5f4eed5b0f79363d7ab",
-)
-STATE_JSON = os.environ.get(
-    "STATE_JSON",
-    str(Path(__file__).resolve().parent / "state.json"),
-)
-TRADES_CSV = os.environ.get(
-    "TRADES_CSV",
-    str(Path(__file__).resolve().parent / "logs" / "trades.csv"),
 )
 DEFAULT_PORT = 8888
 
@@ -48,12 +41,12 @@ DEFAULT_PORT = 8888
 # Data helpers
 # ---------------------------------------------------------------------------
 
-def _bot_get(path: str) -> dict:
-    """GET from the bot REST API."""
-    req = urllib.request.Request(
-        f"{BOT_API_URL}{path}",
-        headers={"Authorization": f"Bearer {BOT_API_TOKEN}"},
-    )
+def _state_store_get(path: str) -> dict:
+    """GET from the state store REST API."""
+    headers = {}
+    if STATE_STORE_TOKEN:
+        headers["Authorization"] = f"Bearer {STATE_STORE_TOKEN}"
+    req = urllib.request.Request(f"{STATE_STORE_URL}{path}", headers=headers)
     try:
         resp = urllib.request.urlopen(req, timeout=5)
         return json.loads(resp.read())
@@ -74,11 +67,15 @@ def _proxy_get(path: str) -> dict:
         return {"_error": str(e)}
 
 
-def _read_state_file() -> dict:
-    """Read state.json directly from disk as fallback."""
+def _pnl_get(path: str) -> dict:
+    """GET from the PnL analyzer API."""
+    headers = {}
+    if PNL_API_TOKEN:
+        headers["Authorization"] = f"Bearer {PNL_API_TOKEN}"
+    req = urllib.request.Request(f"{PNL_API_URL}{path}", headers=headers)
     try:
-        with open(STATE_JSON, "r") as f:
-            return json.loads(f.read())
+        resp = urllib.request.urlopen(req, timeout=5)
+        return json.loads(resp.read())
     except Exception as e:
         return {"_error": str(e)}
 
@@ -135,97 +132,207 @@ def _fetch_all_prices(symbols: list) -> dict:
     return prices
 
 
-def _recent_trades(limit: int = 20) -> list:
-    """Read last N trades from trades.csv."""
+def _safe_float(val, default=0.0) -> float:
+    """Convert a string/number to float safely."""
+    if val is None:
+        return default
     try:
-        with open(TRADES_CSV, "r") as f:
-            lines = f.readlines()
-    except Exception:
-        return []
-    if len(lines) <= 1:
-        return []
-    header = lines[0].strip().split(",")
-    data_lines = lines[1:]
-    recent = data_lines[-limit:]
-    trades = []
-    for line in reversed(recent):
-        parts = line.strip().split(",")
-        if len(parts) >= len(header):
-            trades.append(dict(zip(header, parts)))
-    return trades
+        return float(Decimal(str(val)))
+    except (InvalidOperation, ValueError):
+        return default
 
 
 def build_dashboard_data() -> dict:
     """Assemble all data for the dashboard JSON endpoint."""
-    # 1. Get bot state (prefer API, fall back to file)
-    state = _bot_get("/api/state")
-    if "_error" in state:
-        state = _read_state_file()
 
-    positions_raw = state.get("positions", {})
-    open_orders_raw = state.get("open_orders", {})
-    realized_pnl = float(Decimal(state.get("realized_pnl", "0")))
-    total_fees = float(Decimal(state.get("total_fees", "0")))
-    trade_count = state.get("trade_count", 0)
-    paused = state.get("paused", False)
+    # 1. State store health — bot connection status
+    health = _state_store_get("/health")
+    bot_connected = False
+    ss_up = "_error" not in health
+    if ss_up:
+        bot_connected = health.get("bot_connected", False)
 
-    # 2. Fetch live prices for all positions
-    symbols = list(positions_raw.keys())
-    prices = _fetch_all_prices(symbols)
+    # 2. State store pairs — pair states and configs
+    ss_pairs_resp = _state_store_get("/pairs")
+    ss_pairs = []
+    if "_error" not in ss_pairs_resp:
+        ss_pairs = ss_pairs_resp.get("pairs", [])
 
-    # 3. Build position breakdown
+    # 3. State store defaults — global trading parameters
+    defaults_resp = _state_store_get("/defaults")
+    defaults = {}
+    if "_error" not in defaults_resp:
+        defaults = defaults_resp
+
+    # 4. PnL analyzer summary — realized/unrealized PnL, fees, overall edge
+    pnl_data = _pnl_get("/pnl")
+    pnl_up = "_error" not in pnl_data
+    realized_pnl = 0.0
+    unrealized_pnl = 0.0
+    total_fees = 0.0
+    trade_count = 0
+    overall_edge = None
+    if pnl_up:
+        pnl_section = pnl_data.get("pnl", {})
+        realized_pnl = _safe_float(pnl_section.get("realized_pnl"))
+        unrealized_pnl = _safe_float(pnl_section.get("unrealized_pnl"))
+        total_fees = _safe_float(pnl_section.get("total_fees"))
+        trade_count = pnl_section.get("trade_count", 0)
+        edge_section = pnl_data.get("edge", {})
+        overall_edge = edge_section.get("overall_edge")
+
+    # 5. PnL analyzer per-pair — edge metrics and positions
+    pnl_pairs_resp = _pnl_get("/pairs")
+    pnl_pairs_map = {}
+    if "_error" not in pnl_pairs_resp:
+        for pp in pnl_pairs_resp.get("pairs", []):
+            pnl_pairs_map[pp["symbol"]] = pp
+
+    # 6. Collect all known symbols and fetch live prices
+    all_symbols = set()
+    for p in ss_pairs:
+        all_symbols.add(p["symbol"])
+    for sym in pnl_pairs_map:
+        all_symbols.add(sym)
+    prices = _fetch_all_prices(list(all_symbols))
+
+    # 7. Merge state store pairs with PnL analyzer data
+    merged_pairs = []
+    seen_symbols = set()
+
+    for sp in ss_pairs:
+        symbol = sp["symbol"]
+        seen_symbols.add(symbol)
+        state = sp.get("state", "disabled")
+        config = sp.get("config", {})
+        disabled_reason = sp.get("disabled_reason")
+
+        # PnL analyzer data for this pair
+        pp = pnl_pairs_map.get(symbol, {})
+        windows = pp.get("windows", {})
+
+        # Position data — fetch from per-pair detail if available
+        position = pp.get("position")
+        pos_qty = 0.0
+        pos_avg_cost = 0.0
+        current_price = prices.get(symbol, 0.0)
+        current_value = 0.0
+        pair_unrealized = 0.0
+
+        if position:
+            pos_qty = _safe_float(position.get("qty"))
+            pos_avg_cost = _safe_float(position.get("avg_cost"))
+            # Prefer PnL analyzer's current_price if available, fall back to proxy
+            pnl_price = _safe_float(position.get("current_price"))
+            if pnl_price > 0:
+                current_price = pnl_price
+            current_value = _safe_float(position.get("current_value", pos_qty * current_price))
+            pair_unrealized = _safe_float(position.get("unrealized_pnl", current_value - pos_qty * pos_avg_cost))
+
+        # Edge metrics per window
+        w1h = windows.get("1h", {})
+        w6h = windows.get("6h", {})
+        w24h = windows.get("24h", {})
+
+        merged_pairs.append({
+            "symbol": symbol,
+            "state": state,
+            "config": config,
+            "disabled_reason": disabled_reason,
+            "position_qty": pos_qty,
+            "position_avg_cost": pos_avg_cost,
+            "current_price": current_price,
+            "current_value": current_value,
+            "unrealized_pnl": pair_unrealized,
+            "edge_1h": w1h.get("edge"),
+            "edge_6h": w6h.get("edge"),
+            "edge_24h": w24h.get("edge"),
+            "trade_count_24h": w24h.get("trade_count", 0),
+        })
+
+    # Include pairs from PnL analyzer that aren't in state store
+    for sym, pp in pnl_pairs_map.items():
+        if sym in seen_symbols:
+            continue
+        windows = pp.get("windows", {})
+        position = pp.get("position")
+        pos_qty = 0.0
+        pos_avg_cost = 0.0
+        current_price = prices.get(sym, 0.0)
+        current_value = 0.0
+        pair_unrealized = 0.0
+
+        if position:
+            pos_qty = _safe_float(position.get("qty"))
+            pos_avg_cost = _safe_float(position.get("avg_cost"))
+            pnl_price = _safe_float(position.get("current_price"))
+            if pnl_price > 0:
+                current_price = pnl_price
+            current_value = _safe_float(position.get("current_value", pos_qty * current_price))
+            pair_unrealized = _safe_float(position.get("unrealized_pnl", current_value - pos_qty * pos_avg_cost))
+
+        w1h = windows.get("1h", {})
+        w6h = windows.get("6h", {})
+        w24h = windows.get("24h", {})
+
+        merged_pairs.append({
+            "symbol": sym,
+            "state": "unknown",
+            "config": {},
+            "disabled_reason": None,
+            "position_qty": pos_qty,
+            "position_avg_cost": pos_avg_cost,
+            "current_price": current_price,
+            "current_value": current_value,
+            "unrealized_pnl": pair_unrealized,
+            "edge_1h": w1h.get("edge"),
+            "edge_6h": w6h.get("edge"),
+            "edge_24h": w24h.get("edge"),
+            "trade_count_24h": w24h.get("trade_count", 0),
+        })
+
+    merged_pairs.sort(key=lambda p: p["symbol"])
+
+    # Positions: filtered to pairs with qty > 0
     positions = []
     total_cost_basis = 0.0
     total_current_value = 0.0
     total_unrealized_pnl = 0.0
 
-    for symbol, pos in sorted(positions_raw.items()):
-        qty = float(Decimal(pos.get("qty", "0")))
-        avg_cost = float(Decimal(pos.get("avg_cost", "0")))
-        current_price = prices.get(symbol, 0.0)
-        cost_basis = qty * avg_cost
-        current_value = qty * current_price
-        unrealized = current_value - cost_basis
-        pct_change = ((current_price / avg_cost) - 1.0) * 100 if avg_cost > 0 else 0.0
+    for p in merged_pairs:
+        if p["position_qty"] <= 0:
+            continue
+        cost_basis = p["position_qty"] * p["position_avg_cost"]
+        pct_change = ((p["current_price"] / p["position_avg_cost"]) - 1.0) * 100 if p["position_avg_cost"] > 0 else 0.0
+
+        # Skip dust
+        if cost_basis < 0.01 and p["current_value"] < 0.01:
+            continue
 
         total_cost_basis += cost_basis
-        total_current_value += current_value
-        total_unrealized_pnl += unrealized
+        total_current_value += p["current_value"]
+        total_unrealized_pnl += p["unrealized_pnl"]
 
         positions.append({
-            "symbol": symbol,
-            "qty": qty,
-            "avg_cost": avg_cost,
-            "current_price": current_price,
+            "symbol": p["symbol"],
+            "qty": p["position_qty"],
+            "avg_cost": p["position_avg_cost"],
+            "current_price": p["current_price"],
             "cost_basis": cost_basis,
-            "current_value": current_value,
-            "unrealized_pnl": unrealized,
+            "current_value": p["current_value"],
+            "unrealized_pnl": p["unrealized_pnl"],
             "pct_change": pct_change,
         })
 
-    # 4. Build open orders list
-    orders = []
-    for cl_ord_id, order in open_orders_raw.items():
-        orders.append({
-            "cl_ord_id": cl_ord_id,
-            "symbol": order.get("symbol", ""),
-            "side": order.get("side", ""),
-            "price": float(Decimal(order.get("price", "0"))),
-            "qty": float(Decimal(order.get("qty", "0"))),
-            "placed_at": order.get("placed_at", ""),
-            "acked": order.get("acked", False),
-        })
-
-    # 5. Recent trades
-    recent_trades = _recent_trades(20)
-
-    # 6. Portfolio totals
     net_pnl = realized_pnl + total_unrealized_pnl
-    portfolio_value = total_current_value  # value of held positions
+    portfolio_value = total_current_value
 
     return {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "paused": paused,
+        "bot_connected": bot_connected,
+        "state_store_up": ss_up,
+        "pnl_analyzer_up": pnl_up,
+        "pnl_source": "pnl-analyzer" if pnl_up else "unavailable",
         "portfolio_value": portfolio_value,
         "total_cost_basis": total_cost_basis,
         "total_current_value": total_current_value,
@@ -234,10 +341,10 @@ def build_dashboard_data() -> dict:
         "net_pnl": net_pnl,
         "total_fees": total_fees,
         "trade_count": trade_count,
+        "overall_edge": overall_edge,
+        "defaults": defaults,
+        "pairs": merged_pairs,
         "positions": positions,
-        "open_orders": orders,
-        "open_order_count": len(orders),
-        "recent_trades": recent_trades,
     }
 
 
@@ -264,6 +371,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --blue: #58a6ff;
     --yellow: #d29922;
     --orange: #db6d28;
+    --purple: #bc8cff;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -300,7 +408,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: inline-block;
   }
   .status-dot.live { background: var(--green); }
-  .status-dot.paused { background: var(--yellow); }
+  .status-dot.disconnected { background: var(--yellow); }
   .status-dot.error { background: var(--red); }
 
   /* Summary cards */
@@ -338,6 +446,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .negative { color: var(--red); }
   .neutral  { color: var(--text-dim); }
 
+  /* Defaults section */
+  .defaults-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .default-item {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+  }
+  .default-item .label {
+    font-size: 0.72em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .default-item .value {
+    font-size: 1.05em;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
   /* Tables */
   .section-title {
     font-size: 1.05em;
@@ -370,17 +503,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   tbody tr:hover { background: var(--bg-card-alt); }
   .num { text-align: right; }
-  .side-buy  { color: var(--green); font-weight: 600; }
-  .side-sell { color: var(--red); font-weight: 600; }
-
-  /* Bar for pnl visualization */
-  .pnl-bar {
-    display: inline-block;
-    height: 4px;
-    border-radius: 2px;
-    vertical-align: middle;
-    margin-left: 6px;
-  }
 
   .empty-msg {
     color: var(--text-dim);
@@ -404,8 +526,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     transition: width 1s linear;
   }
 
+  /* Pair status badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.82em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .badge-active      { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-disabled     { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge-wind_down    { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .badge-liquidating  { background: rgba(219,109,40,0.15); color: var(--orange); }
+  .badge-unknown      { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+
+  /* Edge coloring */
+  .edge-positive { color: var(--green); }
+  .edge-negative { color: var(--red); }
+  .edge-neutral  { color: var(--text-dim); }
+
+  /* Config tooltip */
+  .config-hover {
+    cursor: help;
+    text-decoration: underline dotted var(--text-dim);
+    text-underline-offset: 2px;
+  }
+  .config-hover:hover { color: var(--blue); }
+
   @media (max-width: 600px) {
     .summary-grid { grid-template-columns: repeat(2, 1fr); }
+    .defaults-grid { grid-template-columns: repeat(2, 1fr); }
     table { font-size: 0.8em; }
   }
 </style>
@@ -418,6 +570,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span id="statusDot" class="status-dot live" title="Live"></span>
   </h1>
   <div class="header-right">
+    <span id="serviceStatus" style="font-size:0.9em"></span>
     <span id="lastUpdate">--</span>
     <span id="countdown"></span>
   </div>
@@ -448,10 +601,39 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card-sub" id="totalFees">Fees: --</div>
   </div>
   <div class="card">
-    <div class="card-label">Open Orders</div>
-    <div class="card-value" id="openOrderCount">--</div>
-    <div class="card-sub" id="botStatus">--</div>
+    <div class="card-label">Overall Edge</div>
+    <div class="card-value" id="overallEdge">--</div>
+    <div class="card-sub" id="pnlSource">--</div>
   </div>
+</div>
+
+<!-- Global Defaults -->
+<div class="section">
+  <div class="section-title">Global Defaults</div>
+  <div class="defaults-grid" id="defaultsGrid">
+    <div class="default-item"><div class="label">Loading...</div></div>
+  </div>
+</div>
+
+<!-- Pair Status -->
+<div class="section">
+  <div class="section-title">Pairs</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Pair</th>
+        <th>State</th>
+        <th class="num">Edge (1h)</th>
+        <th class="num">Edge (6h)</th>
+        <th class="num">Edge (24h)</th>
+        <th class="num">Position</th>
+        <th>Config</th>
+      </tr>
+    </thead>
+    <tbody id="pairStatusBody">
+      <tr><td colspan="7" class="empty-msg">Loading...</td></tr>
+    </tbody>
+  </table>
 </div>
 
 <!-- Positions Table -->
@@ -464,56 +646,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <th class="num">Qty</th>
         <th class="num">Avg Cost</th>
         <th class="num">Price</th>
-        <th class="num">Cost Basis</th>
         <th class="num">Value</th>
         <th class="num">Unrealized P&L</th>
         <th class="num">Change</th>
       </tr>
     </thead>
     <tbody id="positionsBody">
-      <tr><td colspan="8" class="empty-msg">Loading...</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<!-- Open Orders Table -->
-<div class="section">
-  <div class="section-title">Open Orders</div>
-  <table>
-    <thead>
-      <tr>
-        <th>Symbol</th>
-        <th>Side</th>
-        <th class="num">Price</th>
-        <th class="num">Qty</th>
-        <th>Placed At</th>
-        <th>Status</th>
-      </tr>
-    </thead>
-    <tbody id="ordersBody">
-      <tr><td colspan="6" class="empty-msg">Loading...</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<!-- Recent Trades -->
-<div class="section">
-  <div class="section-title">Recent Trades</div>
-  <table>
-    <thead>
-      <tr>
-        <th>Time</th>
-        <th>Symbol</th>
-        <th>Side</th>
-        <th class="num">Price</th>
-        <th class="num">Qty</th>
-        <th class="num">Value</th>
-        <th class="num">Fee</th>
-        <th class="num">P&L</th>
-      </tr>
-    </thead>
-    <tbody id="tradesBody">
-      <tr><td colspan="8" class="empty-msg">Loading...</td></tr>
+      <tr><td colspan="7" class="empty-msg">Loading...</td></tr>
     </tbody>
   </table>
 </div>
@@ -543,7 +682,6 @@ function fmtPct(n) {
 
 function fmtPrice(n) {
   if (n === null || n === undefined || isNaN(n) || n === 0) return '--';
-  // Auto-detect decimals based on magnitude
   if (n >= 100) return '$' + fmt(n, 2);
   if (n >= 1)   return '$' + fmt(n, 4);
   if (n >= 0.01) return '$' + fmt(n, 5);
@@ -563,27 +701,67 @@ function pnlClass(n) {
   return 'neutral';
 }
 
-function sideClass(s) {
-  if (!s) return '';
-  return s.toLowerCase() === 'buy' ? 'side-buy' : 'side-sell';
+function fmtEdge(val) {
+  if (val === null || val === undefined) return '--';
+  const n = parseFloat(val);
+  if (isNaN(n)) return '--';
+  // Edge is a ratio like 0.0025 → display as bps (0.25%) or raw
+  const pct = (n * 100).toFixed(3);
+  return (n >= 0 ? '+' : '') + pct + '%';
+}
+
+function edgeClass(val) {
+  if (val === null || val === undefined) return 'edge-neutral';
+  const n = parseFloat(val);
+  if (isNaN(n)) return 'edge-neutral';
+  if (n > 0.0001) return 'edge-positive';
+  if (n < -0.0001) return 'edge-negative';
+  return 'edge-neutral';
+}
+
+function fmtDefaultKey(key) {
+  // order_size_usd → Order Size USD
+  return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function fmtDefaultVal(key, val) {
+  if (val === null || val === undefined) return '--';
+  if (key.endsWith('_usd')) return '$' + fmt(val, 2);
+  if (key.endsWith('_bps')) return fmt(val, 0) + ' bps';
+  if (key.endsWith('_pct')) return (val * 100).toFixed(1) + '%';
+  return String(val);
+}
+
+function buildConfigSummary(config) {
+  if (!config) return '--';
+  const parts = [];
+  for (const [k, v] of Object.entries(config)) {
+    if (v === null || v === undefined) continue;
+    parts.push(fmtDefaultKey(k) + ': ' + fmtDefaultVal(k, v));
+  }
+  return parts.length > 0 ? parts.join(', ') : 'defaults';
 }
 
 function updateDashboard(data) {
-  // Status
+  // Status dot — based on bot connection
   const dot = document.getElementById('statusDot');
-  const statusEl = document.getElementById('botStatus');
+  const svcEl = document.getElementById('serviceStatus');
   if (data._error) {
     dot.className = 'status-dot error';
-    dot.title = 'Error';
-    statusEl.textContent = 'Error fetching data';
-  } else if (data.paused) {
-    dot.className = 'status-dot paused';
-    dot.title = 'Paused';
-    statusEl.textContent = 'Bot paused';
+    dot.title = 'Dashboard error';
+    svcEl.textContent = 'Error';
+  } else if (!data.state_store_up) {
+    dot.className = 'status-dot error';
+    dot.title = 'State store down';
+    svcEl.textContent = 'State store down';
+  } else if (!data.bot_connected) {
+    dot.className = 'status-dot disconnected';
+    dot.title = 'Bot disconnected';
+    svcEl.textContent = 'Bot disconnected';
   } else {
     dot.className = 'status-dot live';
-    dot.title = 'Live';
-    statusEl.textContent = 'Bot active';
+    dot.title = 'Bot connected';
+    svcEl.textContent = '';
   }
 
   document.getElementById('lastUpdate').textContent = data.timestamp || '--';
@@ -609,12 +787,68 @@ function updateDashboard(data) {
   npEl.className = 'card-value ' + pnlClass(data.net_pnl);
   document.getElementById('totalFees').textContent = 'Fees: ' + fmtUsd(data.total_fees);
 
-  document.getElementById('openOrderCount').textContent = data.open_order_count || 0;
+  // Overall edge card
+  const edgeEl = document.getElementById('overallEdge');
+  edgeEl.textContent = fmtEdge(data.overall_edge);
+  edgeEl.className = 'card-value ' + edgeClass(data.overall_edge);
+  document.getElementById('pnlSource').textContent =
+    'Source: ' + (data.pnl_source || '--');
+
+  // Global defaults
+  const dg = document.getElementById('defaultsGrid');
+  const defaults = data.defaults || {};
+  const defaultKeys = Object.keys(defaults).sort();
+  if (defaultKeys.length === 0) {
+    dg.innerHTML = '<div class="default-item"><div class="label">No defaults available</div></div>';
+  } else {
+    let html = '';
+    for (const k of defaultKeys) {
+      html += '<div class="default-item">';
+      html += '<div class="label">' + fmtDefaultKey(k) + '</div>';
+      html += '<div class="value">' + fmtDefaultVal(k, defaults[k]) + '</div>';
+      html += '</div>';
+    }
+    dg.innerHTML = html;
+  }
+
+  // Pairs table
+  const psBody = document.getElementById('pairStatusBody');
+  const pairs = data.pairs || [];
+  if (pairs.length === 0) {
+    psBody.innerHTML = '<tr><td colspan="7" class="empty-msg">No pair data</td></tr>';
+  } else {
+    let html = '';
+    for (const p of pairs) {
+      const st = p.state || 'unknown';
+      const badgeClass = 'badge-' + st;
+      const label = st.toUpperCase().replace('_', ' ');
+
+      const posVal = p.position_qty > 0 ? fmtUsd(p.current_value) : '--';
+      const configTitle = buildConfigSummary(p.config);
+      const configLabel = (configTitle === 'defaults') ? 'defaults' : 'custom';
+      let reasonHtml = '';
+      if (p.disabled_reason) {
+        reasonHtml = ' <span style="color:var(--text-dim);font-size:0.85em" title="' +
+          p.disabled_reason.replace(/"/g, '&quot;') + '">(' + p.disabled_reason + ')</span>';
+      }
+
+      html += '<tr>';
+      html += '<td><strong>' + p.symbol + '</strong></td>';
+      html += '<td><span class="badge ' + badgeClass + '">' + label + '</span>' + reasonHtml + '</td>';
+      html += '<td class="num ' + edgeClass(p.edge_1h) + '">' + fmtEdge(p.edge_1h) + '</td>';
+      html += '<td class="num ' + edgeClass(p.edge_6h) + '">' + fmtEdge(p.edge_6h) + '</td>';
+      html += '<td class="num ' + edgeClass(p.edge_24h) + '">' + fmtEdge(p.edge_24h) + '</td>';
+      html += '<td class="num">' + posVal + '</td>';
+      html += '<td><span class="config-hover" title="' + configTitle.replace(/"/g, '&quot;') + '">' + configLabel + '</span></td>';
+      html += '</tr>';
+    }
+    psBody.innerHTML = html;
+  }
 
   // Positions table
   const posBody = document.getElementById('positionsBody');
   if (!data.positions || data.positions.length === 0) {
-    posBody.innerHTML = '<tr><td colspan="8" class="empty-msg">No open positions</td></tr>';
+    posBody.innerHTML = '<tr><td colspan="7" class="empty-msg">No open positions</td></tr>';
   } else {
     let html = '';
     for (const p of data.positions) {
@@ -624,55 +858,12 @@ function updateDashboard(data) {
       html += '<td class="num">' + fmtQty(p.qty) + '</td>';
       html += '<td class="num">' + fmtPrice(p.avg_cost) + '</td>';
       html += '<td class="num">' + fmtPrice(p.current_price) + '</td>';
-      html += '<td class="num">' + fmtUsd(p.cost_basis) + '</td>';
       html += '<td class="num">' + fmtUsd(p.current_value) + '</td>';
       html += '<td class="num ' + cls + '">' + fmtUsd(p.unrealized_pnl) + '</td>';
       html += '<td class="num ' + cls + '">' + fmtPct(p.pct_change) + '</td>';
       html += '</tr>';
     }
     posBody.innerHTML = html;
-  }
-
-  // Open orders table
-  const ordBody = document.getElementById('ordersBody');
-  if (!data.open_orders || data.open_orders.length === 0) {
-    ordBody.innerHTML = '<tr><td colspan="6" class="empty-msg">No open orders</td></tr>';
-  } else {
-    let html = '';
-    for (const o of data.open_orders) {
-      html += '<tr>';
-      html += '<td><strong>' + o.symbol + '</strong></td>';
-      html += '<td class="' + sideClass(o.side) + '">' + (o.side || '').toUpperCase() + '</td>';
-      html += '<td class="num">' + fmtPrice(o.price) + '</td>';
-      html += '<td class="num">' + fmtQty(o.qty) + '</td>';
-      html += '<td>' + (o.placed_at || '--') + '</td>';
-      html += '<td>' + (o.acked ? 'Acked' : 'Pending') + '</td>';
-      html += '</tr>';
-    }
-    ordBody.innerHTML = html;
-  }
-
-  // Recent trades table
-  const trBody = document.getElementById('tradesBody');
-  if (!data.recent_trades || data.recent_trades.length === 0) {
-    trBody.innerHTML = '<tr><td colspan="8" class="empty-msg">No recent trades</td></tr>';
-  } else {
-    let html = '';
-    for (const t of data.recent_trades) {
-      const pnl = parseFloat(t.pnl || 0);
-      const cls = pnlClass(pnl);
-      html += '<tr>';
-      html += '<td>' + (t.timestamp || '--') + '</td>';
-      html += '<td><strong>' + (t.symbol || '--') + '</strong></td>';
-      html += '<td class="' + sideClass(t.side) + '">' + (t.side || '').toUpperCase() + '</td>';
-      html += '<td class="num">' + fmtPrice(parseFloat(t.price)) + '</td>';
-      html += '<td class="num">' + fmtQty(parseFloat(t.qty)) + '</td>';
-      html += '<td class="num">' + fmtUsd(parseFloat(t.value_usd)) + '</td>';
-      html += '<td class="num">' + fmtUsd(parseFloat(t.fee)) + '</td>';
-      html += '<td class="num ' + cls + '">' + fmtUsd(pnl) + '</td>';
-      html += '</tr>';
-    }
-    trBody.innerHTML = html;
   }
 }
 
@@ -778,10 +969,9 @@ def main():
 
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     print(f"Dashboard server starting on http://0.0.0.0:{port}")
-    print(f"  Bot API: {BOT_API_URL}")
-    print(f"  Proxy:   {PROXY_URL}")
-    print(f"  State:   {STATE_JSON}")
-    print(f"  Trades:  {TRADES_CSV}")
+    print(f"  State Store:  {STATE_STORE_URL}")
+    print(f"  PnL Analyzer: {PNL_API_URL}")
+    print(f"  Proxy:        {PROXY_URL}")
     print()
     try:
         server.serve_forever()

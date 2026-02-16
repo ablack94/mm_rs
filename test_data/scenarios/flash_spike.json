@@ -1,0 +1,22 @@
+{
+  "name": "flash_spike",
+  "description": "20% flash crash in one tick, then instant recovery",
+  "defaults": {
+    "spread_pct": 5.0,
+    "fill_probability": 0.3
+  },
+  "pairs": {
+    "OMG/USD": {
+      "starting_price": 0.50,
+      "waypoints": [
+        { "t_ms": 0,     "mid": 0.50 },
+        { "t_ms": 10000, "mid": 0.50 },
+        { "t_ms": 10001, "mid": 0.40, "interpolation": "step", "spread_pct": 20.0 },
+        { "t_ms": 12000, "mid": 0.40, "spread_pct": 20.0 },
+        { "t_ms": 12001, "mid": 0.49, "interpolation": "step", "spread_pct": 8.0 },
+        { "t_ms": 20000, "mid": 0.50, "spread_pct": 5.0 }
+      ]
+    }
+  },
+  "end_behavior": "hold_last"
+}

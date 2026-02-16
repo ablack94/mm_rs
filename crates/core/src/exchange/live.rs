@@ -45,25 +45,16 @@ impl LiveExchange {
         event_tx: mpsc::Sender<EngineEvent>,
         exchange: Arc<dyn ExchangeClient>,
     ) -> Result<Self> {
-        // Get auth token (proxy mode returns placeholder)
+        // Get auth token (proxy returns placeholder, injected upstream)
         tracing::info!("Fetching WS auth token...");
         let token = exchange.get_ws_token().await?;
 
-        // Connect single private WS
-        let ws_url = if config.exchange.proxy_mode {
-            // In proxy mode, connect to proxy's WS endpoint
-            let base = config.exchange.proxy_url.trim_end_matches('/');
-            let ws_base = base.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
-            format!("{}/ws/private", ws_base)
-        } else {
-            config.exchange.ws_private_url.clone()
-        };
+        // Connect private WS through proxy
+        let base = config.exchange.proxy_url.trim_end_matches('/');
+        let ws_base = base.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
+        let ws_url = format!("{}/ws/private", ws_base);
         tracing::info!(url = ws_url, "Connecting private WS...");
-        let priv_ws = if config.exchange.proxy_mode {
-            WsConnection::connect_with_token(&ws_url, &config.exchange.proxy_token).await?
-        } else {
-            WsConnection::connect(&ws_url).await?
-        };
+        let priv_ws = WsConnection::connect_with_token(&ws_url, &config.exchange.proxy_token).await?;
 
         // Split into read/write halves
         let (mut writer, mut reader) = priv_ws.into_split();
@@ -272,11 +263,18 @@ impl LiveExchange {
     }
 
     /// Spawn the public WS feed as a background task that sends events into the channel.
+    /// In proxy mode, connects to the proxy's public WS endpoint instead of the
+    /// default Kraken endpoint, so book data comes from the same source as orders.
     pub async fn spawn_book_feed(
         &self,
         tx: mpsc::Sender<EngineEvent>,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let url = self.config.exchange.ws_public_url.clone();
+        let base = self.config.exchange.proxy_url.trim_end_matches('/');
+        let ws_base = base
+            .replacen("http://", "ws://", 1)
+            .replacen("https://", "wss://", 1);
+        let url = format!("{}/ws/public", ws_base);
+        tracing::info!(url, "Connecting public WS for book data");
         let pairs = self.config.trading.pairs.clone();
         let depth = self.config.exchange.book_depth;
 

@@ -292,3 +292,235 @@ fn parse_order_response(v: &serde_json::Value, method: &str) -> WsMessage {
         error: v["error"].as_str().map(String::from),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_book_snapshot_parsing() {
+        let raw = r#"{
+            "channel": "book",
+            "type": "snapshot",
+            "data": [{
+                "symbol": "CAMP/USD",
+                "bids": [
+                    {"price": 0.0039, "qty": 50000.0},
+                    {"price": 0.0038, "qty": 25000.0}
+                ],
+                "asks": [
+                    {"price": 0.0041, "qty": 50000.0},
+                    {"price": 0.0042, "qty": 30000.0}
+                ],
+                "checksum": 0
+            }]
+        }"#;
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::BookSnapshot { symbol, bids, asks } => {
+                assert_eq!(symbol, "CAMP/USD");
+                assert_eq!(bids.len(), 2);
+                assert_eq!(asks.len(), 2);
+                assert_eq!(bids[0].price, dec!(0.0039));
+                assert_eq!(bids[0].qty, dec!(50000.0));
+                assert_eq!(bids[1].price, dec!(0.0038));
+                assert_eq!(bids[1].qty, dec!(25000.0));
+                assert_eq!(asks[0].price, dec!(0.0041));
+                assert_eq!(asks[0].qty, dec!(50000.0));
+                assert_eq!(asks[1].price, dec!(0.0042));
+                assert_eq!(asks[1].qty, dec!(30000.0));
+            }
+            other => panic!("Expected BookSnapshot, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_book_update_parsing() {
+        let raw = r#"{
+            "channel": "book",
+            "type": "update",
+            "data": [{
+                "symbol": "BTC/USD",
+                "bids": [{"price": 97500.0, "qty": 1.5}],
+                "asks": [{"price": 97600.0, "qty": 0.8}],
+                "checksum": 12345
+            }]
+        }"#;
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::BookUpdate { symbol, bid_updates, ask_updates } => {
+                assert_eq!(symbol, "BTC/USD");
+                assert_eq!(bid_updates.len(), 1);
+                assert_eq!(ask_updates.len(), 1);
+                assert_eq!(bid_updates[0].price, dec!(97500.0));
+                assert_eq!(bid_updates[0].qty, dec!(1.5));
+                assert_eq!(ask_updates[0].price, dec!(97600.0));
+                assert_eq!(ask_updates[0].qty, dec!(0.8));
+            }
+            other => panic!("Expected BookUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execution_report_trade() {
+        let raw = r#"{
+            "channel": "executions",
+            "type": "update",
+            "data": [{
+                "exec_type": "trade",
+                "order_id": "ORD-ABC-123",
+                "cl_ord_id": "mm_buy_camp_001",
+                "symbol": "CAMP/USD",
+                "side": "buy",
+                "last_qty": 10000.0,
+                "last_price": 0.0039,
+                "fees": [{"asset": "USD", "qty": 0.09}],
+                "order_status": "filled",
+                "liquidity_ind": "m",
+                "timestamp": "2026-02-15T12:00:00.000Z"
+            }]
+        }"#;
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "trade");
+                assert_eq!(report.order_id, "ORD-ABC-123");
+                assert_eq!(report.cl_ord_id, "mm_buy_camp_001");
+                assert_eq!(report.symbol, "CAMP/USD");
+                assert_eq!(report.side, "buy");
+                assert_eq!(report.last_qty, dec!(10000.0));
+                assert_eq!(report.last_price, dec!(0.0039));
+                assert_eq!(report.fee, dec!(0.09));
+                assert_eq!(report.order_status, "filled");
+                assert!(report.is_maker);
+            }
+            other => panic!("Expected Execution, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execution_snapshot_is_skipped() {
+        let raw = r#"{
+            "channel": "executions",
+            "type": "snapshot",
+            "data": [{
+                "exec_type": "trade",
+                "order_id": "ORD-OLD-999",
+                "cl_ord_id": "old_order",
+                "symbol": "ETH/USD",
+                "side": "sell",
+                "last_qty": 0.1,
+                "last_price": 3000.0,
+                "fees": [],
+                "order_status": "filled",
+                "liquidity_ind": "t",
+                "timestamp": "2026-01-01T00:00:00.000Z"
+            }]
+        }"#;
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::Unknown(s) => assert_eq!(s, "exec_snapshot"),
+            other => panic!("Expected Unknown(\"exec_snapshot\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_order_response_success() {
+        let raw = r#"{
+            "method": "add_order",
+            "req_id": 42,
+            "success": true,
+            "result": {
+                "order_id": "ORD-NEW-001",
+                "cl_ord_id": "mm_buy_camp_002"
+            }
+        }"#;
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::OrderResponse { req_id, success, method, order_id, cl_ord_id, error } => {
+                assert_eq!(req_id, 42);
+                assert!(success);
+                assert_eq!(method, "add_order");
+                assert_eq!(order_id, Some("ORD-NEW-001".to_string()));
+                assert_eq!(cl_ord_id, Some("mm_buy_camp_002".to_string()));
+                assert!(error.is_none());
+            }
+            other => panic!("Expected OrderResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_order_response_error() {
+        let raw = r#"{
+            "method": "add_order",
+            "req_id": 99,
+            "success": false,
+            "error": "EOrder:Insufficient funds",
+            "result": {}
+        }"#;
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::OrderResponse { req_id, success, method, order_id, cl_ord_id, error } => {
+                assert_eq!(req_id, 99);
+                assert!(!success);
+                assert_eq!(method, "add_order");
+                assert!(order_id.is_none());
+                assert!(cl_ord_id.is_none());
+                assert_eq!(error, Some("EOrder:Insufficient funds".to_string()));
+            }
+            other => panic!("Expected OrderResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_subscribe_confirmation() {
+        let raw = r#"{
+            "method": "subscribe",
+            "result": {
+                "channel": "book",
+                "depth": 10,
+                "symbol": "CAMP/USD"
+            },
+            "success": true
+        }"#;
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::SubscribeConfirmed { channel } => {
+                assert_eq!(channel, "book");
+            }
+            other => panic!("Expected SubscribeConfirmed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_heartbeat_parsing() {
+        let raw = r#"{"channel":"heartbeat"}"#;
+        let msg = parse_ws_message(raw);
+        assert!(matches!(msg, WsMessage::Heartbeat));
+    }
+
+    #[test]
+    fn test_pong_parsing() {
+        let raw = r#"{"method":"pong","req_id":1,"time_in":"2026-02-15T12:00:00.000000Z","time_out":"2026-02-15T12:00:00.000001Z"}"#;
+        let msg = parse_ws_message(raw);
+        assert!(matches!(msg, WsMessage::Pong));
+    }
+
+    #[test]
+    fn test_unknown_message() {
+        let raw = r#"{"channel":"status","data":[{"api_version":"v2","system":"online"}],"type":"update"}"#;
+        let msg = parse_ws_message(raw);
+        assert!(matches!(msg, WsMessage::Unknown(_)));
+    }
+
+    #[test]
+    fn test_invalid_json() {
+        let raw = "this is not json at all";
+        let msg = parse_ws_message(raw);
+        match msg {
+            WsMessage::Unknown(s) => assert_eq!(s, "this is not json at all"),
+            other => panic!("Expected Unknown, got {:?}", other),
+        }
+    }
+}

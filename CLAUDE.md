@@ -2,14 +2,16 @@
 
 ## Project Structure
 
-Cargo workspace with 6 crates under `crates/`:
+Cargo workspace with 8 crates under `crates/`:
 
 | Crate | Type | Binary | Description |
 |-------|------|--------|-------------|
 | `core` | library | — | Shared engine, exchange adapters, types, traits, config (`kraken_core`) |
-| `bot` | binary | `kraken-mm` | Main market-making bot |
+| `bot` | binary | `kraken-mm` | Market-making executor (dumb, no REST API, connects to state store) |
+| `state-store` | binary | `state-store` | CRUD service for pair configs/states, WS relay to bot (standalone, no `kraken-core` dep) |
+| `pnl-analyzer` | binary | `pnl-analyzer` | Edge metrics, pair promotion/demotion, writes to state store |
+| `mock-exchange` | binary | `mock-exchange` | Simulated Kraken exchange for testing (random walk + deterministic scenario mode) |
 | `proxy` | binary | `kraken-proxy` | Signing proxy (holds API keys, signs requests) |
-| `pnl-tracker` | binary | `pnl-tracker` | Standalone PnL analysis tool |
 | `recorder` | binary | `recorder` | Records live WS data to JSONL for replay |
 | `scanner` | binary | `scanner` | Scans Kraken pairs for MM opportunities (standalone, no `kraken-core` dep) |
 
@@ -31,7 +33,6 @@ All exchange interaction goes through traits for testability:
 - `ExchangeClient` — REST calls (balances, ticker, asset pairs, WS token)
 - `OrderManager` — place/amend/cancel orders (WS)
 - `DeadManSwitch` — cancel-all-after heartbeat
-- `StateStore` — persist/load bot state (JSON)
 - `TradeLogger` — append trade fills to CSV
 - `EventSource` — replay recorded events for testing
 - `Clock` / `SystemClock` — wall-clock abstraction
@@ -69,12 +70,13 @@ Caps per-pair exposure at `max_inventory_usd` and total at `max_total_exposure_u
 - `exchange/replay.rs` — Replay recorded JSONL for testing
 - `exchange/messages.rs` — Kraken WS v2 message types and parser
 
-### Proxy Mode
-When `PROXY_MODE=true`, the bot:
-- Uses `proxy_client.rs` instead of direct REST
-- Connects WS with `Authorization: Bearer {token}` header
-- Gets a placeholder WS token (proxy injects real one upstream)
-- Never sees API keys (proxy holds them)
+### Proxy Architecture
+The bot always connects through a proxy — there is no direct-to-Kraken path.
+Set `PROXY_URL` (required) and `PROXY_TOKEN` env vars. WS URLs are derived from `PROXY_URL`:
+- Private WS: `ws://{proxy}/ws/private`
+- Public WS: `ws://{proxy}/ws/public`
+- REST: routes through `ProxyClient` to `{proxy}/0/...`
+The bot never sees API keys (proxy holds them).
 
 ## Key Types
 - `TickerData` → `types/ticker.rs`
@@ -105,22 +107,66 @@ When `PROXY_MODE=true`, the bot:
 - Tests use `EventSource` trait to replay recorded data against engine
 
 ## State Persistence
-- `state.json` — positions, open orders, realized PnL, trade count
-- `logs/trades.csv` — append-only trade log
+- State store service is the source of truth for pair configs and state
+- `logs/trades.csv` — append-only trade log (local debug aid)
 
-## API Server (`api/server.rs`)
-REST API on `BOT_API_PORT` (default 3030) with `BOT_API_TOKEN` auth:
-- Routes through `ExchangeClient` trait, not raw reqwest
+## Per-Pair Architecture (Feb 2026 refactor)
+
+The engine no longer uses flat `disabled_pairs`/`sell_only_pairs`/`pending_liquidation`/`cooldown_until` collections. Each pair is a `ManagedPair`:
+
+```rust
+ManagedPair { symbol, state: PairState, config: PairConfig, quoter, pair_info, liq_retry_count }
+```
+
+**`PairState` enum:** `Disabled`, `WindDown` (sell-only, auto-disables on position=0), `Liquidating` (market sell, auto-disables on fill), `Active`
+
+**`PairConfig`:** per-pair overrides (all `Option<Decimal>`): `order_size_usd`, `max_inventory_usd`, `min_spread_bps`, `spread_capture_pct`, `min_profit_pct`, `stop_loss_pct`, `take_profit_pct`. `None` = use `GlobalDefaults`.
+
+**`ResolvedConfig`:** merge of pair config + global defaults, computed at quote time.
+
+Key types in `crates/core/src/types/managed_pair.rs`.
+
+## Service Architecture
+
+```
+Kraken WS ──► PnL Analyzer (edge metrics, promotes/demotes pairs)
+                   │ REST
+                   ▼
+             State Store (CRUD pairs/config, WS relay, JSON persistence)
+                   │ WS
+                   ▼
+             Bot (per-pair ManagedPair objects, dumb executor)
+```
+
+- **State Store** (port 3040): dumb CRUD + WS relay. API contract in `docs/STATE_STORE_API.md`
+- **PnL Analyzer** (port 3031): watches Kraken fills via proxy WS, computes per-pair `Net PnL / Traded Volume`, adjusts pair configs via state store REST
+- **Bot**: no REST API, connects to state store via WS for config/state updates. Falls back to config file if no state store URL.
 
 ## Key Patterns
 - All WS sends go through a single mpsc channel to a write loop (serialized access)
 - `req_id → cl_ord_id` map resolves Kraken rejection responses (Kraken often omits cl_ord_id in errors)
-- Pair disabling: `disabled_pairs` HashSet, checked at quote time
-- Sell-only mode: `sell_only_pairs` HashSet for downtrending pairs
+- Per-pair state checked via `pair.state.allows_quoting()` / `allows_buys()` / `allows_sells()`
 - Liquidation is two-phase: cancel pair orders → wait → market sell
+- State store auto-transitions WindDown/Liquidating → Disabled when bot reports position=0
+
+## Mock Exchange
+
+The `mock-exchange` crate simulates a Kraken exchange for integration testing.
+
+**Config:** All via env vars (`MOCK_PORT`, `MOCK_PAIRS`, `MOCK_SPREAD_PCT`, `MOCK_VOLATILITY`, `MOCK_FILL_PROBABILITY`, `MOCK_UPDATE_INTERVAL_MS`, `MOCK_SEED`, `MOCK_STARTING_USD`).
+
+**Deterministic Scenario Mode:** Set `MOCK_SCENARIO_FILE` to a JSON file path. Pairs listed in the scenario follow predefined price trajectories (waypoints with linear/step interpolation); unlisted pairs continue random-walking. Design doc: `docs/DETERMINISTIC_MOCK_DESIGN.md`.
+
+**Scenario files:** `test_data/scenarios/` — crash_recovery, gradual_uptrend, sideways_choppy, spread_widening, flash_spike, multi_pair_divergence.
+
+**Example:**
+```bash
+MOCK_SCENARIO_FILE=test_data/scenarios/crash_recovery.json \
+MOCK_SEED=42 MOCK_PAIRS="OMG/USD:0.50,CAMP/USD:0.004" \
+MOCK_UPDATE_INTERVAL_MS=500 cargo run -p mock-exchange
+```
 
 ## Known Behaviors
 - US:NJ restricted pairs (SPICE, STEP, EPT) get auto-disabled on first rejection
-- CAMP/USD enters sell-only mode when 24h change exceeds `downtrend_threshold_pct`
 - Dust positions below exchange minimums are removed from state (fixed Feb 2026)
 - No-op amends (same price) are skipped to avoid Kraken rejections (fixed Feb 2026)

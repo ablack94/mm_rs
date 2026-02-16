@@ -192,13 +192,6 @@ impl ExchangeClient for ProxyClient {
         Ok(balances)
     }
 
-    async fn get_ticker_raw(&self, pair: &str) -> Result<serde_json::Value> {
-        self.proxy_get(&format!("/0/public/Ticker?pair={}", pair)).await
-    }
-
-    async fn get_ohlc_raw(&self, pair: &str) -> Result<serde_json::Value> {
-        self.proxy_get(&format!("/0/public/OHLC?pair={}&interval=60", pair)).await
-    }
 }
 
 fn check_error(resp: &serde_json::Value) -> Result<()> {

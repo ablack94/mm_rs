@@ -1,0 +1,25 @@
+{
+  "name": "multi_pair_divergence",
+  "description": "OMG rises 15% while CAMP drops 15% over 60s",
+  "defaults": {
+    "spread_pct": 5.0,
+    "fill_probability": 0.4
+  },
+  "pairs": {
+    "OMG/USD": {
+      "starting_price": 0.50,
+      "waypoints": [
+        { "t_ms": 0,     "mid": 0.50 },
+        { "t_ms": 60000, "mid": 0.575 }
+      ]
+    },
+    "CAMP/USD": {
+      "starting_price": 0.004,
+      "waypoints": [
+        { "t_ms": 0,     "mid": 0.004 },
+        { "t_ms": 60000, "mid": 0.0034 }
+      ]
+    }
+  },
+  "end_behavior": "hold_last"
+}
