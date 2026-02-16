@@ -7,6 +7,10 @@ edition = "2021"
 name = "pnl-analyzer"
 path = "src/main.rs"
 
+[[bin]]
+name = "pnl-bootstrap"
+path = "src/bootstrap.rs"
+
 [dependencies]
 kraken-core = { path = "../core" }
 tokio = { version = "1", features = ["full"] }
