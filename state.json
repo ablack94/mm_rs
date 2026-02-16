@@ -1,0 +1,94 @@
+{
+  "positions": {
+    "OMG/USD": {
+      "qty": "3160.83507516",
+      "avg_cost": "0.0626623918799968703382271419"
+    },
+    "SUP/USD": {
+      "qty": "13062.50408203",
+      "avg_cost": "0.007668"
+    },
+    "KEEP/USD": {
+      "qty": "939.97219573",
+      "avg_cost": "0.03519"
+    },
+    "RAIN/USD": {
+      "qty": "14622.839",
+      "avg_cost": "0.0100061547075130086611604283"
+    },
+    "FXS/USD": {
+      "qty": "156.61707126",
+      "avg_cost": "0.646"
+    }
+  },
+  "open_orders": {
+    "bid-6": {
+      "cl_ord_id": "bid-6",
+      "symbol": "SUP/USD",
+      "side": "buy",
+      "price": "0.007668",
+      "qty": "13062.50408203",
+      "placed_at": "2026-02-16T00:42:25.244052356Z",
+      "acked": true
+    },
+    "liq-9": {
+      "cl_ord_id": "liq-9",
+      "symbol": "KEEP/USD",
+      "side": "sell",
+      "price": "0.03355",
+      "qty": "3859.09816549",
+      "placed_at": "2026-02-16T00:44:41.471999217Z",
+      "acked": true
+    },
+    "bid-10": {
+      "cl_ord_id": "bid-10",
+      "symbol": "KEEP/USD",
+      "side": "buy",
+      "price": "0.03519",
+      "qty": "2878.94054988",
+      "placed_at": "2026-02-16T00:44:41.445659Z",
+      "acked": true
+    },
+    "bid-5": {
+      "cl_ord_id": "bid-5",
+      "symbol": "FXS/USD",
+      "side": "buy",
+      "price": "0.628",
+      "qty": "156.61707126",
+      "placed_at": "2026-02-16T00:42:25.243953559Z",
+      "acked": true
+    },
+    "bid-3": {
+      "cl_ord_id": "bid-3",
+      "symbol": "HOUSE/USD",
+      "side": "buy",
+      "price": "0.000774",
+      "qty": "131926.12137",
+      "placed_at": "2026-02-16T00:42:25.243773248Z",
+      "acked": true
+    },
+    "ask-4": {
+      "cl_ord_id": "ask-4",
+      "symbol": "RAIN/USD",
+      "side": "sell",
+      "price": "0.010106",
+      "qty": "9780.90766823",
+      "placed_at": "2026-02-16T00:42:25.243864250Z",
+      "acked": true
+    },
+    "ask-1": {
+      "cl_ord_id": "ask-1",
+      "symbol": "OMG/USD",
+      "side": "sell",
+      "price": "0.063289",
+      "qty": "1626.83629146",
+      "placed_at": "2026-02-16T00:42:25.243543813Z",
+      "acked": true
+    }
+  },
+  "realized_pnl": "1034.8117106066122086903607189",
+  "total_fees": "17.9478369",
+  "trade_count": 162,
+  "started_at": "1970-01-01T00:00:00Z",
+  "paused": false
+}
