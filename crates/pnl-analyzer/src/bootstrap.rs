@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
 
     // Step 1: Fetch AssetPairs to build rest_name → ws_name mapping
     tracing::info!("Fetching asset pairs for name mapping...");
-    let pairs_resp = fetch_public(&client, proxy_url, "/0/public/AssetPairs").await?;
+    let pairs_resp = fetch_public(&client, proxy_url, &args.proxy_token, "/0/public/AssetPairs").await?;
     let rest_to_ws = build_pair_mapping(&pairs_resp)?;
     tracing::info!(pairs = rest_to_ws.len(), "Built pair name mapping");
 
@@ -239,9 +239,10 @@ async fn fetch_private(
     Ok(resp)
 }
 
-async fn fetch_public(client: &reqwest::Client, proxy_url: &str, path: &str) -> Result<Value> {
+async fn fetch_public(client: &reqwest::Client, proxy_url: &str, token: &str, path: &str) -> Result<Value> {
     let resp: Value = client
         .get(format!("{}{}", proxy_url, path))
+        .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?
         .json()
