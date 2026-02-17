@@ -20,6 +20,7 @@ enum WsRequest {
 
 /// Live Kraken exchange adapter: uses a single private WS connection
 /// for both sending orders and receiving executions/responses.
+/// The private WS automatically reconnects on disconnect.
 pub struct LiveExchange {
     config: Config,
     /// Channel to send serialized WS messages to the write loop.
@@ -28,15 +29,18 @@ pub struct LiveExchange {
     token: String,
     /// Maps req_id → cl_ord_id so we can route rejection responses.
     req_id_map: Arc<Mutex<HashMap<u64, String>>>,
+    /// Shared writer that gets swapped on reconnect (kept alive via Arc clones in tasks).
+    #[allow(dead_code)]
+    shared_writer: Arc<Mutex<Option<WsWriter>>>,
     /// Internal task handles for clean shutdown.
-    read_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    reconnect_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     write_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl LiveExchange {
     /// Connect to Kraken: opens one private WS connection, splits it into
     /// a write loop (for orders/DMS) and a read loop (for executions/responses).
-    /// The read loop sends EngineEvents into `event_tx`.
+    /// The read loop automatically reconnects on disconnect with exponential backoff.
     ///
     /// In proxy mode, connects to the proxy's WS endpoint and uses a placeholder
     /// token (the proxy injects the real token on the upstream side).
@@ -49,176 +53,83 @@ impl LiveExchange {
         tracing::info!("Fetching WS auth token...");
         let token = exchange.get_ws_token().await?;
 
-        // Connect private WS through proxy
+        // Build WS URL
         let base = config.exchange.proxy_url.trim_end_matches('/');
         let ws_base = base.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
         let ws_url = format!("{}/ws/private", ws_base);
         tracing::info!(url = ws_url, "Connecting private WS...");
-        let priv_ws = WsConnection::connect_with_token(&ws_url, &config.exchange.proxy_token).await?;
 
-        // Split into read/write halves
-        let (mut writer, mut reader) = priv_ws.into_split();
+        // Initial connection + subscribe
+        let (writer, reader) = try_private_connect(&ws_url, &config.exchange.proxy_token, &token).await?;
 
-        // Subscribe to executions on the write half
-        let sub_msg = serde_json::to_string(&SubscribeExecMsg {
-            method: "subscribe",
-            params: SubscribeExecParams {
-                channel: "executions",
-                snap_orders: true,
-                snap_trades: false,
-                ratecounter: true,
-                token: token.clone(),
-            },
-        })?;
-        writer.send_raw(&sub_msg).await?;
-
-        // Shared map: req_id → cl_ord_id for resolving rejections
+        // Shared state
+        let shared_writer: Arc<Mutex<Option<WsWriter>>> = Arc::new(Mutex::new(Some(writer)));
         let req_id_map = Arc::new(Mutex::new(HashMap::<u64, String>::new()));
+
+        // Spawn reconnect loop (owns the read side lifecycle)
+        let reconnect_writer = shared_writer.clone();
+        let reconnect_token = token.clone();
+        let proxy_token = config.exchange.proxy_token.clone();
         let req_id_map_read = req_id_map.clone();
 
-        // Spawn the read loop: routes executions + order responses into the engine
-        let read_handle = tokio::spawn(async move {
-            while let Some(raw) = reader.recv().await {
-                let msg = parse_ws_message(&raw);
-                let event = match msg {
-                    WsMessage::Execution(report) => {
-                        match report.exec_type.as_str() {
-                            "trade" => {
-                                // Actual trade execution with price/qty data
-                                let side = if report.side == "buy" {
-                                    OrderSide::Buy
-                                } else {
-                                    OrderSide::Sell
-                                };
-                                tracing::info!(
-                                    symbol = report.symbol,
-                                    side = report.side,
-                                    price = %report.last_price,
-                                    qty = %report.last_qty,
-                                    order_status = report.order_status,
-                                    "Execution report: trade"
-                                );
-                                Some(EngineEvent::Fill(Fill {
-                                    order_id: report.order_id,
-                                    cl_ord_id: report.cl_ord_id,
-                                    symbol: report.symbol,
-                                    side,
-                                    price: report.last_price,
-                                    qty: report.last_qty,
-                                    fee: report.fee,
-                                    is_maker: report.is_maker,
-                                    is_fully_filled: report.order_status == "filled",
-                                    timestamp: report.timestamp,
-                                }))
-                            }
-                            "filled" => {
-                                // Order fully filled status update (no trade data).
-                                // The actual fill came via exec_type "trade" above.
-                                tracing::info!(
-                                    cl_ord_id = report.cl_ord_id,
-                                    symbol = report.symbol,
-                                    "Order fully filled (status update)"
-                                );
-                                None
-                            }
-                            "new" | "pending_new" => {
-                                tracing::info!(
-                                    cl_ord_id = report.cl_ord_id,
-                                    order_id = report.order_id,
-                                    exec_type = report.exec_type,
-                                    "Order acknowledged by exchange"
-                                );
-                                Some(EngineEvent::OrderAcknowledged {
-                                    cl_ord_id: report.cl_ord_id,
-                                    order_id: report.order_id,
-                                })
-                            }
-                            "canceled" | "expired" => {
-                                tracing::info!(
-                                    cl_ord_id = report.cl_ord_id,
-                                    symbol = report.symbol,
-                                    exec_type = report.exec_type,
-                                    "Order cancelled/expired"
-                                );
-                                Some(EngineEvent::OrderCancelled {
-                                    cl_ord_id: report.cl_ord_id,
-                                    symbol: report.symbol,
-                                })
-                            }
-                            other => {
-                                tracing::debug!(
-                                    exec_type = other,
-                                    cl_ord_id = report.cl_ord_id,
-                                    "Unhandled exec_type"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    WsMessage::OrderResponse {
-                        success,
-                        method,
-                        error,
-                        cl_ord_id,
-                        req_id,
-                        ..
-                    } => {
-                        if !success {
-                            // Resolve cl_ord_id: Kraken often omits it in error responses,
-                            // so fall back to our req_id → cl_ord_id map.
-                            let resolved_id = match cl_ord_id {
-                                Some(id) => Some(id),
-                                None => req_id_map_read.lock().await.remove(&req_id),
-                            };
-                            let err_msg = error.as_deref().unwrap_or("unknown");
-                            tracing::warn!(
-                                method,
-                                req_id,
-                                cl_ord_id = resolved_id.as_deref().unwrap_or("?"),
-                                error = err_msg,
-                                "Order rejected by exchange"
-                            );
-                            // Feed rejection back to engine so it can clean up state
-                            resolved_id.map(|id| EngineEvent::OrderRejected {
-                                cl_ord_id: id,
-                                symbol: String::new(), // filled in by engine lookup
-                                reason: err_msg.to_string(),
-                            })
-                        } else {
-                            // Clean up the mapping on success
-                            req_id_map_read.lock().await.remove(&req_id);
-                            tracing::debug!(method, "Order response OK");
-                            None
-                        }
-                    }
-                    WsMessage::SubscribeConfirmed { channel } => {
-                        tracing::info!(channel, "Private subscription confirmed");
-                        None
-                    }
-                    WsMessage::Heartbeat | WsMessage::Pong => None,
-                    WsMessage::ExecutionSnapshot(_) => {
-                        tracing::info!("Ignoring execution snapshot (positions loaded from state)");
-                        None
-                    }
-                    _ => None,
-                };
-                if let Some(e) = event {
-                    if event_tx.send(e).await.is_err() {
-                        break;
-                    }
+        let reconnect_handle = tokio::spawn(async move {
+            // Run initial read loop
+            run_private_read_loop(reader, &event_tx, &req_id_map_read).await;
+
+            // Reconnect loop: backoff → connect → subscribe → read → repeat
+            loop {
+                if event_tx.is_closed() {
+                    tracing::info!("Engine event channel closed, stopping private WS reconnect");
+                    break;
                 }
+
+                // Clear writer so write loop stops sending to dead connection
+                *reconnect_writer.lock().await = None;
+
+                // Backoff and reconnect
+                let mut backoff_secs = 1u64;
+                let (new_writer, new_reader) = loop {
+                    tracing::warn!(backoff_secs, "Private WS disconnected, reconnecting...");
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+
+                    if event_tx.is_closed() {
+                        tracing::info!("Engine event channel closed during reconnect backoff");
+                        return;
+                    }
+
+                    match try_private_connect(&ws_url, &proxy_token, &reconnect_token).await {
+                        Ok(pair) => break pair,
+                        Err(e) => {
+                            tracing::error!(error = %e, "Private WS reconnect failed");
+                            backoff_secs = (backoff_secs * 2).min(30);
+                        }
+                    }
+                };
+
+                // Swap new writer in for the write loop
+                *reconnect_writer.lock().await = Some(new_writer);
+                tracing::info!("Private WS reconnected successfully");
+
+                // Run read loop until next disconnect
+                run_private_read_loop(new_reader, &event_tx, &req_id_map_read).await;
             }
-            tracing::warn!("Private WS read loop ended");
         });
 
-        // Spawn the write loop: serializes WS sends through a channel
+        // Write loop: reads from channel, sends through shared writer
         let (ws_write_tx, mut ws_write_rx) = mpsc::channel::<WsRequest>(256);
+        let write_shared = shared_writer.clone();
         let write_handle = tokio::spawn(async move {
             while let Some(req) = ws_write_rx.recv().await {
                 match req {
                     WsRequest::Json(text) => {
-                        if let Err(e) = writer.send_raw(&text).await {
-                            tracing::error!(error = %e, "WS write error");
+                        let mut guard = write_shared.lock().await;
+                        if let Some(ref mut w) = *guard {
+                            if let Err(e) = w.send_raw(&text).await {
+                                tracing::error!(error = %e, "WS write error (connection lost)");
+                                *guard = None;
+                            }
+                        } else {
+                            tracing::warn!("WS write dropped: no active connection");
                         }
                     }
                 }
@@ -231,14 +142,15 @@ impl LiveExchange {
             req_counter: Arc::new(Mutex::new(0u64)),
             token,
             req_id_map,
-            read_handle: Mutex::new(Some(read_handle)),
+            shared_writer,
+            reconnect_handle: Mutex::new(Some(reconnect_handle)),
             write_handle: Mutex::new(Some(write_handle)),
         })
     }
 
     /// Abort internal read/write tasks for clean shutdown.
     pub async fn abort_tasks(&self) {
-        if let Some(h) = self.read_handle.lock().await.take() {
+        if let Some(h) = self.reconnect_handle.lock().await.take() {
             h.abort();
         }
         if let Some(h) = self.write_handle.lock().await.take() {
@@ -406,6 +318,163 @@ impl DeadManSwitch for LiveExchange {
     async fn disable(&self) -> Result<()> {
         self.refresh(0).await
     }
+}
+
+// --- Private WS helpers ---
+
+/// Connect to the private WS, subscribe to executions, and return (writer, reader).
+async fn try_private_connect(
+    ws_url: &str,
+    proxy_token: &str,
+    exec_token: &str,
+) -> Result<(WsWriter, WsReader)> {
+    let ws = WsConnection::connect_with_token(ws_url, proxy_token).await?;
+    let (mut writer, reader) = ws.into_split();
+    let sub_msg = serde_json::to_string(&SubscribeExecMsg {
+        method: "subscribe",
+        params: SubscribeExecParams {
+            channel: "executions",
+            snap_orders: true,
+            snap_trades: false,
+            ratecounter: true,
+            token: exec_token.to_string(),
+        },
+    })?;
+    writer.send_raw(&sub_msg).await?;
+    Ok((writer, reader))
+}
+
+/// Read loop for private WS: routes executions and order responses into the engine.
+/// Returns when the WS connection closes or the event channel is dropped.
+async fn run_private_read_loop(
+    mut reader: WsReader,
+    event_tx: &mpsc::Sender<EngineEvent>,
+    req_id_map: &Arc<Mutex<HashMap<u64, String>>>,
+) {
+    while let Some(raw) = reader.recv().await {
+        let msg = parse_ws_message(&raw);
+        let event = match msg {
+            WsMessage::Execution(report) => {
+                match report.exec_type.as_str() {
+                    "trade" => {
+                        let side = if report.side == "buy" {
+                            OrderSide::Buy
+                        } else {
+                            OrderSide::Sell
+                        };
+                        tracing::info!(
+                            symbol = report.symbol,
+                            side = report.side,
+                            price = %report.last_price,
+                            qty = %report.last_qty,
+                            order_status = report.order_status,
+                            "Execution report: trade"
+                        );
+                        Some(EngineEvent::Fill(Fill {
+                            order_id: report.order_id,
+                            cl_ord_id: report.cl_ord_id,
+                            symbol: report.symbol,
+                            side,
+                            price: report.last_price,
+                            qty: report.last_qty,
+                            fee: report.fee,
+                            is_maker: report.is_maker,
+                            is_fully_filled: report.order_status == "filled",
+                            timestamp: report.timestamp,
+                        }))
+                    }
+                    "filled" => {
+                        tracing::info!(
+                            cl_ord_id = report.cl_ord_id,
+                            symbol = report.symbol,
+                            "Order fully filled (status update)"
+                        );
+                        None
+                    }
+                    "new" | "pending_new" => {
+                        tracing::info!(
+                            cl_ord_id = report.cl_ord_id,
+                            order_id = report.order_id,
+                            exec_type = report.exec_type,
+                            "Order acknowledged by exchange"
+                        );
+                        Some(EngineEvent::OrderAcknowledged {
+                            cl_ord_id: report.cl_ord_id,
+                            order_id: report.order_id,
+                        })
+                    }
+                    "canceled" | "expired" => {
+                        tracing::info!(
+                            cl_ord_id = report.cl_ord_id,
+                            symbol = report.symbol,
+                            exec_type = report.exec_type,
+                            "Order cancelled/expired"
+                        );
+                        Some(EngineEvent::OrderCancelled {
+                            cl_ord_id: report.cl_ord_id,
+                            symbol: report.symbol,
+                        })
+                    }
+                    other => {
+                        tracing::debug!(
+                            exec_type = other,
+                            cl_ord_id = report.cl_ord_id,
+                            "Unhandled exec_type"
+                        );
+                        None
+                    }
+                }
+            }
+            WsMessage::OrderResponse {
+                success,
+                method,
+                error,
+                cl_ord_id,
+                req_id,
+                ..
+            } => {
+                if !success {
+                    let resolved_id = match cl_ord_id {
+                        Some(id) => Some(id),
+                        None => req_id_map.lock().await.remove(&req_id),
+                    };
+                    let err_msg = error.as_deref().unwrap_or("unknown");
+                    tracing::warn!(
+                        method,
+                        req_id,
+                        cl_ord_id = resolved_id.as_deref().unwrap_or("?"),
+                        error = err_msg,
+                        "Order rejected by exchange"
+                    );
+                    resolved_id.map(|id| EngineEvent::OrderRejected {
+                        cl_ord_id: id,
+                        symbol: String::new(),
+                        reason: err_msg.to_string(),
+                    })
+                } else {
+                    req_id_map.lock().await.remove(&req_id);
+                    tracing::debug!(method, "Order response OK");
+                    None
+                }
+            }
+            WsMessage::SubscribeConfirmed { channel } => {
+                tracing::info!(channel, "Private subscription confirmed");
+                None
+            }
+            WsMessage::Heartbeat | WsMessage::Pong => None,
+            WsMessage::ExecutionSnapshot(_) => {
+                tracing::info!("Ignoring execution snapshot (positions loaded from state)");
+                None
+            }
+            _ => None,
+        };
+        if let Some(e) = event {
+            if event_tx.send(e).await.is_err() {
+                break;
+            }
+        }
+    }
+    tracing::warn!("Private WS read loop ended");
 }
 
 // --- Book feed (public WS, separate connection) ---
