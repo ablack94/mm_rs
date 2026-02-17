@@ -293,6 +293,15 @@ def build_dashboard_data() -> dict:
 
     merged_pairs.sort(key=lambda p: p["symbol"])
 
+    # 8. Recent trades from PnL analyzer
+    trades_resp = _pnl_get("/trades?limit=100")
+    recent_trades = []
+    if isinstance(trades_resp, list):
+        recent_trades = trades_resp
+    elif isinstance(trades_resp, dict) and "_error" not in trades_resp:
+        # In case the endpoint wraps in an object
+        recent_trades = trades_resp.get("trades", trades_resp)
+
     # Positions: filtered to pairs with qty > 0
     positions = []
     total_cost_basis = 0.0
@@ -345,6 +354,7 @@ def build_dashboard_data() -> dict:
         "defaults": defaults,
         "pairs": merged_pairs,
         "positions": positions,
+        "recent_trades": recent_trades,
     }
 
 
@@ -555,6 +565,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .config-hover:hover { color: var(--blue); }
 
+  /* Side badges for trades */
+  .badge-buy  { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-sell { background: rgba(248,81,73,0.15); color: var(--red); }
+
   @media (max-width: 600px) {
     .summary-grid { grid-template-columns: repeat(2, 1fr); }
     .defaults-grid { grid-template-columns: repeat(2, 1fr); }
@@ -657,6 +671,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </table>
 </div>
 
+<!-- Recent Trades -->
+<div class="section">
+  <div class="section-title">Recent Trades</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Pair</th>
+        <th>Side</th>
+        <th class="num">Price</th>
+        <th class="num">Qty</th>
+        <th class="num">Value</th>
+        <th class="num">Fee</th>
+        <th class="num">P&L</th>
+      </tr>
+    </thead>
+    <tbody id="tradesBody">
+      <tr><td colspan="8" class="empty-msg">Loading...</td></tr>
+    </tbody>
+  </table>
+</div>
+
 <script>
 const REFRESH_INTERVAL = 15; // seconds
 let countdown = REFRESH_INTERVAL;
@@ -699,6 +735,22 @@ function pnlClass(n) {
   if (n > 0.005) return 'positive';
   if (n < -0.005) return 'negative';
   return 'neutral';
+}
+
+function fmtTradeTime(ts) {
+  if (!ts) return '--';
+  try {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return '--';
+    const now = new Date();
+    const diffMs = now - d;
+    const diffSec = Math.floor(diffMs / 1000);
+    if (diffSec < 60) return diffSec + 's ago';
+    if (diffSec < 3600) return Math.floor(diffSec / 60) + 'm ago';
+    if (diffSec < 86400) return d.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    return d.toLocaleDateString('en-US', {month: 'short', day: 'numeric'}) + ' ' +
+           d.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit'});
+  } catch (e) { return '--'; }
 }
 
 function fmtEdge(val) {
@@ -864,6 +916,31 @@ function updateDashboard(data) {
       html += '</tr>';
     }
     posBody.innerHTML = html;
+  }
+
+  // Recent Trades table
+  const tradesBody = document.getElementById('tradesBody');
+  const trades = data.recent_trades || [];
+  if (trades.length === 0) {
+    tradesBody.innerHTML = '<tr><td colspan="8" class="empty-msg">No recent trades</td></tr>';
+  } else {
+    let html = '';
+    for (const t of trades) {
+      const sideClass = t.side === 'buy' ? 'badge-buy' : 'badge-sell';
+      const sideLabel = (t.side || '').toUpperCase();
+      const pCls = pnlClass(parseFloat(t.pnl) || 0);
+      html += '<tr>';
+      html += '<td>' + fmtTradeTime(t.timestamp) + '</td>';
+      html += '<td><strong>' + (t.symbol || '--') + '</strong></td>';
+      html += '<td><span class="badge ' + sideClass + '">' + sideLabel + '</span></td>';
+      html += '<td class="num">' + fmtPrice(parseFloat(t.price)) + '</td>';
+      html += '<td class="num">' + fmtQty(parseFloat(t.qty)) + '</td>';
+      html += '<td class="num">' + fmtUsd(parseFloat(t.value)) + '</td>';
+      html += '<td class="num">' + fmtUsd(parseFloat(t.fee)) + '</td>';
+      html += '<td class="num ' + pCls + '">' + fmtUsd(parseFloat(t.pnl)) + '</td>';
+      html += '</tr>';
+    }
+    tradesBody.innerHTML = html;
   }
 }
 

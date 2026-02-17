@@ -5,7 +5,7 @@ mod state_store;
 use anyhow::Result;
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::get,
@@ -551,11 +551,17 @@ async fn run_evaluation_cycle(
 // REST API
 // ---------------------------------------------------------------------------
 
+#[derive(serde::Deserialize)]
+struct TradesQuery {
+    limit: Option<usize>,
+}
+
 fn build_router(shared: Arc<AppState>) -> Router {
     Router::new()
         .route("/pnl", get(get_pnl))
         .route("/pairs", get(get_pairs))
         .route("/pairs/{symbol}", get(get_pair_detail))
+        .route("/trades", get(get_trades))
         .with_state(shared)
 }
 
@@ -618,6 +624,41 @@ async fn get_pnl(
             "uptime_secs": uptime,
         })),
     )
+}
+
+async fn get_trades(
+    headers: HeaderMap,
+    Query(params): Query<TradesQuery>,
+    State(shared): State<Arc<AppState>>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(e) = check_auth(&headers, &shared.api_token) {
+        return e;
+    }
+
+    let limit = params.limit.unwrap_or(50);
+    let tracker = shared.tracker.read().await;
+
+    let trades: Vec<Value> = tracker
+        .recent_trades
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|t| {
+            let value = t.price * t.qty;
+            json!({
+                "timestamp": t.timestamp,
+                "symbol": t.symbol,
+                "side": t.side,
+                "price": t.price,
+                "qty": t.qty,
+                "value": value,
+                "fee": t.fee,
+                "pnl": t.pnl,
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(json!(trades)))
 }
 
 async fn get_pairs(
