@@ -128,9 +128,7 @@ async fn main() -> Result<()> {
         start_time: Instant::now(),
     });
 
-    // Connect to proxy WS for execution feeds
-    let proxy_client = ProxyClient::new(args.proxy_url.clone(), args.proxy_token.clone());
-
+    // WS connection info for execution feeds
     let ws_url = {
         let base = args.proxy_url.trim_end_matches('/');
         let ws_base = base
@@ -138,25 +136,8 @@ async fn main() -> Result<()> {
             .replacen("https://", "wss://", 1);
         format!("{}/ws/private", ws_base)
     };
-
-    tracing::info!(url = ws_url, "Connecting to proxy WS for execution feed...");
-    let mut ws = WsConnection::connect_with_token(&ws_url, &args.proxy_token).await?;
-
-    // Subscribe to executions with snap_trades for recent history
-    let token = proxy_client.get_ws_token().await?;
-    ws.send_json(&SubscribeExecMsg {
-        method: "subscribe",
-        params: SubscribeExecParams {
-            channel: "executions",
-            snap_orders: false,
-            snap_trades: true,
-            ratecounter: false,
-            token,
-        },
-    })
-    .await?;
-
-    tracing::info!("Subscribed to execution feed");
+    let proxy_url = args.proxy_url.clone();
+    let proxy_token = args.proxy_token.clone();
 
     // Spawn the REST API
     let api_shared = shared.clone();
@@ -172,10 +153,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn the fill processing loop
+    // Spawn the fill processing loop with reconnection
     let feed_shared = shared.clone();
     let feed_handle = tokio::spawn(async move {
-        process_fill_feed(ws, feed_shared).await;
+        run_feed_with_reconnect(feed_shared, &ws_url, &proxy_url, &proxy_token).await;
     });
 
     // Spawn the evaluation loop
@@ -211,7 +192,55 @@ async fn main() -> Result<()> {
 // Fill feed processing
 // ---------------------------------------------------------------------------
 
-async fn process_fill_feed(mut ws: WsConnection, shared: Arc<AppState>) {
+async fn run_feed_with_reconnect(
+    shared: Arc<AppState>,
+    ws_url: &str,
+    proxy_url: &str,
+    proxy_token: &str,
+) {
+    let mut backoff_secs = 1u64;
+    let max_backoff = 30u64;
+
+    loop {
+        tracing::info!(url = ws_url, "Connecting to proxy WS for execution feed...");
+
+        let result: Result<()> = async {
+            let mut ws = WsConnection::connect_with_token(ws_url, proxy_token).await?;
+
+            let proxy_client = ProxyClient::new(proxy_url.to_string(), proxy_token.to_string());
+            let token = proxy_client.get_ws_token().await?;
+            ws.send_json(&SubscribeExecMsg {
+                method: "subscribe",
+                params: SubscribeExecParams {
+                    channel: "executions",
+                    snap_orders: false,
+                    snap_trades: true,
+                    ratecounter: false,
+                    token,
+                },
+            })
+            .await?;
+
+            tracing::info!("Subscribed to execution feed");
+            backoff_secs = 1; // reset on successful connect
+
+            process_fill_feed(&mut ws, &shared).await;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            tracing::warn!(error = %e, backoff_secs, "WS connection failed, will retry");
+        } else {
+            tracing::warn!(backoff_secs, "WS execution feed disconnected, will reconnect");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(max_backoff);
+    }
+}
+
+async fn process_fill_feed(ws: &mut WsConnection, shared: &Arc<AppState>) {
     while let Some(raw) = ws.recv().await {
         let msg = parse_ws_message(&raw);
         match msg {
@@ -300,7 +329,6 @@ async fn process_fill_feed(mut ws: WsConnection, shared: Arc<AppState>) {
             _ => {}
         }
     }
-    tracing::warn!("WS execution feed ended");
 }
 
 // ---------------------------------------------------------------------------

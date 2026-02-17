@@ -283,9 +283,10 @@ impl LiveExchange {
         tracing::info!(url, ?pairs, "Connecting public WS for book data");
         let pairs = pairs.to_vec();
         let depth = self.config.exchange.book_depth;
+        let proxy_token = self.config.exchange.proxy_token.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_book_feed_dynamic(&url, &pairs, depth, &tx, sub_rx).await {
+            if let Err(e) = run_book_feed_dynamic(&url, &proxy_token, &pairs, depth, &tx, sub_rx).await {
                 tracing::error!(error = %e, "Book feed error");
             }
         });
@@ -411,12 +412,13 @@ impl DeadManSwitch for LiveExchange {
 
 async fn run_book_feed_dynamic(
     url: &str,
+    proxy_token: &str,
     pairs: &[String],
     depth: u32,
     tx: &mpsc::Sender<EngineEvent>,
     sub_rx: Option<mpsc::Receiver<Vec<String>>>,
 ) -> Result<()> {
-    let ws = WsConnection::connect(url).await?;
+    let ws = WsConnection::connect_with_token(url, proxy_token).await?;
     tracing::info!("Public WS connected");
     let (mut writer, mut reader) = ws.into_split();
 

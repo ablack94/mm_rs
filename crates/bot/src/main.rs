@@ -252,7 +252,7 @@ async fn run_dry(
         .replacen("http://", "ws://", 1)
         .replacen("https://", "wss://", 1);
     let pub_ws_url = format!("{}/ws/public", ws_base);
-    let pub_ws = WsConnection::connect(&pub_ws_url).await?;
+    let pub_ws = WsConnection::connect_with_token(&pub_ws_url, &config.exchange.proxy_token).await?;
     tracing::info!(url = pub_ws_url, "Public WS connected");
     let (mut pub_writer, mut pub_reader) = pub_ws.into_split();
     let depth = config.exchange.book_depth;

@@ -123,7 +123,7 @@ pub enum InboundMessage {
         #[allow(dead_code)]
         active_pairs: u32,
         #[allow(dead_code)]
-        total_exposure_usd: f64,
+        total_exposure_usd: String,
     },
     PairReport {
         symbol: String,
