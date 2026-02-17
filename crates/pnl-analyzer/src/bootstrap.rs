@@ -155,8 +155,46 @@ async fn main() -> Result<()> {
 
     // Step 4: Apply to PnlTracker
     let mut tracker = PnlTracker::new();
+    let mut seeded = 0u64;
     for (_, fill) in &all_trades {
+        // If selling a pair we never tracked buying, seed cost basis at the sell price.
+        // We don't know the real cost for pre-bootstrap positions, so assume break-even
+        // to avoid phantom PnL. Only fees are counted as a loss.
+        if matches!(fill.side, OrderSide::Sell) {
+            let held = tracker
+                .positions
+                .get(&fill.symbol)
+                .map(|p| p.qty)
+                .unwrap_or(Decimal::ZERO);
+            if held < fill.qty {
+                let shortfall = fill.qty - held;
+                let seed = Fill {
+                    order_id: String::new(),
+                    cl_ord_id: String::new(),
+                    symbol: fill.symbol.clone(),
+                    side: OrderSide::Buy,
+                    price: fill.price,
+                    qty: shortfall,
+                    fee: Decimal::ZERO,
+                    is_maker: false,
+                    is_fully_filled: true,
+                    timestamp: fill.timestamp,
+                };
+                tracing::warn!(
+                    symbol = fill.symbol,
+                    shortfall = %shortfall,
+                    price = %fill.price,
+                    "Seeding cost basis for pre-bootstrap position (PnL will be 0 for this sell)"
+                );
+                tracker.apply_fill(&seed);
+                seeded += 1;
+            }
+        }
         tracker.apply_fill(fill);
+    }
+
+    if seeded > 0 {
+        tracing::info!(seeded, "Seeded cost basis for sells without tracked buys");
     }
 
     // Step 5: Print summary
