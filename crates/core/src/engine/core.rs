@@ -1246,11 +1246,33 @@ impl Engine {
         match quotes {
             None => {
                 // Spread too narrow to place NEW quotes.
-                // But if already quoting, apply hysteresis: only cancel if spread
-                // drops to 70% of min_spread_bps. This prevents rapid place/cancel
-                // oscillation when spread hovers right at the threshold.
                 let quoter = &self.pairs.get(symbol).unwrap().quoter;
-                if quoter.state != QuoteState::Idle {
+                let has_position = !self.state.position(symbol).is_empty();
+
+                // WindDown with position: NEVER cancel sell orders due to spread.
+                // The whole point of WindDown is to exit — keep sells on the book.
+                if pair_state == PairState::WindDown && has_position {
+                    if quoter.state == QuoteState::Idle {
+                        // Place a sell at best_ask regardless of spread
+                        tracing::info!(
+                            symbol,
+                            spread_bps = %spread_bps_raw,
+                            best_ask = %best_ask,
+                            "WindDown: placing sell at best ask despite narrow spread"
+                        );
+                        self.place_fresh_quotes(
+                            symbol, best_bid, best_ask, qty, mid, timestamp, &risk, pair_state,
+                        )
+                    } else {
+                        tracing::debug!(
+                            symbol,
+                            spread_bps = %spread_bps_raw,
+                            "WindDown: holding existing sell (ignoring narrow spread)"
+                        );
+                        vec![]
+                    }
+                } else if quoter.state != QuoteState::Idle {
+                    // Apply hysteresis: only cancel if spread drops to 70% of threshold.
                     let cancel_threshold = resolved.min_spread_bps * dec!(0.7);
                     if spread_bps_raw < cancel_threshold {
                         tracing::info!(
