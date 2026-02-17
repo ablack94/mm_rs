@@ -268,14 +268,15 @@ impl LiveExchange {
     pub async fn spawn_book_feed(
         &self,
         tx: mpsc::Sender<EngineEvent>,
+        pairs: &[String],
     ) -> Result<tokio::task::JoinHandle<()>> {
         let base = self.config.exchange.proxy_url.trim_end_matches('/');
         let ws_base = base
             .replacen("http://", "ws://", 1)
             .replacen("https://", "wss://", 1);
         let url = format!("{}/ws/public", ws_base);
-        tracing::info!(url, "Connecting public WS for book data");
-        let pairs = self.config.trading.pairs.clone();
+        tracing::info!(url, ?pairs, "Connecting public WS for book data");
+        let pairs = pairs.to_vec();
         let depth = self.config.exchange.book_depth;
 
         let handle = tokio::spawn(async move {

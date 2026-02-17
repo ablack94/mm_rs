@@ -416,11 +416,7 @@ impl Engine {
                     }
                 }
 
-                // Note: we do NOT remove pairs that are in self.pairs but not in the
-                // snapshot, because the engine may have pairs from config file that the
-                // state store doesn't know about. The state store only manages the pairs
-                // it knows about.
-                let _ = snapshot_symbols; // used above, suppress unused warning
+                let _ = snapshot_symbols; // used above in the loop
 
                 vec![EngineCommand::PersistState(self.state.clone())]
             }

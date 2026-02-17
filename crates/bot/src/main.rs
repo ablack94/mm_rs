@@ -24,10 +24,6 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
-    /// Target pairs (e.g., CAMP/USD SUP/USD)
-    #[arg(long, num_args = 1..)]
-    pairs: Vec<String>,
-
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -46,36 +42,61 @@ async fn main() -> Result<()> {
     config.exchange.proxy_token = std::env::var("PROXY_TOKEN").unwrap_or_default();
     config.trading.dry_run = args.dry_run;
 
-    if !args.pairs.is_empty() {
-        config.trading.pairs = args.pairs;
-    }
-
-    if config.trading.pairs.is_empty() {
-        anyhow::bail!(
-            "No pairs specified. Use --pairs CAMP/USD SUP/USD ..."
-        );
-    }
-
     if config.exchange.proxy_url.is_empty() {
         anyhow::bail!("PROXY_URL is required (e.g., http://localhost:3053)");
+    }
+
+    let state_store_url = std::env::var("STATE_STORE_URL").unwrap_or_default();
+    let state_store_token = std::env::var("STATE_STORE_TOKEN").unwrap_or_default();
+
+    if state_store_url.is_empty() {
+        anyhow::bail!("STATE_STORE_URL is required (e.g., http://localhost:3040)");
     }
 
     let mode = if config.trading.dry_run { "DRY-RUN" } else { "LIVE" };
     tracing::info!(
         mode,
-        pairs = ?config.trading.pairs,
         proxy_url = config.exchange.proxy_url,
+        state_store_url,
         "Starting Kraken Market Maker"
     );
+
+    // State store channels:
+    // - ss_cmd_rx: state store client -> bot (pair configs, defaults)
+    // - ss_snapshot_tx: bot -> state store client (engine snapshots for heartbeat/reports)
+    let (ss_cmd_tx, ss_cmd_rx) = mpsc::channel::<StateStoreCommand>(64);
+    let (ss_snapshot_tx, ss_snapshot_rx) = mpsc::channel::<EngineSnapshot>(4);
+
+    tracing::info!(url = state_store_url, "Connecting to state store");
+    let ss_config = StateStoreConfig {
+        url: state_store_url,
+        token: state_store_token,
+        ..Default::default()
+    };
+    let client = StateStoreClient::new(ss_config, ss_cmd_tx, ss_snapshot_rx);
+    let ss_handle = tokio::spawn(async move { client.run().await });
+
+    // Wait for initial snapshot from state store to get pair list
+    let (initial_snapshot, ss_cmd_rx) = wait_for_snapshot(ss_cmd_rx).await?;
+
+    let pairs: Vec<String> = initial_snapshot.pairs.iter()
+        .map(|p| p.symbol.clone())
+        .collect();
+
+    if pairs.is_empty() {
+        anyhow::bail!("State store returned no pairs. Add pairs via the state store API first.");
+    }
+
+    tracing::info!(?pairs, "Got {} pairs from state store", pairs.len());
 
     let exchange: Arc<dyn ExchangeClient> = Arc::new(ProxyClient::new(
         config.exchange.proxy_url.clone(),
         config.exchange.proxy_token.clone(),
     ));
 
-    // Fetch pair info
+    // Fetch pair info for state store pairs
     tracing::info!("Fetching pair info...");
-    let pair_info = exchange.get_pair_info(&config.trading.pairs).await?;
+    let pair_info = exchange.get_pair_info(&pairs).await?;
 
     for (symbol, info) in &pair_info {
         tracing::info!(
@@ -90,50 +111,56 @@ async fn main() -> Result<()> {
 
     let logger = CsvTradeLogger::new(&config.persistence.trade_log_file)?;
 
-    // Create engine with fresh state
-    let engine = Engine::new(config.clone(), pair_info, BotState::default());
+    // Create engine and apply the initial state store snapshot
+    let mut engine = Engine::new(config.clone(), pair_info, BotState::default());
+    let snapshot_event = state_store_cmd_to_event(StateStoreCommand::Snapshot {
+        pairs: initial_snapshot.pairs,
+        defaults: initial_snapshot.defaults,
+    });
+    engine.handle_event(snapshot_event);
 
     // Event channel: feeds -> engine
     let (event_tx, event_rx) = mpsc::channel::<EngineEvent>(1024);
     // Command channel: engine -> dispatcher
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(256);
 
-    // State store connection
-    let state_store_url = std::env::var("STATE_STORE_URL").unwrap_or_default();
-    let state_store_token = std::env::var("STATE_STORE_TOKEN").unwrap_or_default();
-
-    // State store channels:
-    // - ss_cmd_rx: state store client -> bot (pair configs, defaults)
-    // - ss_snapshot_tx: bot -> state store client (engine snapshots for heartbeat/reports)
-    let (ss_cmd_tx, ss_cmd_rx) = mpsc::channel::<StateStoreCommand>(64);
-    let (ss_snapshot_tx, ss_snapshot_rx) = mpsc::channel::<EngineSnapshot>(4);
-
-    let ss_handle = if !state_store_url.is_empty() {
-        tracing::info!(url = state_store_url, "Connecting to state store");
-        let ss_config = StateStoreConfig {
-            url: state_store_url,
-            token: state_store_token,
-            ..Default::default()
-        };
-        let client = StateStoreClient::new(ss_config, ss_cmd_tx, ss_snapshot_rx);
-        Some(tokio::spawn(async move { client.run().await }))
-    } else {
-        tracing::info!("No STATE_STORE_URL set — running from config file only");
-        None
-    };
-
     let result = if config.trading.dry_run {
-        run_dry(config, engine, event_tx, event_rx, cmd_tx, cmd_rx, logger, ss_cmd_rx, ss_snapshot_tx).await
+        run_dry(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, ss_cmd_rx, ss_snapshot_tx).await
     } else {
-        run_live(config, engine, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx).await
+        run_live(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx).await
     };
 
     // Abort state store task on shutdown
-    if let Some(handle) = ss_handle {
-        handle.abort();
-    }
+    ss_handle.abort();
 
     result
+}
+
+/// Holds the initial snapshot data from the state store.
+struct InitialSnapshot {
+    pairs: Vec<kraken_core::state_store::messages::PairRecord>,
+    defaults: kraken_core::types::GlobalDefaults,
+}
+
+/// Wait for the first Snapshot command from the state store.
+/// Returns the snapshot data and the receiver (for continued use).
+async fn wait_for_snapshot(
+    mut rx: mpsc::Receiver<StateStoreCommand>,
+) -> anyhow::Result<(InitialSnapshot, mpsc::Receiver<StateStoreCommand>)> {
+    tracing::info!("Waiting for initial snapshot from state store...");
+    let timeout = std::time::Duration::from_secs(30);
+    match tokio::time::timeout(timeout, async {
+        while let Some(cmd) = rx.recv().await {
+            if let StateStoreCommand::Snapshot { pairs, defaults } = cmd {
+                return Ok(InitialSnapshot { pairs, defaults });
+            }
+            // Ignore non-snapshot messages during startup
+        }
+        anyhow::bail!("State store channel closed before snapshot received")
+    }).await {
+        Ok(result) => result.map(|snap| (snap, rx)),
+        Err(_) => anyhow::bail!("Timed out waiting for state store snapshot ({}s)", timeout.as_secs()),
+    }
 }
 
 /// Build an EngineSnapshot from the current engine state, for state store heartbeats/reports.
@@ -200,6 +227,7 @@ fn state_store_cmd_to_event(cmd: StateStoreCommand) -> EngineEvent {
 async fn run_dry(
     config: Config,
     engine: Engine,
+    pairs: Vec<String>,
     event_tx: mpsc::Sender<EngineEvent>,
     event_rx: mpsc::Receiver<EngineEvent>,
     cmd_tx: mpsc::Sender<EngineCommand>,
@@ -220,7 +248,7 @@ async fn run_dry(
     let pub_ws_url = format!("{}/ws/public", ws_base);
     let mut pub_ws = WsConnection::connect(&pub_ws_url).await?;
     tracing::info!(url = pub_ws_url, "Public WS connected");
-    subscribe_book(&mut pub_ws, &config.trading.pairs, config.exchange.book_depth).await?;
+    subscribe_book(&mut pub_ws, &pairs, config.exchange.book_depth).await?;
 
     // Spawn book feed reader
     let tx = event_tx.clone();
@@ -366,6 +394,7 @@ async fn run_dry(
 async fn run_live(
     config: Config,
     engine: Engine,
+    pairs: Vec<String>,
     event_tx: mpsc::Sender<EngineEvent>,
     event_rx: mpsc::Receiver<EngineEvent>,
     cmd_tx: mpsc::Sender<EngineCommand>,
@@ -383,7 +412,7 @@ async fn run_live(
     live.cancel_all().await?;
 
     // Spawn feeds (private WS read loop already spawned by connect)
-    let book_handle = live.spawn_book_feed(event_tx.clone()).await?;
+    let book_handle = live.spawn_book_feed(event_tx.clone(), &pairs).await?;
     let ticker_handle = live.spawn_ticker(event_tx.clone(), 10);
 
     // Forward state store commands to the engine via the event channel

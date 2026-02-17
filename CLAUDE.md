@@ -140,7 +140,7 @@ Kraken WS ──► PnL Analyzer (edge metrics, promotes/demotes pairs)
 
 - **State Store** (port 3040): dumb CRUD + WS relay. API contract in `docs/STATE_STORE_API.md`
 - **PnL Analyzer** (port 3031): watches Kraken fills via proxy WS, computes per-pair `Net PnL / Traded Volume`, adjusts pair configs via state store REST
-- **Bot**: no REST API, connects to state store via WS for config/state updates. Falls back to config file if no state store URL.
+- **Bot**: no REST API, requires state store. On startup: connects to state store WS, waits for initial snapshot (pair list + defaults), fetches pair_info from exchange, subscribes to book data, then runs. No CLI pair args or config files.
 
 ## Key Patterns
 - All WS sends go through a single mpsc channel to a write loop (serialized access)
