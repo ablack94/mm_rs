@@ -1048,6 +1048,17 @@ impl Engine {
             cmds.push(EngineCommand::RefreshDms);
         }
 
+        // Periodic requote for all active pairs.
+        // This ensures recovery after rate-limit exhaustion leaves quoters idle,
+        // and picks up spread changes between book updates.
+        let quotable_symbols: Vec<String> = self.pairs.iter()
+            .filter(|(_, mp)| mp.state == PairState::Active || mp.state == PairState::WindDown)
+            .map(|(s, _)| s.clone())
+            .collect();
+        for symbol in quotable_symbols {
+            cmds.extend(self.maybe_quote(&symbol, timestamp));
+        }
+
         cmds
     }
 
@@ -1162,17 +1173,34 @@ impl Engine {
 
         match quotes {
             None => {
-                // Spread too narrow — cancel existing quotes
+                // Spread too narrow to place NEW quotes.
+                // But if already quoting, apply hysteresis: only cancel if spread
+                // drops to 70% of min_spread_bps. This prevents rapid place/cancel
+                // oscillation when spread hovers right at the threshold.
                 let quoter = &self.pairs.get(symbol).unwrap().quoter;
                 if quoter.state != QuoteState::Idle {
-                    tracing::info!(
-                        symbol,
-                        spread_bps = %spread_bps_raw,
-                        state = ?quoter.state,
-                        "Spread too narrow — cancelling quotes"
-                    );
+                    let cancel_threshold = resolved.min_spread_bps * dec!(0.7);
+                    if spread_bps_raw < cancel_threshold {
+                        tracing::info!(
+                            symbol,
+                            spread_bps = %spread_bps_raw,
+                            cancel_threshold = %cancel_threshold,
+                            state = ?quoter.state,
+                            "Spread well below threshold — cancelling quotes"
+                        );
+                        self.cancel_pair_quotes(symbol)
+                    } else {
+                        tracing::debug!(
+                            symbol,
+                            spread_bps = %spread_bps_raw,
+                            min = %resolved.min_spread_bps,
+                            "Spread narrowed but holding existing quotes (hysteresis)"
+                        );
+                        vec![]
+                    }
+                } else {
+                    vec![]
                 }
-                self.cancel_pair_quotes(symbol)
             }
             Some((bid_price, ask_price)) => {
                 let quoter = &self.pairs.get(symbol).unwrap().quoter;
