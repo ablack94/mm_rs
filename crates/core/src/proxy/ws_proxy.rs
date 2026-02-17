@@ -213,3 +213,77 @@ fn millis_nonce() -> String {
         .as_millis()
         .to_string()
 }
+
+/// Handle a public WebSocket proxy connection (no auth token injection).
+/// Relays bidirectionally between client and Kraken public WS.
+pub async fn handle_public_ws_connection(bot_ws: WebSocket, upstream_url: String) {
+    let result = run_public_ws_proxy(bot_ws, upstream_url).await;
+    if let Err(e) = result {
+        tracing::error!(error = %e, "Public WS proxy connection error");
+    }
+}
+
+async fn run_public_ws_proxy(bot_ws: WebSocket, upstream_url: String) -> Result<()> {
+    tracing::info!(url = upstream_url, "Public WS proxy: connecting upstream");
+    let (upstream_ws, _) = connect_async(&upstream_url).await?;
+    tracing::info!("Public WS proxy: upstream connected");
+
+    let (mut upstream_write, mut upstream_read) = upstream_ws.split();
+    let (mut bot_write, mut bot_read) = bot_ws.split();
+
+    let bot_to_upstream = tokio::spawn(async move {
+        while let Some(Ok(msg)) = bot_read.next().await {
+            match msg {
+                ws::Message::Text(text) => {
+                    if upstream_write
+                        .send(Message::Text(text.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                ws::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let upstream_to_bot = tokio::spawn(async move {
+        while let Some(Ok(msg)) = upstream_read.next().await {
+            match msg {
+                Message::Text(text) => {
+                    if bot_write
+                        .send(ws::Message::Text(text.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Message::Ping(data) => {
+                    if bot_write
+                        .send(ws::Message::Ping(data.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = bot_to_upstream => {
+            tracing::info!("Public WS proxy: bot disconnected");
+        }
+        _ = upstream_to_bot => {
+            tracing::info!("Public WS proxy: upstream disconnected");
+        }
+    }
+
+    Ok(())
+}

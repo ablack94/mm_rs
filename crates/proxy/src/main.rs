@@ -10,7 +10,7 @@ use clap::Parser;
 use std::sync::Arc;
 
 use kraken_core::proxy::rest_proxy::{build_proxy_router, ProxyState};
-use kraken_core::proxy::ws_proxy::{handle_ws_connection, WsProxyState};
+use kraken_core::proxy::ws_proxy::{handle_public_ws_connection, handle_ws_connection, WsProxyState};
 
 #[derive(Parser)]
 #[command(name = "kraken-proxy", about = "Kraken API proxy — holds keys, signs requests")]
@@ -41,6 +41,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "https://api.kraken.com".to_string());
     let kraken_ws_url = std::env::var("KRAKEN_WS_URL")
         .unwrap_or_else(|_| "wss://ws-auth.kraken.com/v2".to_string());
+    let kraken_public_ws_url = std::env::var("KRAKEN_PUBLIC_WS_URL")
+        .unwrap_or_else(|_| "wss://ws.kraken.com/v2".to_string());
 
     tracing::info!(
         port = args.port,
@@ -70,6 +72,7 @@ async fn main() -> Result<()> {
     let rest_router = build_proxy_router(rest_state);
     let ws_token = proxy_token;
 
+    let ws_token_pub = ws_token.clone();
     let ws_router = Router::new()
         .route(
             "/ws/private",
@@ -97,6 +100,32 @@ async fn main() -> Result<()> {
                     }
 
                     ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+                        .into_response()
+                },
+            ),
+        )
+        .route(
+            "/ws/public",
+            get(
+                move |headers: HeaderMap,
+                      ws: WebSocketUpgrade| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let token_from_protocol = headers
+                        .get("sec-websocket-protocol")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+
+                    if auth != format!("Bearer {}", ws_token_pub)
+                        && token_from_protocol != ws_token_pub
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+
+                    let url = kraken_public_ws_url.clone();
+                    ws.on_upgrade(move |socket| handle_public_ws_connection(socket, url))
                         .into_response()
                 },
             ),
