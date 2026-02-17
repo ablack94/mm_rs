@@ -148,6 +148,7 @@ pub enum WsMessage {
         ask_updates: Vec<LevelUpdate>,
     },
     Execution(ExecReport),
+    ExecutionSnapshot(Vec<ExecReport>),
     SubscribeConfirmed {
         channel: String,
     },
@@ -245,10 +246,18 @@ fn parse_levels(v: &serde_json::Value) -> Vec<LevelUpdate> {
 fn parse_executions(v: &serde_json::Value) -> WsMessage {
     let msg_type = v["type"].as_str().unwrap_or("");
 
-    // Skip execution snapshots — they replay old fills that would double-count
-    // positions already loaded from state.json. We only want live updates.
     if msg_type == "snapshot" {
-        return WsMessage::Unknown("exec_snapshot".to_string());
+        // Parse all trades in the snapshot
+        let trades: Vec<ExecReport> = v["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|d| d["exec_type"].as_str() == Some("trade"))
+                    .filter_map(|d| parse_single_exec(d))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return WsMessage::ExecutionSnapshot(trades);
     }
 
     let data = match v["data"].as_array().and_then(|a| a.first()) {
@@ -256,6 +265,13 @@ fn parse_executions(v: &serde_json::Value) -> WsMessage {
         None => return WsMessage::Unknown(v.to_string()),
     };
 
+    match parse_single_exec(data) {
+        Some(report) => WsMessage::Execution(report),
+        None => WsMessage::Unknown(v.to_string()),
+    }
+}
+
+fn parse_single_exec(data: &serde_json::Value) -> Option<ExecReport> {
     let fee = data["fees"]
         .as_array()
         .and_then(|fees| fees.iter().map(|f| f["qty"].as_f64().unwrap_or(0.0)).reduce(|a, b| a + b))
@@ -267,7 +283,7 @@ fn parse_executions(v: &serde_json::Value) -> WsMessage {
         .and_then(|s| s.parse::<DateTime<Utc>>().ok())
         .unwrap_or_else(Utc::now);
 
-    WsMessage::Execution(ExecReport {
+    Some(ExecReport {
         exec_type: data["exec_type"].as_str().unwrap_or("").to_string(),
         order_id: data["order_id"].as_str().unwrap_or("").to_string(),
         cl_ord_id: data["cl_ord_id"].as_str().unwrap_or("").to_string(),
@@ -400,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_snapshot_is_skipped() {
+    fn test_execution_snapshot_parsed() {
         let raw = r#"{
             "channel": "executions",
             "type": "snapshot",
@@ -420,8 +436,12 @@ mod tests {
         }"#;
         let msg = parse_ws_message(raw);
         match msg {
-            WsMessage::Unknown(s) => assert_eq!(s, "exec_snapshot"),
-            other => panic!("Expected Unknown(\"exec_snapshot\"), got {:?}", other),
+            WsMessage::ExecutionSnapshot(trades) => {
+                assert_eq!(trades.len(), 1);
+                assert_eq!(trades[0].order_id, "ORD-OLD-999");
+                assert_eq!(trades[0].symbol, "ETH/USD");
+            }
+            other => panic!("Expected ExecutionSnapshot, got {:?}", other),
         }
     }
 

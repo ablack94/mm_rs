@@ -3,6 +3,7 @@ mod edge;
 mod state_store;
 
 use anyhow::Result;
+use std::collections::HashSet;
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -63,6 +64,7 @@ struct AppState {
     tracker: RwLock<PnlTracker>,
     edge_tracker: RwLock<EdgeTracker>,
     prices: RwLock<HashMap<String, Decimal>>,
+    seen_order_ids: RwLock<HashSet<String>>,
     pnl_state_file: PathBuf,
     analyzer_state_file: PathBuf,
     api_token: String,
@@ -121,6 +123,7 @@ async fn main() -> Result<()> {
         tracker: RwLock::new(tracker),
         edge_tracker: RwLock::new(edge_tracker),
         prices: RwLock::new(HashMap::new()),
+        seen_order_ids: RwLock::new(HashSet::new()),
         pnl_state_file,
         analyzer_state_file,
         api_token,
@@ -244,90 +247,122 @@ async fn process_fill_feed(ws: &mut WsConnection, shared: &Arc<AppState>) {
     while let Some(raw) = ws.recv().await {
         let msg = parse_ws_message(&raw);
         match msg {
-            WsMessage::Execution(report) if report.exec_type == "trade" => {
-                let side = if report.side == "buy" {
-                    OrderSide::Buy
-                } else {
-                    OrderSide::Sell
-                };
-
-                let fill = Fill {
-                    order_id: report.order_id,
-                    cl_ord_id: report.cl_ord_id,
-                    symbol: report.symbol.clone(),
-                    side,
-                    price: report.last_price,
-                    qty: report.last_qty,
-                    fee: report.fee,
-                    is_maker: report.is_maker,
-                    is_fully_filled: report.order_status == "filled",
-                    timestamp: report.timestamp,
-                };
-
+            WsMessage::ExecutionSnapshot(reports) => {
+                let trade_reports: Vec<_> = reports
+                    .into_iter()
+                    .filter(|r| r.exec_type == "trade")
+                    .collect();
                 tracing::info!(
-                    symbol = fill.symbol,
-                    side = %fill.side,
-                    price = %fill.price,
-                    qty = %fill.qty,
-                    fee = %fill.fee,
-                    "Fill received"
+                    count = trade_reports.len(),
+                    "Processing execution snapshot"
                 );
-
-                // Apply to PnL tracker
-                let pnl;
-                {
-                    let mut tracker = shared.tracker.write().await;
-                    // Compute PnL before applying (for edge tracking)
-                    let pos = tracker.positions.get(&fill.symbol);
-                    pnl = match fill.side {
-                        OrderSide::Sell => {
-                            let avg_cost = pos.map(|p| p.avg_cost).unwrap_or_default();
-                            fill.qty * (fill.price - avg_cost) - fill.fee
-                        }
-                        OrderSide::Buy => Decimal::ZERO - fill.fee,
-                    };
-
-                    tracker.apply_fill(&fill);
-
-                    // Persist PnL state
-                    if let Err(e) = tracker.save(&shared.pnl_state_file) {
-                        tracing::error!(error = %e, "Failed to persist PnL state");
-                    }
+                for report in trade_reports {
+                    apply_exec_report(report, shared).await;
                 }
-
-                // Update last price
-                shared
-                    .prices
-                    .write()
-                    .await
-                    .insert(fill.symbol.clone(), fill.price);
-
-                // Record in edge tracker
-                let trade = PnlTrade {
-                    timestamp: fill.timestamp,
-                    symbol: fill.symbol,
-                    side: fill.side.to_string(),
-                    price: fill.price,
-                    qty: fill.qty,
-                    fee: fill.fee,
-                    pnl,
-                };
-                {
-                    let mut et = shared.edge_tracker.write().await;
-                    et.record_trade(&trade);
-                }
-
-                // Persist edge state periodically (every trade is fine for now)
-                {
-                    let et = shared.edge_tracker.read().await;
-                    save_edge_tracker(&et, &shared.analyzer_state_file);
-                }
+            }
+            WsMessage::Execution(report) if report.exec_type == "trade" => {
+                apply_exec_report(report, shared).await;
             }
             WsMessage::SubscribeConfirmed { channel } => {
                 tracing::info!(channel, "Subscription confirmed");
             }
             _ => {}
         }
+    }
+}
+
+async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
+    // Dedup by order_id — prevents double-counting on reconnect snapshots
+    let dedup_key = format!("{}:{}", report.order_id, report.last_qty);
+    {
+        let mut seen = shared.seen_order_ids.write().await;
+        if !seen.insert(dedup_key) {
+            tracing::debug!(
+                order_id = report.order_id,
+                symbol = report.symbol,
+                "Skipping duplicate fill"
+            );
+            return;
+        }
+        // Cap the set size to prevent unbounded growth
+        if seen.len() > 10_000 {
+            seen.clear();
+        }
+    }
+
+    let side = if report.side == "buy" {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+
+    let fill = Fill {
+        order_id: report.order_id,
+        cl_ord_id: report.cl_ord_id,
+        symbol: report.symbol.clone(),
+        side,
+        price: report.last_price,
+        qty: report.last_qty,
+        fee: report.fee,
+        is_maker: report.is_maker,
+        is_fully_filled: report.order_status == "filled",
+        timestamp: report.timestamp,
+    };
+
+    tracing::info!(
+        symbol = fill.symbol,
+        side = %fill.side,
+        price = %fill.price,
+        qty = %fill.qty,
+        fee = %fill.fee,
+        "Fill received"
+    );
+
+    // Apply to PnL tracker
+    let pnl;
+    {
+        let mut tracker = shared.tracker.write().await;
+        let pos = tracker.positions.get(&fill.symbol);
+        pnl = match fill.side {
+            OrderSide::Sell => {
+                let avg_cost = pos.map(|p| p.avg_cost).unwrap_or_default();
+                fill.qty * (fill.price - avg_cost) - fill.fee
+            }
+            OrderSide::Buy => Decimal::ZERO - fill.fee,
+        };
+
+        tracker.apply_fill(&fill);
+
+        if let Err(e) = tracker.save(&shared.pnl_state_file) {
+            tracing::error!(error = %e, "Failed to persist PnL state");
+        }
+    }
+
+    // Update last price
+    shared
+        .prices
+        .write()
+        .await
+        .insert(fill.symbol.clone(), fill.price);
+
+    // Record in edge tracker
+    let trade = PnlTrade {
+        timestamp: fill.timestamp,
+        symbol: fill.symbol,
+        side: fill.side.to_string(),
+        price: fill.price,
+        qty: fill.qty,
+        fee: fill.fee,
+        pnl,
+    };
+    {
+        let mut et = shared.edge_tracker.write().await;
+        et.record_trade(&trade);
+    }
+
+    {
+        let et = shared.edge_tracker.read().await;
+        save_edge_tracker(&et, &shared.analyzer_state_file);
     }
 }
 

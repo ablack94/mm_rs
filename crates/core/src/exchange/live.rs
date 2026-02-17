@@ -196,7 +196,7 @@ impl LiveExchange {
                         None
                     }
                     WsMessage::Heartbeat | WsMessage::Pong => None,
-                    WsMessage::Unknown(ref s) if s == "exec_snapshot" => {
+                    WsMessage::ExecutionSnapshot(_) => {
                         tracing::info!("Ignoring execution snapshot (positions loaded from state)");
                         None
                     }
