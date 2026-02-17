@@ -95,20 +95,24 @@ async fn main() -> Result<()> {
         config.exchange.proxy_token.clone(),
     ));
 
-    // Fetch pair info for state store pairs
-    tracing::info!("Fetching pair info...");
-    let pair_info = exchange.get_pair_info(&pairs).await?;
-
-    for (symbol, info) in &pair_info {
-        tracing::info!(
-            symbol,
-            min_order = %info.min_order_qty,
-            price_dec = info.price_decimals,
-            qty_dec = info.qty_decimals,
-            cost_min = %info.min_cost,
-            "Pair info"
-        );
-    }
+    // Fetch pair info for state store pairs (skip if empty — pairs will be fetched dynamically)
+    let pair_info = if pairs.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        tracing::info!("Fetching pair info...");
+        let info = exchange.get_pair_info(&pairs).await?;
+        for (symbol, pi) in &info {
+            tracing::info!(
+                symbol,
+                min_order = %pi.min_order_qty,
+                price_dec = pi.price_decimals,
+                qty_dec = pi.qty_decimals,
+                cost_min = %pi.min_cost,
+                "Pair info"
+            );
+        }
+        info
+    };
 
     let logger = CsvTradeLogger::new(&config.persistence.trade_log_file)?;
 
