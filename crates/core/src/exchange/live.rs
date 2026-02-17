@@ -265,10 +265,15 @@ impl LiveExchange {
     /// Spawn the public WS feed as a background task that sends events into the channel.
     /// In proxy mode, connects to the proxy's public WS endpoint instead of the
     /// default Kraken endpoint, so book data comes from the same source as orders.
+    ///
+    /// Accepts an optional `sub_rx` channel for dynamic pair subscriptions. When new
+    /// pairs arrive on this channel, the book feed subscribes to them on the existing
+    /// WS connection without reconnecting.
     pub async fn spawn_book_feed(
         &self,
         tx: mpsc::Sender<EngineEvent>,
         pairs: &[String],
+        sub_rx: Option<mpsc::Receiver<Vec<String>>>,
     ) -> Result<tokio::task::JoinHandle<()>> {
         let base = self.config.exchange.proxy_url.trim_end_matches('/');
         let ws_base = base
@@ -280,7 +285,7 @@ impl LiveExchange {
         let depth = self.config.exchange.book_depth;
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_book_feed(&url, &pairs, depth, &tx).await {
+            if let Err(e) = run_book_feed_dynamic(&url, &pairs, depth, &tx, sub_rx).await {
                 tracing::error!(error = %e, "Book feed error");
             }
         });
@@ -404,53 +409,105 @@ impl DeadManSwitch for LiveExchange {
 
 // --- Book feed (public WS, separate connection) ---
 
-async fn run_book_feed(
+async fn run_book_feed_dynamic(
     url: &str,
     pairs: &[String],
     depth: u32,
     tx: &mpsc::Sender<EngineEvent>,
+    sub_rx: Option<mpsc::Receiver<Vec<String>>>,
 ) -> Result<()> {
-    let mut ws = WsConnection::connect(url).await?;
+    let ws = WsConnection::connect(url).await?;
     tracing::info!("Public WS connected");
-    subscribe_book(&mut ws, pairs, depth).await?;
+    let (mut writer, mut reader) = ws.into_split();
 
-    while let Some(raw) = ws.recv().await {
-        let msg = parse_ws_message(&raw);
-        match msg {
-            WsMessage::BookSnapshot {
-                symbol,
-                bids,
-                asks,
-            } => {
-                tx.send(EngineEvent::BookSnapshot {
+    // Subscribe to initial pairs
+    if !pairs.is_empty() {
+        let sub_msg = serde_json::to_string(&SubscribeBookMsg {
+            method: "subscribe",
+            params: SubscribeBookParams {
+                channel: "book",
+                symbol: pairs.to_vec(),
+                depth,
+            },
+        })?;
+        writer.send_raw(&sub_msg).await?;
+    }
+
+    let mut sub_rx = sub_rx;
+    loop {
+        // If we have a subscription channel, select on both WS and channel.
+        // Otherwise, just read WS.
+        let ws_msg = if let Some(ref mut rx) = sub_rx {
+            tokio::select! {
+                raw = reader.recv() => {
+                    match raw {
+                        Some(text) => Some(text),
+                        None => break, // WS closed
+                    }
+                }
+                new_pairs = rx.recv() => {
+                    if let Some(new_pairs) = new_pairs {
+                        if !new_pairs.is_empty() {
+                            tracing::info!(?new_pairs, "Subscribing to new pairs dynamically");
+                            let sub_msg = serde_json::to_string(&SubscribeBookMsg {
+                                method: "subscribe",
+                                params: SubscribeBookParams {
+                                    channel: "book",
+                                    symbol: new_pairs,
+                                    depth,
+                                },
+                            })?;
+                            writer.send_raw(&sub_msg).await?;
+                        }
+                    }
+                    continue; // Go back to select
+                }
+            }
+        } else {
+            match reader.recv().await {
+                Some(text) => Some(text),
+                None => break,
+            }
+        };
+
+        if let Some(raw) = ws_msg {
+            let msg = parse_ws_message(&raw);
+            match msg {
+                WsMessage::BookSnapshot {
                     symbol,
                     bids,
                     asks,
-                    timestamp: Utc::now(),
-                })
-                .await?;
-            }
-            WsMessage::BookUpdate {
-                symbol,
-                bid_updates,
-                ask_updates,
-            } => {
-                tx.send(EngineEvent::BookUpdate {
+                } => {
+                    tx.send(EngineEvent::BookSnapshot {
+                        symbol,
+                        bids,
+                        asks,
+                        timestamp: Utc::now(),
+                    })
+                    .await?;
+                }
+                WsMessage::BookUpdate {
                     symbol,
                     bid_updates,
                     ask_updates,
-                    timestamp: Utc::now(),
-                })
-                .await?;
+                } => {
+                    tx.send(EngineEvent::BookUpdate {
+                        symbol,
+                        bid_updates,
+                        ask_updates,
+                        timestamp: Utc::now(),
+                    })
+                    .await?;
+                }
+                WsMessage::SubscribeConfirmed { channel } => {
+                    tracing::info!(channel, "Subscription confirmed");
+                }
+                WsMessage::Heartbeat | WsMessage::Pong => {}
+                WsMessage::Unknown(raw) => {
+                    tracing::debug!(raw, "Unknown public message");
+                }
+                _ => {}
             }
-            WsMessage::SubscribeConfirmed { channel } => {
-                tracing::info!(channel, "Subscription confirmed");
-            }
-            WsMessage::Heartbeat | WsMessage::Pong => {}
-            WsMessage::Unknown(raw) => {
-                tracing::debug!(raw, "Unknown public message");
-            }
-            _ => {}
         }
     }
     Ok(())

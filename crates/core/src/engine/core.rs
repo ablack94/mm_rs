@@ -252,6 +252,23 @@ impl Engine {
             EngineEvent::Tick { timestamp } => self.on_tick(timestamp),
             EngineEvent::ApiCommand(action) => self.on_api_command(action),
             EngineEvent::StateStoreCommand(action) => self.on_state_store_command(action),
+            EngineEvent::PairInfoFetched { info } => {
+                for (symbol, pair_info) in info {
+                    if let Some(mp) = self.pairs.get_mut(&symbol) {
+                        if mp.pair_info.is_none() {
+                            tracing::info!(
+                                symbol,
+                                min_order = %pair_info.min_order_qty,
+                                price_dec = pair_info.price_decimals,
+                                qty_dec = pair_info.qty_decimals,
+                                "Pair info loaded dynamically"
+                            );
+                            mp.pair_info = Some(pair_info);
+                        }
+                    }
+                }
+                vec![]
+            }
         }
     }
 

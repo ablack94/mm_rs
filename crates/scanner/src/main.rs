@@ -32,6 +32,14 @@ struct Args {
     /// Output JSON to stdout instead of a table
     #[arg(long)]
     json: bool,
+
+    /// State store URL to push new pairs (e.g., http://localhost:3040)
+    #[arg(long)]
+    state_store_url: Option<String>,
+
+    /// State store auth token
+    #[arg(long, env = "STATE_STORE_TOKEN", default_value = "")]
+    state_store_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +235,11 @@ async fn main() -> Result<()> {
         "Scan results saved"
     );
 
+    // Push new pairs to state store if configured
+    if let Some(ref ss_url) = args.state_store_url {
+        push_to_state_store(&client, ss_url, &args.state_store_token, &scan_result.symbols).await?;
+    }
+
     Ok(())
 }
 
@@ -260,6 +273,73 @@ fn parse_ticker_vol(ticker: &serde_json::Value) -> f64 {
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+/// Push newly discovered pairs to the state store.
+/// Only creates pairs that don't already exist (never overrides existing pairs).
+async fn push_to_state_store(
+    client: &reqwest::Client,
+    ss_url: &str,
+    token: &str,
+    symbols: &[String],
+) -> Result<()> {
+    let base = ss_url.trim_end_matches('/');
+
+    // Fetch existing pairs from state store
+    let mut req = client.get(format!("{base}/pairs"));
+    if !token.is_empty() {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp: serde_json::Value = req.send().await?.json().await?;
+    let existing: std::collections::HashSet<String> = resp["pairs"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p["symbol"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let new_pairs: Vec<&String> = symbols.iter().filter(|s| !existing.contains(*s)).collect();
+
+    if new_pairs.is_empty() {
+        tracing::info!("All scanned pairs already in state store — nothing to add");
+        return Ok(());
+    }
+
+    tracing::info!(count = new_pairs.len(), "Pushing new pairs to state store");
+
+    let mut added = 0u32;
+    for symbol in &new_pairs {
+        // URL-encode the symbol (e.g., OMG/USD → OMG%2FUSD)
+        let encoded = symbol.replace('/', "%2F");
+        let body = serde_json::json!({
+            "state": "active",
+            "config": {}
+        });
+
+        let mut req = client.put(format!("{base}/pairs/{encoded}")).json(&body);
+        if !token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                added += 1;
+                tracing::info!(symbol, status = %resp.status(), "Added pair to state store");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(symbol, %status, body, "Failed to add pair to state store");
+            }
+            Err(e) => {
+                tracing::error!(symbol, error = %e, "Request failed for pair");
+            }
+        }
+    }
+
+    tracing::info!(added, total_new = new_pairs.len(), "State store push complete");
+    Ok(())
 }
 
 fn print_report(results: &[ScannedPair]) {

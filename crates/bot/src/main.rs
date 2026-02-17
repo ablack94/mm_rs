@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -84,10 +85,10 @@ async fn main() -> Result<()> {
         .collect();
 
     if pairs.is_empty() {
-        anyhow::bail!("State store returned no pairs. Add pairs via the state store API first.");
+        tracing::info!("No pairs in state store yet — will idle until pairs are added");
+    } else {
+        tracing::info!(?pairs, "Got {} pairs from state store", pairs.len());
     }
-
-    tracing::info!(?pairs, "Got {} pairs from state store", pairs.len());
 
     let exchange: Arc<dyn ExchangeClient> = Arc::new(ProxyClient::new(
         config.exchange.proxy_url.clone(),
@@ -125,7 +126,7 @@ async fn main() -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(256);
 
     let result = if config.trading.dry_run {
-        run_dry(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, ss_cmd_rx, ss_snapshot_tx).await
+        run_dry(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx).await
     } else {
         run_live(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx).await
     };
@@ -233,6 +234,7 @@ async fn run_dry(
     cmd_tx: mpsc::Sender<EngineCommand>,
     mut cmd_rx: mpsc::Receiver<EngineCommand>,
     mut logger: CsvTradeLogger,
+    exchange: Arc<dyn ExchangeClient>,
     mut ss_cmd_rx: mpsc::Receiver<StateStoreCommand>,
     ss_snapshot_tx: mpsc::Sender<EngineSnapshot>,
 ) -> Result<()> {
@@ -246,30 +248,74 @@ async fn run_dry(
         .replacen("http://", "ws://", 1)
         .replacen("https://", "wss://", 1);
     let pub_ws_url = format!("{}/ws/public", ws_base);
-    let mut pub_ws = WsConnection::connect(&pub_ws_url).await?;
+    let pub_ws = WsConnection::connect(&pub_ws_url).await?;
     tracing::info!(url = pub_ws_url, "Public WS connected");
-    subscribe_book(&mut pub_ws, &pairs, config.exchange.book_depth).await?;
+    let (mut pub_writer, mut pub_reader) = pub_ws.into_split();
+    let depth = config.exchange.book_depth;
 
-    // Spawn book feed reader
+    // Subscribe to initial pairs
+    if !pairs.is_empty() {
+        let sub_msg = serde_json::to_string(&SubscribeBookMsg {
+            method: "subscribe",
+            params: SubscribeBookParams {
+                channel: "book",
+                symbol: pairs.clone(),
+                depth,
+            },
+        })?;
+        pub_writer.send_raw(&sub_msg).await?;
+    }
+
+    // Channel for dynamic book subscriptions
+    let (book_sub_tx, mut book_sub_rx) = mpsc::channel::<Vec<String>>(16);
+
+    // Spawn book feed reader with dynamic subscription support
     let tx = event_tx.clone();
     let book_handle = tokio::spawn(async move {
-        while let Some(raw) = pub_ws.recv().await {
-            let msg = parse_ws_message(&raw);
-            let event = match msg {
-                WsMessage::BookSnapshot { symbol, bids, asks } => {
-                    Some(EngineEvent::BookSnapshot { symbol, bids, asks, timestamp: Utc::now() })
+        loop {
+            tokio::select! {
+                raw = pub_reader.recv() => {
+                    match raw {
+                        Some(text) => {
+                            let msg = parse_ws_message(&text);
+                            let event = match msg {
+                                WsMessage::BookSnapshot { symbol, bids, asks } => {
+                                    Some(EngineEvent::BookSnapshot { symbol, bids, asks, timestamp: Utc::now() })
+                                }
+                                WsMessage::BookUpdate { symbol, bid_updates, ask_updates } => {
+                                    Some(EngineEvent::BookUpdate { symbol, bid_updates, ask_updates, timestamp: Utc::now() })
+                                }
+                                WsMessage::SubscribeConfirmed { channel } => {
+                                    tracing::info!(channel, "Subscription confirmed");
+                                    None
+                                }
+                                _ => None,
+                            };
+                            if let Some(e) = event {
+                                if tx.send(e).await.is_err() { return; }
+                            }
+                        }
+                        None => return, // WS closed
+                    }
                 }
-                WsMessage::BookUpdate { symbol, bid_updates, ask_updates } => {
-                    Some(EngineEvent::BookUpdate { symbol, bid_updates, ask_updates, timestamp: Utc::now() })
+                new_pairs = book_sub_rx.recv() => {
+                    if let Some(new_pairs) = new_pairs {
+                        if !new_pairs.is_empty() {
+                            tracing::info!(?new_pairs, "Subscribing to new pairs (dry-run)");
+                            let sub_msg = serde_json::to_string(&SubscribeBookMsg {
+                                method: "subscribe",
+                                params: SubscribeBookParams {
+                                    channel: "book",
+                                    symbol: new_pairs,
+                                    depth,
+                                },
+                            }).unwrap();
+                            if let Err(e) = pub_writer.send_raw(&sub_msg).await {
+                                tracing::error!(error = %e, "Failed to subscribe to new pairs");
+                            }
+                        }
+                    }
                 }
-                WsMessage::SubscribeConfirmed { channel } => {
-                    tracing::info!(channel, "Subscription confirmed");
-                    None
-                }
-                _ => None,
-            };
-            if let Some(e) = event {
-                if tx.send(e).await.is_err() { break; }
             }
         }
     });
@@ -286,13 +332,67 @@ async fn run_dry(
         }
     });
 
-    // Forward state store commands to the engine via the event channel
+    // Forward state store commands to the engine, enriching new pairs with pair_info
     let tx3 = event_tx.clone();
     let ss_forward_handle = tokio::spawn(async move {
+        let mut known_symbols: HashSet<String> = pairs.into_iter().collect();
+
         while let Some(cmd) = ss_cmd_rx.recv().await {
+            // Extract new symbols from Snapshot or PairUpdated
+            let new_symbols: Vec<String> = match &cmd {
+                StateStoreCommand::Snapshot { pairs, .. } => {
+                    pairs.iter()
+                        .filter(|p| !known_symbols.contains(&p.symbol))
+                        .map(|p| p.symbol.clone())
+                        .collect()
+                }
+                StateStoreCommand::PairUpdated(record) => {
+                    if known_symbols.contains(&record.symbol) {
+                        vec![]
+                    } else {
+                        vec![record.symbol.clone()]
+                    }
+                }
+                _ => vec![],
+            };
+
+            // Forward the command to the engine as-is
             let event = state_store_cmd_to_event(cmd);
             if tx3.send(event).await.is_err() {
                 break;
+            }
+
+            // For new pairs: fetch pair_info, send to engine, subscribe to book
+            if !new_symbols.is_empty() {
+                tracing::info!(?new_symbols, "New pairs discovered — fetching pair info");
+                match exchange.get_pair_info(&new_symbols).await {
+                    Ok(info) => {
+                        if !info.is_empty() {
+                            for symbol in info.keys() {
+                                tracing::info!(symbol, "Pair info fetched for new pair");
+                            }
+                            let subscribed: Vec<String> = info.keys().cloned().collect();
+
+                            // Send PairInfoFetched to engine
+                            let pi_event = EngineEvent::PairInfoFetched { info };
+                            if tx3.send(pi_event).await.is_err() {
+                                break;
+                            }
+
+                            // Subscribe to book data for new pairs
+                            if let Err(e) = book_sub_tx.send(subscribed.clone()).await {
+                                tracing::error!(error = %e, "Failed to send book subscription");
+                            }
+
+                            known_symbols.extend(subscribed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, ?new_symbols, "Failed to fetch pair info for new pairs");
+                    }
+                }
+                // Track as known even if pair_info fetch failed
+                known_symbols.extend(new_symbols);
             }
         }
     });
@@ -404,24 +504,81 @@ async fn run_live(
     mut ss_cmd_rx: mpsc::Receiver<StateStoreCommand>,
     ss_snapshot_tx: mpsc::Sender<EngineSnapshot>,
 ) -> Result<()> {
-    let live = LiveExchange::connect(config.clone(), event_tx.clone(), exchange).await?;
+    let live = LiveExchange::connect(config.clone(), event_tx.clone(), exchange.clone()).await?;
     let live = std::sync::Arc::new(live);
 
     // Clear any ghost orders from previous sessions (one-time cleanup)
     tracing::info!("Cancelling any leftover orders from previous sessions...");
     live.cancel_all().await?;
 
+    // Channel for dynamic book subscriptions (new pairs discovered via state store)
+    let (book_sub_tx, book_sub_rx) = mpsc::channel::<Vec<String>>(16);
+
     // Spawn feeds (private WS read loop already spawned by connect)
-    let book_handle = live.spawn_book_feed(event_tx.clone(), &pairs).await?;
+    let book_handle = live.spawn_book_feed(event_tx.clone(), &pairs, Some(book_sub_rx)).await?;
     let ticker_handle = live.spawn_ticker(event_tx.clone(), 10);
 
-    // Forward state store commands to the engine via the event channel
+    // Forward state store commands to the engine, enriching new pairs with pair_info
     let tx_ss = event_tx.clone();
     let ss_forward_handle = tokio::spawn(async move {
+        let mut known_symbols: HashSet<String> = pairs.into_iter().collect();
+
         while let Some(cmd) = ss_cmd_rx.recv().await {
+            // Extract new symbols from Snapshot or PairUpdated
+            let new_symbols: Vec<String> = match &cmd {
+                StateStoreCommand::Snapshot { pairs, .. } => {
+                    pairs.iter()
+                        .filter(|p| !known_symbols.contains(&p.symbol))
+                        .map(|p| p.symbol.clone())
+                        .collect()
+                }
+                StateStoreCommand::PairUpdated(record) => {
+                    if known_symbols.contains(&record.symbol) {
+                        vec![]
+                    } else {
+                        vec![record.symbol.clone()]
+                    }
+                }
+                _ => vec![],
+            };
+
+            // Forward the command to the engine as-is
             let event = state_store_cmd_to_event(cmd);
             if tx_ss.send(event).await.is_err() {
                 break;
+            }
+
+            // For new pairs: fetch pair_info, send to engine, subscribe to book
+            if !new_symbols.is_empty() {
+                tracing::info!(?new_symbols, "New pairs discovered — fetching pair info");
+                match exchange.get_pair_info(&new_symbols).await {
+                    Ok(info) => {
+                        if !info.is_empty() {
+                            for symbol in info.keys() {
+                                tracing::info!(symbol, "Pair info fetched for new pair");
+                            }
+                            let subscribed: Vec<String> = info.keys().cloned().collect();
+
+                            // Send PairInfoFetched to engine
+                            let pi_event = EngineEvent::PairInfoFetched { info };
+                            if tx_ss.send(pi_event).await.is_err() {
+                                break;
+                            }
+
+                            // Subscribe to book data for new pairs
+                            if let Err(e) = book_sub_tx.send(subscribed.clone()).await {
+                                tracing::error!(error = %e, "Failed to send book subscription");
+                            }
+
+                            known_symbols.extend(subscribed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, ?new_symbols, "Failed to fetch pair info for new pairs");
+                    }
+                }
+                // Track as known even if pair_info fetch failed, to avoid retrying every message
+                known_symbols.extend(new_symbols);
             }
         }
     });

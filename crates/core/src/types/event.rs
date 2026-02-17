@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use super::fill::Fill;
+use super::pair::PairInfo;
 
 /// A price-level update from the order book.
 #[derive(Debug, Clone)]
@@ -48,6 +50,10 @@ pub enum EngineEvent {
     ApiCommand(ApiAction),
     /// Command from the state store WS client.
     StateStoreCommand(StateStoreAction),
+    /// Pair info fetched for newly discovered pairs (from state store).
+    PairInfoFetched {
+        info: HashMap<String, PairInfo>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
