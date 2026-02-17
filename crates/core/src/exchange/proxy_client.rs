@@ -42,14 +42,22 @@ impl ProxyClient {
 
     /// Send a GET to the proxy, which forwards to Kraken's public API.
     async fn proxy_get(&self, path: &str) -> Result<serde_json::Value> {
-        let resp: serde_json::Value = self
+        let url = format!("{}{}", self.proxy_base_url, path);
+        let http_resp = self
             .client
-            .get(format!("{}{}", self.proxy_base_url, path))
+            .get(&url)
             .header("Authorization", format!("Bearer {}", self.proxy_token))
             .send()
-            .await?
-            .json()
             .await?;
+
+        let status = http_resp.status();
+        let resp: serde_json::Value = http_resp.json().await?;
+
+        if !status.is_success() {
+            let preview: String = resp.to_string().chars().take(200).collect();
+            bail!("Proxy GET {} returned {}: {}", path, status, preview);
+        }
+
         Ok(resp)
     }
 }
@@ -63,12 +71,20 @@ impl ExchangeClient for ProxyClient {
     }
 
     async fn get_pair_info(&self, target_symbols: &[String]) -> Result<HashMap<String, PairInfo>> {
+        if target_symbols.is_empty() {
+            return Ok(HashMap::new());
+        }
+
         let resp = self.proxy_get("/0/public/AssetPairs").await?;
         check_error(&resp)?;
 
         let result = resp["result"]
             .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Invalid AssetPairs response"))?;
+            .ok_or_else(|| {
+                // Log the actual response for debugging
+                let preview: String = resp.to_string().chars().take(200).collect();
+                anyhow::anyhow!("Invalid AssetPairs response (no 'result' object): {}", preview)
+            })?;
 
         let mut ws_lookup: HashMap<String, (&str, &serde_json::Value)> = HashMap::new();
         for (key, info) in result {
