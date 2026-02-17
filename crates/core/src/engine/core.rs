@@ -96,6 +96,52 @@ impl Engine {
         }
     }
 
+    /// Restore positions from Kraken balances.
+    /// Maps base_asset balances to managed pair symbols and sets qty.
+    /// For any pair that has a position but is Disabled, overrides to WindDown
+    /// so the bot can sell the position.
+    pub fn restore_balances(&mut self, balances: &HashMap<String, Decimal>) {
+        // Build base_asset → symbol map from pair_info
+        let asset_to_symbol: HashMap<String, String> = self.pairs.iter()
+            .filter_map(|(symbol, mp)| {
+                mp.pair_info.as_ref().map(|pi| (pi.base_asset.clone(), symbol.clone()))
+            })
+            .collect();
+
+        for (asset, &balance) in balances {
+            if balance.is_zero() {
+                continue;
+            }
+            if let Some(symbol) = asset_to_symbol.get(asset) {
+                // We don't know avg_cost from balances alone — use zero as placeholder.
+                // The engine will update avg_cost from fills, and the cost floor
+                // on sells will use mid price as a fallback when avg_cost is zero.
+                let position = self.state.positions.entry(symbol.clone()).or_default();
+                if position.qty.is_zero() {
+                    position.qty = balance;
+                    tracing::info!(
+                        symbol,
+                        asset,
+                        qty = %balance,
+                        "Restored position from exchange balance"
+                    );
+                }
+
+                // If this pair is Disabled but has a position, override to WindDown
+                if let Some(mp) = self.pairs.get_mut(symbol) {
+                    if mp.state == PairState::Disabled {
+                        tracing::warn!(
+                            symbol,
+                            qty = %balance,
+                            "Pair is Disabled but holds position — overriding to WindDown"
+                        );
+                        mp.state = PairState::WindDown;
+                    }
+                }
+            }
+        }
+    }
+
     /// Mark pairs as sell-only (downtrend filter). No new buys will be placed.
     /// Sets their state to WindDown if currently Active.
     pub fn set_sell_only(&mut self, pair_symbols: std::collections::HashSet<String>) {
@@ -407,12 +453,24 @@ impl Engine {
 
                 for record in pairs {
                     if let Some(mp) = self.pairs.get_mut(&record.symbol) {
-                        // Update existing pair's state and config
-                        mp.state = record.state;
+                        // Guard: don't disable a pair that still has a position
+                        let effective_state = if record.state == PairState::Disabled
+                            && !self.state.position(&record.symbol).is_empty()
+                        {
+                            tracing::warn!(
+                                symbol = record.symbol,
+                                qty = %self.state.position(&record.symbol).qty,
+                                "Snapshot wants Disabled but position held — overriding to WindDown"
+                            );
+                            PairState::WindDown
+                        } else {
+                            record.state
+                        };
+                        mp.state = effective_state;
                         mp.config = record.config;
                         tracing::info!(
                             symbol = record.symbol,
-                            state = ?record.state,
+                            state = ?effective_state,
                             "Updated pair from snapshot"
                         );
                     } else {
@@ -441,16 +499,30 @@ impl Engine {
                 let mut cmds = vec![];
                 if let Some(mp) = self.pairs.get_mut(&record.symbol) {
                     let old_state = mp.state;
-                    mp.state = record.state;
+                    // Guard: don't disable a pair that still has a position.
+                    // Override to WindDown (sell-only) so the bot can exit.
+                    let effective_state = if record.state == PairState::Disabled
+                        && !self.state.position(&record.symbol).is_empty()
+                    {
+                        tracing::warn!(
+                            symbol = record.symbol,
+                            qty = %self.state.position(&record.symbol).qty,
+                            "State store wants Disabled but position held — overriding to WindDown"
+                        );
+                        PairState::WindDown
+                    } else {
+                        record.state
+                    };
+                    mp.state = effective_state;
                     mp.config = record.config;
                     tracing::info!(
                         symbol = record.symbol,
                         old_state = ?old_state,
-                        new_state = ?record.state,
+                        new_state = ?effective_state,
                         "Pair updated from state store"
                     );
                     // If transitioning to Disabled, cancel orders for this pair
-                    if record.state == PairState::Disabled && old_state != PairState::Disabled {
+                    if effective_state == PairState::Disabled && old_state != PairState::Disabled {
                         cmds.extend(self.cancel_pair_quotes(&record.symbol));
                     }
                     // If transitioning to Liquidating, start liquidation

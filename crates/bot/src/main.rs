@@ -124,6 +124,20 @@ async fn main() -> Result<()> {
     });
     engine.handle_event(snapshot_event);
 
+    // Restore positions from Kraken balances.
+    // This ensures the bot knows about existing positions (e.g., from a previous session)
+    // and overrides Disabled → WindDown for pairs with open positions.
+    if !pairs.is_empty() {
+        match exchange.get_balances().await {
+            Ok(balances) => {
+                engine.restore_balances(&balances);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to fetch balances — positions may be stale");
+            }
+        }
+    }
+
     // Event channel: feeds -> engine
     let (event_tx, event_rx) = mpsc::channel::<EngineEvent>(1024);
     // Command channel: engine -> dispatcher
