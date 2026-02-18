@@ -1,0 +1,38 @@
+#!/bin/bash
+# Hourly pair scanner — finds new MM opportunities and pushes to state store
+# Filters: min $50k daily volume, min 0.80% spread
+set -uo pipefail
+
+SCANNER_BINARY="/workarea/target/release/scanner"
+STATE_STORE_URL="${STATE_STORE_URL:-http://localhost:3040}"
+STATE_STORE_TOKEN="${STATE_STORE_TOKEN:-a1fb58b5829e886cce2fa70516ac3495477834e025d8d91612584a82818acc69}"
+PROXY_URL="${PROXY_URL:-http://localhost:8080}"
+PROXY_TOKEN="${PROXY_TOKEN:-367f1923618511fe5814aa774b87f462e463326aa4e7298e1c1983315f6b1120}"
+SCAN_INTERVAL=${SCAN_INTERVAL:-3600}  # seconds (1 hour)
+MIN_VOLUME_USD=${MIN_VOLUME_USD:-50000}
+MIN_SPREAD_PCT=${MIN_SPREAD_PCT:-0.80}
+
+echo "[$(date -u +%H:%M:%S)] Scanner loop started (interval: ${SCAN_INTERVAL}s, min_volume: \$${MIN_VOLUME_USD}, min_spread: ${MIN_SPREAD_PCT}%)"
+
+while true; do
+    echo ""
+    echo "[$(date -u +%H:%M:%S)] Running pair scan..."
+
+    PROXY_URL="$PROXY_URL" \
+    PROXY_TOKEN="$PROXY_TOKEN" \
+    STATE_STORE_URL="$STATE_STORE_URL" \
+    STATE_STORE_TOKEN="$STATE_STORE_TOKEN" \
+    MIN_VOLUME_USD="$MIN_VOLUME_USD" \
+    MIN_SPREAD_PCT="$MIN_SPREAD_PCT" \
+    "$SCANNER_BINARY" 2>&1 || echo "[$(date -u +%H:%M:%S)] Scanner failed (will retry next cycle)"
+
+    # Show results
+    if [ -f /workarea/scanned_pairs.json ]; then
+        count=$(python3 -c "import json; d=json.load(open('/workarea/scanned_pairs.json')); print(d.get('total_pairs',0))")
+        symbols=$(python3 -c "import json; d=json.load(open('/workarea/scanned_pairs.json')); print(', '.join(d.get('symbols',[])))")
+        echo "[$(date -u +%H:%M:%S)] Found ${count} pairs: ${symbols}"
+    fi
+
+    echo "[$(date -u +%H:%M:%S)] Next scan in ${SCAN_INTERVAL}s..."
+    sleep "$SCAN_INTERVAL"
+done

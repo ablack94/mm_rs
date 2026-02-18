@@ -134,14 +134,26 @@ impl Engine {
                 }
 
                 // If this pair is Disabled but has a position, override to WindDown
+                // UNLESS the position is below exchange minimums (dust — unsellable)
                 if let Some(mp) = self.pairs.get_mut(symbol) {
                     if mp.state == PairState::Disabled {
-                        tracing::warn!(
-                            symbol,
-                            qty = %balance,
-                            "Pair is Disabled but holds position — overriding to WindDown"
-                        );
-                        mp.state = PairState::WindDown;
+                        let is_dust = mp.pair_info.as_ref().map_or(false, |pi| {
+                            balance < pi.min_order_qty
+                        });
+                        if is_dust {
+                            tracing::info!(
+                                symbol,
+                                qty = %balance,
+                                "Pair is Disabled with dust position below exchange minimums — keeping Disabled"
+                            );
+                        } else {
+                            tracing::warn!(
+                                symbol,
+                                qty = %balance,
+                                "Pair is Disabled but holds position — overriding to WindDown"
+                            );
+                            mp.state = PairState::WindDown;
+                        }
                     }
                 }
             }
@@ -1036,6 +1048,28 @@ impl Engine {
             } else {
                 tracing::info!(symbol, "Liquidation phase 2: all orders cleared, sending market sell");
                 cmds.extend(self.send_liquidation_sell(&symbol));
+            }
+        }
+
+        // Backfill avg_cost for positions restored from exchange balances.
+        // When restored, avg_cost is zero (Kraken balances don't include cost basis).
+        // Use the first available mid price as a proxy so stop-loss/take-profit can work.
+        let positions_needing_cost: Vec<String> = self.state.positions.iter()
+            .filter(|(_, pos)| !pos.is_empty() && pos.avg_cost.is_zero())
+            .map(|(s, _)| s.clone())
+            .collect();
+        for symbol in positions_needing_cost {
+            if let Some(mid) = self.prices.get(&symbol) {
+                if !mid.is_zero() {
+                    let pos = self.state.positions.entry(symbol.clone()).or_default();
+                    pos.avg_cost = *mid;
+                    tracing::info!(
+                        symbol = %symbol,
+                        avg_cost = %mid,
+                        qty = %pos.qty,
+                        "Backfilled avg_cost from current mid (was zero from balance restore)"
+                    );
+                }
             }
         }
 

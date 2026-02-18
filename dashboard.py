@@ -35,6 +35,7 @@ PROXY_TOKEN = os.environ.get(
     "PROXY_TOKEN",
     "0ba154d4e4886b262f7752ebcb5213a57ea8161b88c4b5f4eed5b0f79363d7ab",
 )
+SESSION_FILE = os.environ.get("SESSION_FILE", "session.json")
 DEFAULT_PORT = 8888
 
 # ---------------------------------------------------------------------------
@@ -187,6 +188,31 @@ def build_dashboard_data() -> dict:
     if "_error" not in pnl_pairs_resp:
         for pp in pnl_pairs_resp.get("pairs", []):
             pnl_pairs_map[pp["symbol"]] = pp
+
+    # 5b. Fetch individual pair details for position data
+    #     The /pairs list doesn't include positions; /pairs/{symbol} does
+    active_symbols = set()
+    for p in ss_pairs:
+        if p.get("state") in ("active", "wind_down", "liquidating"):
+            active_symbols.add(p["symbol"])
+    for sym in pnl_pairs_map:
+        active_symbols.add(sym)
+    for sym in active_symbols:
+        encoded = sym.replace("/", "%2F")
+        detail = _pnl_get(f"/pairs/{encoded}")
+        if "_error" not in detail and "position" in detail:
+            if sym in pnl_pairs_map:
+                pnl_pairs_map[sym]["position"] = detail["position"]
+            else:
+                pnl_pairs_map[sym] = detail
+
+    # 5c. Session PnL from monitor
+    session_data = None
+    try:
+        with open(SESSION_FILE) as f:
+            session_data = json.load(f)
+    except Exception:
+        pass
 
     # 6. Collect all known symbols and fetch live prices
     all_symbols = set()
@@ -355,6 +381,7 @@ def build_dashboard_data() -> dict:
         "pairs": merged_pairs,
         "positions": positions,
         "recent_trades": recent_trades,
+        "session": session_data,
     }
 
 
@@ -619,6 +646,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card-value" id="overallEdge">--</div>
     <div class="card-sub" id="pnlSource">--</div>
   </div>
+  <div class="card">
+    <div class="card-label">Session P&amp;L</div>
+    <div class="card-value" id="sessionPnl">--</div>
+    <div class="card-sub" id="sessionInfo">--</div>
+  </div>
 </div>
 
 <!-- Global Defaults -->
@@ -845,6 +877,26 @@ function updateDashboard(data) {
   edgeEl.className = 'card-value ' + edgeClass(data.overall_edge);
   document.getElementById('pnlSource').textContent =
     'Source: ' + (data.pnl_source || '--');
+
+  // Session PnL card
+  const spEl = document.getElementById('sessionPnl');
+  const siEl = document.getElementById('sessionInfo');
+  if (data.session) {
+    const sp = data.session.session_pnl || 0;
+    spEl.textContent = fmtUsd(sp);
+    spEl.className = 'card-value ' + pnlClass(sp);
+    const limit = data.session.session_loss_limit || 0;
+    const started = data.session.started_at || '';
+    let startStr = '';
+    if (started) {
+      try { startStr = new Date(started).toLocaleTimeString('en-US', {hour12: true, hour: 'numeric', minute: '2-digit'}); } catch(e) {}
+    }
+    siEl.textContent = 'Limit: -$' + limit + (startStr ? ' | Since ' + startStr : '');
+  } else {
+    spEl.textContent = '--';
+    spEl.className = 'card-value neutral';
+    siEl.textContent = 'No active session';
+  }
 
   // Global defaults
   const dg = document.getElementById('defaultsGrid');

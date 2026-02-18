@@ -248,17 +248,14 @@ async fn process_fill_feed(ws: &mut WsConnection, shared: &Arc<AppState>) {
         let msg = parse_ws_message(&raw);
         match msg {
             WsMessage::ExecutionSnapshot(reports) => {
-                let trade_reports: Vec<_> = reports
-                    .into_iter()
-                    .filter(|r| r.exec_type == "trade")
-                    .collect();
+                let trade_count = reports.iter().filter(|r| r.exec_type == "trade").count();
                 tracing::info!(
-                    count = trade_reports.len(),
-                    "Processing execution snapshot"
+                    count = trade_count,
+                    "Ignoring execution snapshot (historical fills inflate PnL due to incomplete cost basis)"
                 );
-                for report in trade_reports {
-                    apply_exec_report(report, shared).await;
-                }
+                // Do NOT process — snapshot sells without prior buys get avg_cost=0,
+                // causing full proceeds to be counted as profit. State is persisted
+                // to pnl_state.json between restarts, so the snapshot is unnecessary.
             }
             WsMessage::Execution(report) if report.exec_type == "trade" => {
                 apply_exec_report(report, shared).await;
