@@ -408,11 +408,13 @@ async fn run_private_read_loop(
                             cl_ord_id = report.cl_ord_id,
                             symbol = report.symbol,
                             exec_type = report.exec_type,
+                            cancel_reason = report.cancel_reason.as_deref().unwrap_or("none"),
                             "Order cancelled/expired"
                         );
                         Some(EngineEvent::OrderCancelled {
                             cl_ord_id: report.cl_ord_id,
                             symbol: report.symbol,
+                            reason: report.cancel_reason,
                         })
                     }
                     other => {

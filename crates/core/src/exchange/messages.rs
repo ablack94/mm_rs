@@ -178,6 +178,9 @@ pub struct ExecReport {
     pub order_status: String,
     pub is_maker: bool,
     pub timestamp: DateTime<Utc>,
+    /// Reason for cancellation (populated on canceled/expired exec_type).
+    /// Kraken v2 WS includes this as "reason" in the execution report.
+    pub cancel_reason: Option<String>,
 }
 
 /// Parse a raw WS JSON message into our typed enum.
@@ -295,6 +298,7 @@ fn parse_single_exec(data: &serde_json::Value) -> Option<ExecReport> {
         order_status: data["order_status"].as_str().unwrap_or("").to_string(),
         is_maker: data["liquidity_ind"].as_str() == Some("m"),
         timestamp: ts,
+        cancel_reason: data["reason"].as_str().map(String::from),
     })
 }
 

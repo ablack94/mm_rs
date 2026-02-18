@@ -36,6 +36,8 @@ pub enum EngineEvent {
     OrderCancelled {
         cl_ord_id: String,
         symbol: String,
+        /// Reason for cancellation from exchange (e.g., "Market price protection").
+        reason: Option<String>,
     },
     OrderRejected {
         cl_ord_id: String,

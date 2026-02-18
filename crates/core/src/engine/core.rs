@@ -14,6 +14,12 @@ use crate::state::bot_state::{BotState, TrackedOrder};
 use crate::types::*;
 use crate::types::managed_pair::{GlobalDefaults, ManagedPair, PairConfig, PairState, ResolvedConfig};
 
+/// Maximum percentage above the best ask that we'll place a sell order.
+/// Kraken's market price protection cancels orders placed too far from market.
+/// If the cost floor pushes our ask beyond this threshold above the best ask,
+/// we skip placing the sell to avoid immediate cancellation.
+const MAX_ASK_DEVIATION_PCT: Decimal = dec!(0.03); // 3% above best ask
+
 /// Truncate a Decimal to `dp` decimal places (floor, never rounds up).
 /// This prevents sending a qty slightly larger than available balance.
 fn truncate_decimal(value: Decimal, dp: u32) -> Decimal {
@@ -241,8 +247,27 @@ impl Engine {
                 }
                 vec![]
             }
-            EngineEvent::OrderCancelled { cl_ord_id, symbol } => {
-                self.on_order_cancelled(&cl_ord_id, &symbol)
+            EngineEvent::OrderCancelled { cl_ord_id, symbol, reason } => {
+                // Look up symbol from tracked orders if not provided (Kraken
+                // often omits symbol on cancel execution reports)
+                let sym = if symbol.is_empty() {
+                    self.state
+                        .open_orders
+                        .get(&cl_ord_id)
+                        .map(|o| o.symbol.clone())
+                        .unwrap_or_default()
+                } else {
+                    symbol
+                };
+                if let Some(ref reason) = reason {
+                    tracing::warn!(
+                        cl_ord_id,
+                        symbol = sym,
+                        reason,
+                        "Order cancelled by exchange"
+                    );
+                }
+                self.on_order_cancelled(&cl_ord_id, &sym)
             }
             EngineEvent::OrderRejected {
                 cl_ord_id,
@@ -1379,21 +1404,38 @@ impl Engine {
         let price_decimals = pair_info.map_or(8, |pi| pi.price_decimals);
         let resolved = self.resolved_config(symbol);
         let min_profit_pct = resolved.as_ref().map_or(self.config.trading.min_profit_pct, |r| r.min_profit_pct);
-        let ask_price = if !position.avg_cost.is_zero() && can_sell {
+        let (ask_price, can_sell) = if !position.avg_cost.is_zero() && can_sell {
             let cost_floor = (position.avg_cost * (Decimal::ONE + min_profit_pct))
                 .round_dp(price_decimals);
             if cost_floor > ask_price {
-                tracing::info!(
-                    symbol,
-                    book_ask = %ask_price,
-                    cost_floor = %cost_floor,
-                    avg_cost = %position.avg_cost,
-                    "Raising ask to cost floor (guaranteeing profit)"
-                );
+                // Check if cost floor is too far above the book ask (market price protection)
+                let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|(p, _)| p);
+                let deviation_limit = book_best_ask.unwrap_or(ask_price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
+                if cost_floor > deviation_limit {
+                    tracing::warn!(
+                        symbol,
+                        book_ask = %ask_price,
+                        cost_floor = %cost_floor,
+                        avg_cost = %position.avg_cost,
+                        deviation_limit = %deviation_limit,
+                        "Skipping sell — cost floor too far from market (would hit market price protection)"
+                    );
+                    (ask_price, false)
+                } else {
+                    tracing::info!(
+                        symbol,
+                        book_ask = %ask_price,
+                        cost_floor = %cost_floor,
+                        avg_cost = %position.avg_cost,
+                        "Raising ask to cost floor (guaranteeing profit)"
+                    );
+                    (ask_price.max(cost_floor), can_sell)
+                }
+            } else {
+                (ask_price.max(cost_floor), can_sell)
             }
-            ask_price.max(cost_floor)
         } else {
-            ask_price
+            (ask_price, can_sell)
         };
 
         tracing::info!(
@@ -1559,16 +1601,34 @@ impl Engine {
     ) -> Vec<EngineCommand> {
         let mut cmds = vec![];
 
-        // Apply cost floor to ask price
-        let ask_price = {
+        // Apply cost floor to ask price, but skip if it would trigger market price protection
+        let (ask_price, skip_ask) = {
             let position = self.state.position(symbol);
             if !position.avg_cost.is_zero() {
                 let price_decimals = self.pair_info(symbol).map_or(8, |pi| pi.price_decimals);
                 let cost_floor = (position.avg_cost * (Decimal::ONE + resolved.min_profit_pct))
                     .round_dp(price_decimals);
-                ask_price.max(cost_floor)
+                let adjusted = ask_price.max(cost_floor);
+                if cost_floor > ask_price {
+                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|(p, _)| p);
+                    let deviation_limit = book_best_ask.unwrap_or(ask_price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
+                    if cost_floor > deviation_limit {
+                        tracing::warn!(
+                            symbol,
+                            book_ask = %ask_price,
+                            cost_floor = %cost_floor,
+                            avg_cost = %position.avg_cost,
+                            "Requote: skipping ask amend — cost floor too far from market"
+                        );
+                        (adjusted, true)
+                    } else {
+                        (adjusted, false)
+                    }
+                } else {
+                    (adjusted, false)
+                }
             } else {
-                ask_price
+                (ask_price, false)
             }
         };
 
@@ -1594,6 +1654,19 @@ impl Engine {
                     }
                 }
             }
+        }
+        // If cost floor is too far from market, cancel the existing ask instead of amending
+        if skip_ask {
+            if let Some(ref ask_id) = quoter.ask_cl_ord_id.take() {
+                self.state.open_orders.remove(ask_id);
+                cmds.push(EngineCommand::CancelOrders(vec![ask_id.clone()]));
+                if quoter.bid_cl_ord_id.is_none() {
+                    quoter.state = QuoteState::Idle;
+                    quoter.last_mid = None;
+                }
+            }
+            quoter.last_mid = Some(mid);
+            return cmds;
         }
         if let Some(ref ask_id) = quoter.ask_cl_ord_id {
             if let Some(order) = self.state.open_orders.get(ask_id) {
@@ -1636,13 +1709,27 @@ impl Engine {
         risk: &crate::config::RiskConfig,
         resolved: &ResolvedConfig,
     ) -> Vec<EngineCommand> {
-        // Apply cost floor for sells
+        // Apply cost floor for sells, but skip if it would trigger market price protection
         let price = if side == OrderSide::Sell {
             let position = self.state.position(symbol);
             if !position.avg_cost.is_zero() {
                 let price_decimals = self.pair_info(symbol).map_or(8, |pi| pi.price_decimals);
                 let cost_floor = (position.avg_cost * (Decimal::ONE + resolved.min_profit_pct))
                     .round_dp(price_decimals);
+                if cost_floor > price {
+                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|(p, _)| p);
+                    let deviation_limit = book_best_ask.unwrap_or(price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
+                    if cost_floor > deviation_limit {
+                        tracing::warn!(
+                            symbol,
+                            book_ask = %price,
+                            cost_floor = %cost_floor,
+                            avg_cost = %position.avg_cost,
+                            "Skipping sell — cost floor too far from market (would hit market price protection)"
+                        );
+                        return vec![];
+                    }
+                }
                 price.max(cost_floor)
             } else {
                 price
