@@ -1,7 +1,19 @@
-use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Serialize, Serializer};
-use crate::types::*;
+
+// Re-export protocol types and parser from trading-primitives.
+pub use trading_primitives::protocol::{
+    WsMessage, ExecReport, parse_ws_message,
+    // Builder functions (used by proxies, re-exported for convenience).
+    build_book_message, build_book_level,
+    build_execution_update, build_execution_snapshot, build_exec_report,
+    build_subscribe_confirmed, build_order_response_success, build_order_response_error,
+    build_pong, build_heartbeat,
+};
+
+// ---------------------------------------------------------------------------
+// Outgoing message structs (bot → proxy, only used in live.rs)
+// ---------------------------------------------------------------------------
 
 /// Serialize Decimal as a JSON float (Kraken rejects string-encoded numbers).
 fn decimal_as_f64<S: Serializer>(val: &Decimal, s: S) -> Result<S::Ok, S::Error> {
@@ -17,8 +29,6 @@ fn option_decimal_as_f64<S: Serializer>(val: &Option<Decimal>, s: S) -> Result<S
         None => s.serialize_none(),
     }
 }
-
-// --- Outgoing messages (to Kraken) ---
 
 #[derive(Debug, Serialize)]
 pub struct SubscribeBookMsg {
@@ -138,187 +148,8 @@ pub struct PingMsg {
     pub req_id: u64,
 }
 
-// --- Incoming message parsing ---
-
-/// Parsed WS message from Kraken.
-#[derive(Debug)]
-pub enum WsMessage {
-    BookSnapshot {
-        symbol: String,
-        bids: Vec<LevelUpdate>,
-        asks: Vec<LevelUpdate>,
-    },
-    BookUpdate {
-        symbol: String,
-        bid_updates: Vec<LevelUpdate>,
-        ask_updates: Vec<LevelUpdate>,
-    },
-    Execution(ExecReport),
-    ExecutionSnapshot(Vec<ExecReport>),
-    SubscribeConfirmed {
-        channel: String,
-    },
-    OrderResponse {
-        req_id: u64,
-        success: bool,
-        method: String,
-        order_id: Option<String>,
-        cl_ord_id: Option<String>,
-        error: Option<String>,
-    },
-    Heartbeat,
-    Pong,
-    Unknown(String),
-}
-
-#[derive(Debug)]
-pub struct ExecReport {
-    pub exec_type: String,
-    pub order_id: String,
-    pub cl_ord_id: String,
-    pub symbol: String,
-    pub side: String,
-    pub last_qty: Decimal,
-    pub last_price: Decimal,
-    pub fee: Decimal,
-    pub order_status: String,
-    pub is_maker: bool,
-    pub timestamp: DateTime<Utc>,
-    /// Reason for cancellation (populated on canceled/expired exec_type).
-    /// Kraken v2 WS includes this as "reason" in the execution report.
-    pub cancel_reason: Option<String>,
-}
-
-/// Parse a raw WS JSON message into our typed enum.
-pub fn parse_ws_message(raw: &str) -> WsMessage {
-    let v: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return WsMessage::Unknown(raw.to_string()),
-    };
-
-    if let Some(channel) = v.get("channel").and_then(|c| c.as_str()) {
-        match channel {
-            "book" => parse_book(&v),
-            "executions" => parse_executions(&v),
-            "heartbeat" => WsMessage::Heartbeat,
-            _ => WsMessage::Unknown(raw.to_string()),
-        }
-    } else if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
-        match method {
-            "pong" => WsMessage::Pong,
-            "subscribe" => {
-                let ch = v["result"]["channel"].as_str().unwrap_or("").to_string();
-                WsMessage::SubscribeConfirmed { channel: ch }
-            }
-            _ => parse_order_response(&v, method),
-        }
-    } else {
-        WsMessage::Unknown(raw.to_string())
-    }
-}
-
-fn parse_book(v: &serde_json::Value) -> WsMessage {
-    let msg_type = v["type"].as_str().unwrap_or("");
-    let data = match v["data"].as_array().and_then(|a| a.first()) {
-        Some(d) => d,
-        None => return WsMessage::Unknown(v.to_string()),
-    };
-    let symbol = data["symbol"].as_str().unwrap_or("").to_string();
-    let bids = parse_levels(&data["bids"]);
-    let asks = parse_levels(&data["asks"]);
-
-    match msg_type {
-        "snapshot" => WsMessage::BookSnapshot { symbol, bids, asks },
-        "update" => WsMessage::BookUpdate {
-            symbol,
-            bid_updates: bids,
-            ask_updates: asks,
-        },
-        _ => WsMessage::Unknown(v.to_string()),
-    }
-}
-
-fn parse_levels(v: &serde_json::Value) -> Vec<LevelUpdate> {
-    v.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| {
-                    let price = Decimal::try_from(entry["price"].as_f64()?).ok()?;
-                    let qty = Decimal::try_from(entry["qty"].as_f64()?).ok()?;
-                    Some(LevelUpdate { price, qty })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_executions(v: &serde_json::Value) -> WsMessage {
-    let msg_type = v["type"].as_str().unwrap_or("");
-
-    if msg_type == "snapshot" {
-        // Parse all trades in the snapshot
-        let trades: Vec<ExecReport> = v["data"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter(|d| d["exec_type"].as_str() == Some("trade"))
-                    .filter_map(|d| parse_single_exec(d))
-                    .collect()
-            })
-            .unwrap_or_default();
-        return WsMessage::ExecutionSnapshot(trades);
-    }
-
-    let data = match v["data"].as_array().and_then(|a| a.first()) {
-        Some(d) => d,
-        None => return WsMessage::Unknown(v.to_string()),
-    };
-
-    match parse_single_exec(data) {
-        Some(report) => WsMessage::Execution(report),
-        None => WsMessage::Unknown(v.to_string()),
-    }
-}
-
-fn parse_single_exec(data: &serde_json::Value) -> Option<ExecReport> {
-    let fee = data["fees"]
-        .as_array()
-        .and_then(|fees| fees.iter().map(|f| f["qty"].as_f64().unwrap_or(0.0)).reduce(|a, b| a + b))
-        .and_then(|f| Decimal::try_from(f).ok())
-        .unwrap_or_default();
-
-    let ts = data["timestamp"]
-        .as_str()
-        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-        .unwrap_or_else(Utc::now);
-
-    Some(ExecReport {
-        exec_type: data["exec_type"].as_str().unwrap_or("").to_string(),
-        order_id: data["order_id"].as_str().unwrap_or("").to_string(),
-        cl_ord_id: data["cl_ord_id"].as_str().unwrap_or("").to_string(),
-        symbol: data["symbol"].as_str().unwrap_or("").to_string(),
-        side: data["side"].as_str().unwrap_or("").to_string(),
-        last_qty: Decimal::try_from(data["last_qty"].as_f64().unwrap_or(0.0)).unwrap_or_default(),
-        last_price: Decimal::try_from(data["last_price"].as_f64().unwrap_or(0.0)).unwrap_or_default(),
-        fee,
-        order_status: data["order_status"].as_str().unwrap_or("").to_string(),
-        is_maker: data["liquidity_ind"].as_str() == Some("m"),
-        timestamp: ts,
-        cancel_reason: data["reason"].as_str().map(String::from),
-    })
-}
-
-fn parse_order_response(v: &serde_json::Value, method: &str) -> WsMessage {
-    WsMessage::OrderResponse {
-        req_id: v["req_id"].as_u64().unwrap_or(0),
-        success: v["success"].as_bool().unwrap_or(false),
-        method: method.to_string(),
-        order_id: v["result"]["order_id"].as_str().map(String::from),
-        cl_ord_id: v["result"]["cl_ord_id"].as_str().map(String::from),
-        error: v["error"].as_str().map(String::from),
-    }
-}
-
+// Tests are now in trading_primitives::protocol::tests.
+// The tests below validate that re-exports work correctly.
 #[cfg(test)]
 mod tests {
     use super::*;

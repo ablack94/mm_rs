@@ -5,6 +5,7 @@ pub mod fill;
 pub mod position;
 pub mod ticker;
 pub mod config;
+pub mod protocol;
 pub mod traits;
 
 // Re-export all public types at crate root for convenience.

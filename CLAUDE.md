@@ -2,11 +2,12 @@
 
 ## Project Structure
 
-Cargo workspace with 10 crates under `crates/`:
+Cargo workspace with 11 crates under `crates/`:
 
 | Crate | Type | Binary | Description |
 |-------|------|--------|-------------|
-| `core` | library | — | Shared engine, exchange adapters, types, traits, config (`kraken_core`) |
+| `trading-primitives` | library | — | Exchange-agnostic types (OrderBook, Position, Fill, etc.), traits (ExchangeClient, OrderManager), shared config (PairState, PairConfig) |
+| `core` | library | — | Engine, exchange adapters, bot-specific types, config (`kraken_core`). Re-exports trading-primitives. |
 | `bot` | binary | `kraken-mm` | Market-making executor (exchange-agnostic, connects via proxy + state store) |
 | `state-store` | binary | `state-store` | CRUD service for pair configs/states, WS relay to bot (standalone, no `kraken-core` dep) |
 | `pnl-analyzer` | binary | `pnl-analyzer` | Edge metrics, pair promotion/demotion, writes to state store |

@@ -1,26 +1,15 @@
-/// Translation between Kraken WS v2 format (bot protocol) and Coinbase formats.
+/// Translation between proxy protocol (bot) and Coinbase formats.
 ///
-/// The bot speaks Kraken WS v2 protocol. This module translates:
-/// - Coinbase level2 book data → Kraken book snapshot/update format
-/// - Coinbase user channel events → Kraken execution format
-/// - Kraken subscribe messages → Coinbase subscribe format
+/// The bot speaks the proxy wire protocol. This module translates:
+/// - Coinbase level2 book data → protocol book snapshot/update format
+/// - Coinbase user channel events → protocol execution format
+/// - Protocol subscribe messages → Coinbase subscribe format
 
 use crate::pairs;
-use serde_json::{json, Value};
+use serde_json::Value;
+use trading_primitives::protocol;
 
-/// Translate a Coinbase level2 (l2_data) message to Kraken book format.
-///
-/// Coinbase format:
-/// ```json
-/// {"channel":"l2_data","events":[{"type":"snapshot","product_id":"BTC-USD",
-///   "updates":[{"side":"bid","price_level":"50000","new_quantity":"1.5"}, ...]}]}
-/// ```
-///
-/// Kraken format:
-/// ```json
-/// {"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD",
-///   "bids":[{"price":50000.0,"qty":1.5}],"asks":[...]}]}
-/// ```
+/// Translate a Coinbase level2 (l2_data) message to proxy protocol book format.
 pub fn coinbase_book_to_kraken(coinbase_msg: &Value) -> Option<String> {
     let events = coinbase_msg.get("events")?.as_array()?;
 
@@ -37,7 +26,7 @@ pub fn coinbase_book_to_kraken(coinbase_msg: &Value) -> Option<String> {
             let side = update.get("side")?.as_str()?;
             let price: f64 = update.get("price_level")?.as_str()?.parse().ok()?;
             let qty: f64 = update.get("new_quantity")?.as_str()?.parse().ok()?;
-            let level = json!({"price": price, "qty": qty});
+            let level = protocol::build_book_level(price, qty);
 
             match side {
                 "bid" => bids.push(level),
@@ -46,33 +35,19 @@ pub fn coinbase_book_to_kraken(coinbase_msg: &Value) -> Option<String> {
             }
         }
 
-        let kraken_type = match event_type {
+        let msg_type = match event_type {
             "snapshot" => "snapshot",
             "update" => "update",
             _ => continue,
         };
 
-        let kraken_msg = json!({
-            "channel": "book",
-            "type": kraken_type,
-            "data": [{
-                "symbol": symbol,
-                "bids": bids,
-                "asks": asks,
-                "checksum": 0
-            }]
-        });
-
-        return Some(kraken_msg.to_string());
+        return Some(protocol::build_book_message(msg_type, &symbol, bids, asks));
     }
 
     None
 }
 
-/// Translate a Coinbase user channel message to Kraken execution format.
-///
-/// Coinbase user channel sends order updates with status changes.
-/// We translate these to Kraken-style execution reports.
+/// Translate a Coinbase user channel message to proxy protocol execution format.
 pub fn coinbase_user_to_kraken(coinbase_msg: &Value) -> Vec<String> {
     let mut results = Vec::new();
 
@@ -89,30 +64,18 @@ pub fn coinbase_user_to_kraken(coinbase_msg: &Value) -> Vec<String> {
         };
 
         if event_type == "snapshot" {
-            // Translate snapshot of open orders
             let exec_reports: Vec<Value> = orders
                 .iter()
-                .filter_map(|order| translate_order_to_exec(order, true))
+                .filter_map(|order| translate_order_to_exec(order))
                 .collect();
 
             if !exec_reports.is_empty() {
-                let msg = json!({
-                    "channel": "executions",
-                    "type": "snapshot",
-                    "data": exec_reports
-                });
-                results.push(msg.to_string());
+                results.push(protocol::build_execution_snapshot(exec_reports));
             }
         } else {
-            // Individual order updates
             for order in orders {
-                if let Some(exec_report) = translate_order_to_exec(order, false) {
-                    let msg = json!({
-                        "channel": "executions",
-                        "type": "update",
-                        "data": [exec_report]
-                    });
-                    results.push(msg.to_string());
+                if let Some(exec_report) = translate_order_to_exec(order) {
+                    results.push(protocol::build_execution_update(exec_report));
                 }
             }
         }
@@ -121,8 +84,8 @@ pub fn coinbase_user_to_kraken(coinbase_msg: &Value) -> Vec<String> {
     results
 }
 
-/// Translate a single Coinbase order object to a Kraken-style execution report.
-fn translate_order_to_exec(order: &Value, _is_snapshot: bool) -> Option<Value> {
+/// Translate a single Coinbase order object to a protocol execution report.
+fn translate_order_to_exec(order: &Value) -> Option<Value> {
     let status = order.get("status")?.as_str()?;
     let product_id = order.get("product_id")?.as_str()?;
     let symbol = pairs::to_internal(product_id);
@@ -130,7 +93,7 @@ fn translate_order_to_exec(order: &Value, _is_snapshot: bool) -> Option<Value> {
     let client_order_id = order.get("client_order_id")?.as_str().unwrap_or("");
     let side = order.get("order_side")?.as_str().unwrap_or("").to_lowercase();
 
-    // Map Coinbase status to Kraken exec_type
+    // Map Coinbase status to protocol exec_type
     let (exec_type, order_status) = match status {
         "FILLED" => ("trade", "filled"),
         "OPEN" => ("new", "open"),
@@ -169,39 +132,24 @@ fn translate_order_to_exec(order: &Value, _is_snapshot: bool) -> Option<Value> {
         .and_then(|r| r.as_str())
         .filter(|r| !r.is_empty());
 
-    let mut report = json!({
-        "exec_type": exec_type,
-        "order_id": order_id,
-        "cl_ord_id": client_order_id,
-        "symbol": symbol,
-        "side": side,
-        "last_qty": filled_qty,
-        "last_price": avg_price,
-        "fees": [{"asset": "USD", "qty": total_fees}],
-        "order_status": order_status,
-        "liquidity_ind": "m",
-        "timestamp": timestamp
-    });
-
-    if let Some(reason) = cancel_reason {
-        report["reason"] = json!(reason);
-    }
-
-    Some(report)
+    Some(protocol::build_exec_report(
+        exec_type,
+        order_id,
+        client_order_id,
+        &symbol,
+        &side,
+        filled_qty,
+        avg_price,
+        total_fees,
+        order_status,
+        "m", // assume maker (Coinbase doesn't always report this)
+        timestamp,
+        cancel_reason,
+    ))
 }
 
-/// Translate a Kraken-format subscribe message to Coinbase format.
-/// Returns (channel, product_ids) for the Coinbase subscription.
-///
-/// Kraken subscribe:
-/// ```json
-/// {"method":"subscribe","params":{"channel":"book","symbol":["BTC/USD"],"depth":10}}
-/// ```
-///
-/// Coinbase subscribe:
-/// ```json
-/// {"type":"subscribe","product_ids":["BTC-USD"],"channel":"level2"}
-/// ```
+/// Translate a protocol subscribe message to Coinbase format.
+/// Returns the Coinbase subscribe JSON (without auth fields — caller adds those).
 pub fn kraken_subscribe_to_coinbase(kraken_msg: &Value) -> Option<Value> {
     let params = kraken_msg.get("params")?;
     let channel = params.get("channel")?.as_str()?;
@@ -219,67 +167,43 @@ pub fn kraken_subscribe_to_coinbase(kraken_msg: &Value) -> Option<Value> {
         _ => return None,
     };
 
-    Some(json!({
+    Some(serde_json::json!({
         "type": "subscribe",
         "product_ids": product_ids,
         "channel": coinbase_channel
     }))
 }
 
-/// Build a Kraken-format subscribe confirmation response.
+/// Build a protocol subscribe confirmation response.
 pub fn subscribe_confirmed(channel: &str) -> String {
-    json!({
-        "method": "subscribe",
-        "result": {
-            "channel": channel
-        },
-        "success": true
-    })
-    .to_string()
+    protocol::build_subscribe_confirmed(channel)
 }
 
-/// Build a Kraken-format order response (success).
+/// Build a protocol order response (success).
 pub fn order_response_success(method: &str, req_id: u64, order_id: &str, cl_ord_id: &str) -> String {
-    json!({
-        "method": method,
-        "req_id": req_id,
-        "success": true,
-        "result": {
-            "order_id": order_id,
-            "cl_ord_id": cl_ord_id
-        }
-    })
-    .to_string()
+    protocol::build_order_response_success(method, req_id, order_id, cl_ord_id)
 }
 
-/// Build a Kraken-format order response (error).
+/// Build a protocol order response (error).
 pub fn order_response_error(method: &str, req_id: u64, error: &str) -> String {
-    json!({
-        "method": method,
-        "req_id": req_id,
-        "success": false,
-        "error": error
-    })
-    .to_string()
+    protocol::build_order_response_error(method, req_id, error)
 }
 
-/// Build a Kraken-format pong response.
+/// Build a protocol pong response.
 pub fn pong_response(req_id: u64) -> String {
-    json!({
-        "method": "pong",
-        "req_id": req_id
-    })
-    .to_string()
+    protocol::build_pong(req_id)
 }
 
-/// Build a Kraken-format heartbeat message.
+/// Build a protocol heartbeat message.
 pub fn heartbeat() -> String {
-    json!({"channel": "heartbeat"}).to_string()
+    protocol::build_heartbeat()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use trading_primitives::protocol::{parse_ws_message, WsMessage};
 
     #[test]
     fn test_coinbase_book_snapshot_to_kraken() {
@@ -298,15 +222,15 @@ mod tests {
         });
 
         let result = coinbase_book_to_kraken(&coinbase).unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-
-        assert_eq!(parsed["channel"], "book");
-        assert_eq!(parsed["type"], "snapshot");
-        assert_eq!(parsed["data"][0]["symbol"], "BTC/USD");
-        assert_eq!(parsed["data"][0]["bids"].as_array().unwrap().len(), 2);
-        assert_eq!(parsed["data"][0]["asks"].as_array().unwrap().len(), 1);
-        assert_eq!(parsed["data"][0]["bids"][0]["price"], 50000.0);
-        assert_eq!(parsed["data"][0]["bids"][0]["qty"], 1.5);
+        // Verify it parses correctly through the protocol parser
+        match parse_ws_message(&result) {
+            WsMessage::BookSnapshot { symbol, bids, asks } => {
+                assert_eq!(symbol, "BTC/USD");
+                assert_eq!(bids.len(), 2);
+                assert_eq!(asks.len(), 1);
+            }
+            other => panic!("Expected BookSnapshot, got {:?}", other),
+        }
     }
 
     #[test]
@@ -324,11 +248,12 @@ mod tests {
         });
 
         let result = coinbase_book_to_kraken(&coinbase).unwrap();
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-
-        assert_eq!(parsed["channel"], "book");
-        assert_eq!(parsed["type"], "update");
-        assert_eq!(parsed["data"][0]["symbol"], "ETH/USD");
+        match parse_ws_message(&result) {
+            WsMessage::BookUpdate { symbol, .. } => {
+                assert_eq!(symbol, "ETH/USD");
+            }
+            other => panic!("Expected BookUpdate, got {:?}", other),
+        }
     }
 
     #[test]
@@ -354,14 +279,15 @@ mod tests {
 
         let results = coinbase_user_to_kraken(&coinbase);
         assert_eq!(results.len(), 1);
-        let parsed: Value = serde_json::from_str(&results[0]).unwrap();
-
-        assert_eq!(parsed["channel"], "executions");
-        assert_eq!(parsed["type"], "update");
-        assert_eq!(parsed["data"][0]["exec_type"], "trade");
-        assert_eq!(parsed["data"][0]["symbol"], "BTC/USD");
-        assert_eq!(parsed["data"][0]["side"], "buy");
-        assert_eq!(parsed["data"][0]["order_status"], "filled");
+        // Verify it parses correctly through the protocol parser
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "trade");
+                assert_eq!(report.symbol, "BTC/USD");
+                assert_eq!(report.side, "buy");
+            }
+            other => panic!("Expected Execution, got {:?}", other),
+        }
     }
 
     #[test]
@@ -387,9 +313,13 @@ mod tests {
 
         let results = coinbase_user_to_kraken(&coinbase);
         assert_eq!(results.len(), 1);
-        let parsed: Value = serde_json::from_str(&results[0]).unwrap();
-        assert_eq!(parsed["data"][0]["exec_type"], "canceled");
-        assert_eq!(parsed["data"][0]["reason"], "USER_CANCEL");
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "canceled");
+                assert_eq!(report.cancel_reason, Some("USER_CANCEL".to_string()));
+            }
+            other => panic!("Expected Execution, got {:?}", other),
+        }
     }
 
     #[test]
@@ -414,20 +344,27 @@ mod tests {
     #[test]
     fn test_order_response_success() {
         let result = order_response_success("add_order", 42, "cb-123", "mm_buy_001");
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["method"], "add_order");
-        assert_eq!(parsed["req_id"], 42);
-        assert!(parsed["success"].as_bool().unwrap());
-        assert_eq!(parsed["result"]["order_id"], "cb-123");
-        assert_eq!(parsed["result"]["cl_ord_id"], "mm_buy_001");
+        match parse_ws_message(&result) {
+            WsMessage::OrderResponse { req_id, success, method, order_id, cl_ord_id, .. } => {
+                assert_eq!(req_id, 42);
+                assert!(success);
+                assert_eq!(method, "add_order");
+                assert_eq!(order_id, Some("cb-123".to_string()));
+                assert_eq!(cl_ord_id, Some("mm_buy_001".to_string()));
+            }
+            other => panic!("Expected OrderResponse, got {:?}", other),
+        }
     }
 
     #[test]
     fn test_order_response_error() {
         let result = order_response_error("add_order", 99, "Insufficient funds");
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["req_id"], 99);
-        assert!(!parsed["success"].as_bool().unwrap());
-        assert_eq!(parsed["error"], "Insufficient funds");
+        match parse_ws_message(&result) {
+            WsMessage::OrderResponse { success, error, .. } => {
+                assert!(!success);
+                assert_eq!(error, Some("Insufficient funds".to_string()));
+            }
+            other => panic!("Expected OrderResponse, got {:?}", other),
+        }
     }
 }

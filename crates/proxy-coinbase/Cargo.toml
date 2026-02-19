@@ -8,6 +8,7 @@ name = "coinbase-proxy"
 path = "src/main.rs"
 
 [dependencies]
+trading-primitives = { path = "../trading-primitives" }
 proxy-common = { path = "../proxy-common" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
