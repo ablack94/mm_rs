@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+// Import shared types from trading-primitives.
+pub use trading_primitives::{PairState, PairConfig, GlobalDefaults};
 
 // ---------------------------------------------------------------------------
 // Core data types
@@ -15,51 +19,6 @@ pub struct PairRecord {
     pub auto_enable_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum PairState {
-    Disabled,
-    WindDown,
-    Liquidating,
-    Active,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PairConfig {
-    pub order_size_usd: Option<f64>,
-    pub max_inventory_usd: Option<f64>,
-    pub min_spread_bps: Option<f64>,
-    pub spread_capture_pct: Option<f64>,
-    pub min_profit_pct: Option<f64>,
-    pub stop_loss_pct: Option<f64>,
-    pub take_profit_pct: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlobalDefaults {
-    pub order_size_usd: f64,
-    pub max_inventory_usd: f64,
-    pub min_spread_bps: f64,
-    pub spread_capture_pct: f64,
-    pub min_profit_pct: f64,
-    pub stop_loss_pct: f64,
-    pub take_profit_pct: f64,
-}
-
-impl Default for GlobalDefaults {
-    fn default() -> Self {
-        Self {
-            order_size_usd: 50.0,
-            max_inventory_usd: 200.0,
-            min_spread_bps: 100.0,
-            spread_capture_pct: 0.5,
-            min_profit_pct: 0.01,
-            stop_loss_pct: 0.03,
-            take_profit_pct: 0.10,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,43 +121,65 @@ pub struct PatchPairRequest {
 /// that deserializes both cases.
 #[derive(Debug, Deserialize)]
 pub struct PatchPairConfig {
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub order_size_usd: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub max_inventory_usd: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub min_spread_bps: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub spread_capture_pct: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub min_profit_pct: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub stop_loss_pct: Option<Option<f64>>,
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub take_profit_pct: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub order_size_usd: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub max_inventory_usd: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub min_spread_bps: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub spread_capture_pct: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub min_profit_pct: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub stop_loss_pct: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub take_profit_pct: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
+    pub max_buys_before_sell: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    pub use_winddown_for_stoploss: Option<Option<bool>>,
 }
 
 /// Deserialize a field that can be:
 /// - absent from JSON -> outer None (don't touch)
 /// - present as null  -> Some(None) (set to null / revert to default)
 /// - present as value -> Some(Some(v)) (set to value)
-fn deserialize_optional_field<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
+fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Option<Decimal>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let val: Option<f64> = Option::deserialize(deserializer)?;
+    let val: Option<Decimal> = Option::deserialize(deserializer)?;
+    Ok(Some(val))
+}
+
+fn deserialize_optional_u32<'de, D>(deserializer: D) -> Result<Option<Option<u32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<u32> = Option::deserialize(deserializer)?;
+    Ok(Some(val))
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<Option<bool>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<bool> = Option::deserialize(deserializer)?;
     Ok(Some(val))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PatchDefaultsRequest {
-    pub order_size_usd: Option<f64>,
-    pub max_inventory_usd: Option<f64>,
-    pub min_spread_bps: Option<f64>,
-    pub spread_capture_pct: Option<f64>,
-    pub min_profit_pct: Option<f64>,
-    pub stop_loss_pct: Option<f64>,
-    pub take_profit_pct: Option<f64>,
+    pub order_size_usd: Option<Decimal>,
+    pub max_inventory_usd: Option<Decimal>,
+    pub min_spread_bps: Option<Decimal>,
+    pub spread_capture_pct: Option<Decimal>,
+    pub min_profit_pct: Option<Decimal>,
+    pub stop_loss_pct: Option<Decimal>,
+    pub take_profit_pct: Option<Decimal>,
+    pub max_buys_before_sell: Option<u32>,
+    pub use_winddown_for_stoploss: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

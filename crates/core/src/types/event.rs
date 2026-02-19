@@ -1,16 +1,11 @@
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use super::fill::Fill;
 use super::pair::PairInfo;
 
-/// A price-level update from the order book.
-#[derive(Debug, Clone)]
-pub struct LevelUpdate {
-    pub price: Decimal,
-    pub qty: Decimal,
-}
+// Re-export LevelUpdate from trading-primitives.
+pub use trading_primitives::book::LevelUpdate;
 
 /// Events flowing into the engine. All timestamps come from the event source,
 /// making the engine fully deterministic and testable.

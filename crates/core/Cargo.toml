@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+trading-primitives = { path = "../trading-primitives" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 futures = "0.3"
@@ -21,7 +22,6 @@ chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 anyhow = "1"
 url = "2"
-axum = { version = "0.8", features = ["ws"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
