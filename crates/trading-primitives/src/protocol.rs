@@ -6,9 +6,30 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::book::LevelUpdate;
+
+// ---------------------------------------------------------------------------
+// Exchange capabilities (proxy → bot, queried at startup via REST)
+// ---------------------------------------------------------------------------
+
+/// Capabilities advertised by a proxy, queried at startup.
+/// The bot uses this to skip unsupported features (e.g., DMS on Coinbase).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangeCapabilities {
+    /// Whether the exchange supports dead man's switch (cancel-all-after).
+    pub dead_man_switch: bool,
+}
+
+impl Default for ExchangeCapabilities {
+    fn default() -> Self {
+        Self {
+            dead_man_switch: true,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Parsed incoming messages (proxy/exchange → bot)
@@ -536,6 +557,18 @@ mod tests {
     fn test_invalid_json() {
         let msg = parse_ws_message("not json");
         assert!(matches!(msg, WsMessage::Unknown(_)));
+    }
+
+    #[test]
+    fn test_exchange_capabilities_serde() {
+        let caps = ExchangeCapabilities { dead_man_switch: false };
+        let json = serde_json::to_string(&caps).unwrap();
+        let parsed: ExchangeCapabilities = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.dead_man_switch);
+
+        // Default has DMS enabled
+        let default_caps = ExchangeCapabilities::default();
+        assert!(default_caps.dead_man_switch);
     }
 
     // Builder function tests — ensure builders produce parseable messages.

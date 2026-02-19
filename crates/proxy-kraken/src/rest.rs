@@ -37,9 +37,14 @@ pub fn build_kraken_rest_router(state: Arc<KrakenRestState>) -> Router {
         .route("/0/public/AssetPairs", get(proxy_public))
         .route("/0/public/Ticker", get(proxy_public))
         .route("/0/public/OHLC", get(proxy_public))
-        // Health check
+        // Capabilities & health
+        .route("/capabilities", get(capabilities))
         .route("/health", get(health))
         .with_state(state)
+}
+
+async fn capabilities() -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(json!({"dead_man_switch": true})))
 }
 
 async fn health() -> (StatusCode, Json<Value>) {

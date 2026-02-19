@@ -17,3 +17,4 @@ pub use position::Position;
 pub use ticker::TickerData;
 pub use config::{PairState, PairConfig, GlobalDefaults, ResolvedConfig};
 pub use traits::{ExchangeClient, OrderManager};
+pub use protocol::ExchangeCapabilities;

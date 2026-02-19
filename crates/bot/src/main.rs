@@ -8,6 +8,7 @@ use kraken_core::config::Config;
 use kraken_core::engine::core::Engine;
 use kraken_core::engine::quoter::QuoteState;
 use kraken_core::exchange::live::LiveExchange;
+use kraken_core::exchange::messages::ExchangeCapabilities;
 use kraken_core::exchange::proxy_client::ProxyClient;
 use kraken_core::state::bot_state::BotState;
 use kraken_core::state::csv_logger::CsvTradeLogger;
@@ -90,10 +91,24 @@ async fn main() -> Result<()> {
         tracing::info!(?pairs, "Got {} pairs from state store", pairs.len());
     }
 
-    let exchange: Arc<dyn ExchangeClient> = Arc::new(ProxyClient::new(
+    let proxy_client = ProxyClient::new(
         config.exchange.proxy_url.clone(),
         config.exchange.proxy_token.clone(),
-    ));
+    );
+
+    // Query proxy capabilities (DMS support, etc.)
+    let capabilities = match proxy_client.get_capabilities().await {
+        Ok(caps) => {
+            tracing::info!(dead_man_switch = caps.dead_man_switch, "Proxy capabilities");
+            caps
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query proxy capabilities — assuming defaults");
+            ExchangeCapabilities::default()
+        }
+    };
+
+    let exchange: Arc<dyn ExchangeClient> = Arc::new(proxy_client);
 
     // Fetch pair info for state store pairs (skip if empty — pairs will be fetched dynamically)
     let pair_info = if pairs.is_empty() {
@@ -144,9 +159,9 @@ async fn main() -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(256);
 
     let result = if config.trading.dry_run {
-        run_dry(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx).await
+        run_dry(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx, capabilities).await
     } else {
-        run_live(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx).await
+        run_live(config, engine, pairs, event_tx, event_rx, cmd_tx, cmd_rx, logger, exchange, ss_cmd_rx, ss_snapshot_tx, capabilities).await
     };
 
     // Abort state store task on shutdown
@@ -255,6 +270,7 @@ async fn run_dry(
     exchange: Arc<dyn ExchangeClient>,
     mut ss_cmd_rx: mpsc::Receiver<StateStoreCommand>,
     ss_snapshot_tx: mpsc::Sender<EngineSnapshot>,
+    _capabilities: ExchangeCapabilities,
 ) -> Result<()> {
     use kraken_core::exchange::ws::*;
     use kraken_core::exchange::messages::*;
@@ -521,6 +537,7 @@ async fn run_live(
     exchange: Arc<dyn ExchangeClient>,
     mut ss_cmd_rx: mpsc::Receiver<StateStoreCommand>,
     ss_snapshot_tx: mpsc::Sender<EngineSnapshot>,
+    capabilities: ExchangeCapabilities,
 ) -> Result<()> {
     let live = LiveExchange::connect(config.clone(), event_tx.clone(), exchange.clone()).await?;
     let live = std::sync::Arc::new(live);
@@ -632,6 +649,7 @@ async fn run_live(
     // Command dispatcher (live)
     let live_ref = live.clone();
     let dms_timeout = config.risk.dms_timeout_secs;
+    let has_dms = capabilities.dead_man_switch;
     let dispatch_handle = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let result: Result<()> = async {
@@ -660,7 +678,9 @@ async fn run_live(
                         live_ref.cancel_all().await?;
                     }
                     EngineCommand::RefreshDms => {
-                        live_ref.refresh(dms_timeout).await?;
+                        if has_dms {
+                            live_ref.refresh(dms_timeout).await?;
+                        }
                     }
                     EngineCommand::PersistState(_) => {}
                     EngineCommand::LogTrade(record) => {
@@ -669,7 +689,9 @@ async fn run_live(
                     EngineCommand::Shutdown { reason } => {
                         tracing::warn!(reason, "Shutdown requested");
                         let _ = live_ref.cancel_all().await;
-                        let _ = live_ref.disable().await;
+                        if has_dms {
+                            let _ = live_ref.disable().await;
+                        }
                         return Ok(());
                     }
                 }

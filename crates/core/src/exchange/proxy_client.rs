@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::traits::ExchangeClient;
 use crate::types::PairInfo;
 use crate::types::ticker::TickerData;
+use trading_primitives::ExchangeCapabilities;
 
 /// Exchange client that routes requests through the proxy.
 /// The proxy holds the actual API keys and signs requests.
@@ -38,6 +39,13 @@ impl ProxyClient {
             .await?;
         check_error(&resp)?;
         Ok(resp)
+    }
+
+    /// Query the proxy's capabilities (DMS support, etc.).
+    pub async fn get_capabilities(&self) -> Result<ExchangeCapabilities> {
+        let resp = self.proxy_get("/capabilities").await?;
+        let caps: ExchangeCapabilities = serde_json::from_value(resp)?;
+        Ok(caps)
     }
 
     /// Send a GET to the proxy, which forwards to the exchange's public API.

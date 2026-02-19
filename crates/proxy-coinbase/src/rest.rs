@@ -30,9 +30,14 @@ pub fn build_coinbase_rest_router(state: Arc<CoinbaseRestState>) -> Router {
         .route("/0/private/GetWebSocketsToken", post(handle_ws_token))
         .route("/0/private/OpenOrders", post(handle_open_orders))
         .route("/0/private/TradesHistory", post(handle_trades_history))
-        // Health check
+        // Capabilities & health
+        .route("/capabilities", get(capabilities))
         .route("/health", get(health))
         .with_state(state)
+}
+
+async fn capabilities() -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(json!({"dead_man_switch": false})))
 }
 
 async fn health() -> (StatusCode, Json<Value>) {

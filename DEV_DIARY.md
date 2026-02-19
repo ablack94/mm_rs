@@ -51,8 +51,42 @@
 - `KillSwitch` — risk control
 - `DeadManSwitch`, `TradeLogger`, `EventSource`, `Clock` traits — engine-specific
 
-### Brainstorm Agent Ideas (for future work)
-1. **Formalize proxy protocol** — move message types from `exchange/messages.rs` to `proxy-common` as shared structs. Both proxies would import canonical types instead of constructing JSON ad-hoc.
-2. **ExchangeCapabilities** — let proxy advertise capabilities (e.g., DMS support). Engine skips DMS refresh for Coinbase instead of proxy silently acknowledging.
+### Proxy Protocol Formalization (completed)
+
+Added `protocol` module to `trading-primitives` with:
+- `WsMessage` enum and `ExecReport` struct (parsed incoming messages)
+- `parse_ws_message()` — the canonical protocol parser
+- Builder functions: `build_book_message`, `build_exec_report`, `build_order_response_success/error`, `build_heartbeat`, etc.
+
+Core's `exchange/messages.rs` now re-exports protocol types from trading-primitives.
+Coinbase proxy's `translate.rs` now uses shared builders instead of raw `json!()` — type-safe against protocol drift.
+Tests verify round-trip: builders produce messages that the parser correctly interprets.
+
+**159 tests pass** across the workspace.
+
+### ExchangeCapabilities (completed)
+
+Added `ExchangeCapabilities` struct to `trading-primitives::protocol`:
+- `dead_man_switch: bool` — whether the exchange supports cancel-all-after
+- Default: `true` (safe fallback)
+
+Both proxies now expose `GET /capabilities`:
+- Kraken proxy returns `{"dead_man_switch": true}`
+- Coinbase proxy returns `{"dead_man_switch": false}`
+
+Bot startup queries `/capabilities` via `ProxyClient::get_capabilities()`:
+- On success, logs capabilities and stores the flag
+- On failure (e.g., old proxy without endpoint), falls back to defaults (DMS enabled)
+
+Bot dispatch uses the flag:
+- `RefreshDms` command is skipped when `dead_man_switch == false`
+- Shutdown skips `disable()` DMS call for exchanges without DMS
+- Previously, Coinbase proxy silently faked DMS success — now the bot knows to skip it entirely
+
+**160 tests pass** across the workspace.
+
+### Remaining ideas from brainstorm agent
+1. ~~Formalize proxy protocol~~ (done)
+2. ~~ExchangeCapabilities~~ (done)
 3. **Integration test: bot + mock-exchange + coinbase-proxy** — validate full Coinbase path end-to-end.
 4. **Performance metrics / observability** — Prometheus metrics or structured metric events.
