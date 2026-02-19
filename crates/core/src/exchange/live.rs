@@ -18,7 +18,7 @@ enum WsRequest {
     Json(String),
 }
 
-/// Live Kraken exchange adapter: uses a single private WS connection
+/// Live exchange adapter: uses a single private WS connection (via proxy)
 /// for both sending orders and receiving executions/responses.
 /// The private WS automatically reconnects on disconnect.
 pub struct LiveExchange {
@@ -38,7 +38,7 @@ pub struct LiveExchange {
 }
 
 impl LiveExchange {
-    /// Connect to Kraken: opens one private WS connection, splits it into
+    /// Connect to exchange via proxy: opens one private WS connection, splits it into
     /// a write loop (for orders/DMS) and a read loop (for executions/responses).
     /// The read loop automatically reconnects on disconnect with exponential backoff.
     ///
@@ -249,6 +249,7 @@ impl OrderManager for LiveExchange {
                 token: self.token.clone(),
             },
             req_id,
+            _priority: if request.urgent { Some("urgent".into()) } else { None },
         })
         .await
     }
@@ -270,6 +271,7 @@ impl OrderManager for LiveExchange {
                 token: self.token.clone(),
             },
             req_id,
+            _priority: None,
         })
         .await
     }
@@ -283,6 +285,7 @@ impl OrderManager for LiveExchange {
                 token: self.token.clone(),
             },
             req_id,
+            _priority: None,
         })
         .await
     }

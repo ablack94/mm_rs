@@ -16,7 +16,8 @@ pub struct ExchangeConfig {
     pub api_key: String,
     /// API secret — only needed by proxy and scanner (bot never uses directly).
     pub api_secret: String,
-    /// REST base URL — used by KrakenRest (proxy/scanner direct connections).
+    /// REST base URL — used for direct REST connections (scanner, recorder).
+    /// Not used by the bot (bot connects through proxy).
     pub rest_base_url: String,
     pub book_depth: u32,
     /// Base URL of the proxy (e.g., "http://localhost:3053").
@@ -40,6 +41,13 @@ pub struct TradingConfig {
     pub min_profit_pct: Decimal,
     pub dry_run: bool,
     pub downtrend_threshold_pct: Decimal,
+    /// Minimum seconds between quote operations per pair (book-update triggers only).
+    #[serde(default = "default_min_quote_interval_secs")]
+    pub min_quote_interval_secs: u64,
+}
+
+fn default_min_quote_interval_secs() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,17 +58,23 @@ pub struct RiskConfig {
     pub stale_order_secs: u64,
     pub dms_timeout_secs: u64,
     pub dms_refresh_secs: u64,
-    pub rate_limit_max_counter: u32,
     pub stop_loss_pct: Decimal,
     /// Take-profit threshold: liquidate if price rises this far above avg_cost.
     pub take_profit_pct: Decimal,
     /// Seconds to keep a pair disabled after liquidation before re-enabling.
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_after_liquidation_secs: u64,
+    /// Hours before a stop-loss WindDown escalates to market Liquidation.
+    #[serde(default = "default_winddown_escalation_hours")]
+    pub winddown_escalation_hours: u64,
 }
 
 fn default_cooldown_secs() -> u64 {
     3600
+}
+
+fn default_winddown_escalation_hours() -> u64 {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +103,7 @@ impl Default for Config {
                 min_profit_pct: dec!(0.01),
                 dry_run: true,
                 downtrend_threshold_pct: dec!(-5.0),
+                min_quote_interval_secs: 5,
             },
             risk: RiskConfig {
                 max_inventory_usd: dec!(200),
@@ -97,10 +112,10 @@ impl Default for Config {
                 stale_order_secs: 300,
                 dms_timeout_secs: 60,
                 dms_refresh_secs: 20,
-                rate_limit_max_counter: 60,
                 stop_loss_pct: dec!(0.03),
                 take_profit_pct: dec!(0.10), // 10% — liquidate on insane profit
                 cooldown_after_liquidation_secs: 3600,
+                winddown_escalation_hours: 4,
             },
             persistence: PersistenceConfig {
                 trade_log_file: "logs/trades.csv".into(),

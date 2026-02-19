@@ -6,10 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::exchange::auth::sign_request;
+use crate::auth::sign_request;
+use proxy_common::rate_limit::{TokenBucket, TokenBucketConfig};
 
-/// State shared across WS proxy connections for token management.
-pub struct WsProxyState {
+/// State shared across WS proxy connections for Kraken token management.
+pub struct KrakenWsState {
     pub api_key: String,
     pub api_secret: String,
     pub kraken_ws_url: String,
@@ -17,14 +18,17 @@ pub struct WsProxyState {
     /// Cached WS token and its fetch time.
     token_cache: Mutex<Option<(String, std::time::Instant)>>,
     client: reqwest::Client,
+    /// Shared rate limiter (per-API-key, shared across all WS connections).
+    rate_limiter: Mutex<TokenBucket>,
 }
 
-impl WsProxyState {
+impl KrakenWsState {
     pub fn new(
         api_key: String,
         api_secret: String,
         kraken_ws_url: String,
         kraken_rest_url: String,
+        rate_limit_config: TokenBucketConfig,
     ) -> Self {
         Self {
             api_key,
@@ -33,6 +37,7 @@ impl WsProxyState {
             kraken_rest_url,
             token_cache: Mutex::new(None),
             client: reqwest::Client::new(),
+            rate_limiter: Mutex::new(TokenBucket::new(rate_limit_config)),
         }
     }
 
@@ -40,7 +45,6 @@ impl WsProxyState {
     pub async fn get_token(&self) -> Result<String> {
         let mut cache = self.token_cache.lock().await;
         if let Some((ref token, ref fetched_at)) = *cache {
-            // Refresh if older than 10 minutes (tokens expire ~15 min)
             if fetched_at.elapsed().as_secs() < 600 {
                 return Ok(token.clone());
             }
@@ -76,39 +80,37 @@ impl WsProxyState {
     }
 }
 
-/// Handle a single WebSocket proxy connection.
-/// Bot connects to us, we connect upstream to Kraken, and relay bidirectionally.
-/// We inject the real WS token into outgoing messages that contain a token field.
-pub async fn handle_ws_connection(
+/// Handle a single private WebSocket proxy connection.
+pub async fn handle_kraken_private_ws(
     bot_ws: WebSocket,
-    state: Arc<WsProxyState>,
+    state: Arc<KrakenWsState>,
 ) {
     let result = run_ws_proxy(bot_ws, state).await;
     if let Err(e) = result {
-        tracing::error!(error = %e, "WS proxy connection error");
+        tracing::error!(error = %e, "Kraken WS proxy connection error");
     }
 }
 
 async fn run_ws_proxy(
     bot_ws: WebSocket,
-    state: Arc<WsProxyState>,
+    state: Arc<KrakenWsState>,
 ) -> Result<()> {
-    // Get a fresh token for the upstream connection
     let token = state.get_token().await?;
 
-    // Connect upstream to Kraken
-    tracing::info!(url = state.kraken_ws_url, "WS proxy: connecting upstream");
+    tracing::info!(url = state.kraken_ws_url, "Kraken WS proxy: connecting upstream");
     let (upstream_ws, _) = connect_async(&state.kraken_ws_url).await?;
-    tracing::info!("WS proxy: upstream connected");
+    tracing::info!("Kraken WS proxy: upstream connected");
 
     let (mut upstream_write, mut upstream_read) = upstream_ws.split();
-    let (mut bot_write, mut bot_read) = bot_ws.split();
+    let (bot_write, mut bot_read) = bot_ws.split();
 
     let token_for_inject = Arc::new(Mutex::new(token));
     let state_for_refresh = state.clone();
     let token_ref = token_for_inject.clone();
 
-    // Spawn token refresh task (refresh every 10 minutes)
+    let bot_write = Arc::new(Mutex::new(bot_write));
+
+    // Token refresh task (every 10 minutes)
     let refresh_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
         interval.tick().await; // skip first immediate tick
@@ -117,24 +119,76 @@ async fn run_ws_proxy(
             match state_for_refresh.get_token().await {
                 Ok(new_token) => {
                     *token_ref.lock().await = new_token;
-                    tracing::info!("WS proxy: token refreshed");
+                    tracing::info!("Kraken WS proxy: token refreshed");
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "WS proxy: token refresh failed");
+                    tracing::error!(error = %e, "Kraken WS proxy: token refresh failed");
                 }
             }
         }
     });
 
-    // Bot -> Kraken: inject token into messages
+    // Bot -> Kraken: rate limiting + token injection
     let token_for_bot = token_for_inject.clone();
+    let state_for_rl = state.clone();
+    let bot_write_for_reject = bot_write.clone();
     let bot_to_upstream = tokio::spawn(async move {
         while let Some(Ok(msg)) = bot_read.next().await {
             match msg {
                 ws::Message::Text(text) => {
-                    let injected = inject_token(&text, &token_for_bot).await;
+                    let text_str = text.to_string();
+                    let parsed: serde_json::Value = match serde_json::from_str(&text_str) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            if upstream_write
+                                .send(Message::Text(text_str.into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    let priority = parsed.get("_priority").and_then(|p| p.as_str()).unwrap_or("");
+                    let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
+
+                    let is_exempt = matches!(method,
+                        "cancel_all" | "cancel_all_orders_after" | "subscribe" | "ping" | ""
+                    ) || !matches!(method, "add_order" | "amend_order" | "cancel_order");
+
+                    let is_urgent = priority == "urgent";
+
+                    if !is_exempt && !is_urgent {
+                        let allowed = state_for_rl.rate_limiter.lock().await.try_consume(method);
+                        if !allowed {
+                            let remaining = state_for_rl.rate_limiter.lock().await.tokens_remaining();
+                            tracing::warn!(
+                                method,
+                                req_id,
+                                tokens_remaining = format!("{:.1}", remaining),
+                                "Rate limited by proxy"
+                            );
+                            let rejection = serde_json::json!({
+                                "method": method,
+                                "req_id": req_id,
+                                "success": false,
+                                "error": "EOrder:Rate limit exceeded [proxy]"
+                            });
+                            let reject_text = rejection.to_string();
+                            let mut writer = bot_write_for_reject.lock().await;
+                            let _ = writer
+                                .send(ws::Message::Text(reject_text.into()))
+                                .await;
+                            continue;
+                        }
+                    }
+
+                    let outgoing = prepare_outgoing(&parsed, &token_for_bot).await;
                     if upstream_write
-                        .send(Message::Text(injected.into()))
+                        .send(Message::Text(outgoing.into()))
                         .await
                         .is_err()
                     {
@@ -148,11 +202,13 @@ async fn run_ws_proxy(
     });
 
     // Kraken -> Bot: forward as-is
+    let bot_write_for_upstream = bot_write.clone();
     let upstream_to_bot = tokio::spawn(async move {
         while let Some(Ok(msg)) = upstream_read.next().await {
             match msg {
                 Message::Text(text) => {
-                    if bot_write
+                    let mut writer = bot_write_for_upstream.lock().await;
+                    if writer
                         .send(ws::Message::Text(text.to_string().into()))
                         .await
                         .is_err()
@@ -161,7 +217,8 @@ async fn run_ws_proxy(
                     }
                 }
                 Message::Ping(data) => {
-                    if bot_write
+                    let mut writer = bot_write_for_upstream.lock().await;
+                    if writer
                         .send(ws::Message::Ping(data.into()))
                         .await
                         .is_err()
@@ -175,13 +232,12 @@ async fn run_ws_proxy(
         }
     });
 
-    // Wait for either direction to close
     tokio::select! {
         _ = bot_to_upstream => {
-            tracing::info!("WS proxy: bot disconnected");
+            tracing::info!("Kraken WS proxy: bot disconnected");
         }
         _ = upstream_to_bot => {
-            tracing::info!("WS proxy: upstream disconnected");
+            tracing::info!("Kraken WS proxy: upstream disconnected");
         }
     }
 
@@ -189,12 +245,13 @@ async fn run_ws_proxy(
     Ok(())
 }
 
-/// Inject the real WS token into a JSON message if it has a "params.token" field.
-async fn inject_token(text: &str, token: &Arc<Mutex<String>>) -> String {
-    let mut v: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return text.to_string(),
-    };
+/// Strip `_priority` and inject the real Kraken WS token into `params.token`.
+async fn prepare_outgoing(v: &serde_json::Value, token: &Arc<Mutex<String>>) -> String {
+    let mut v = v.clone();
+
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("_priority");
+    }
 
     if let Some(params) = v.get_mut("params") {
         if params.get("token").is_some() {
@@ -203,7 +260,15 @@ async fn inject_token(text: &str, token: &Arc<Mutex<String>>) -> String {
         }
     }
 
-    serde_json::to_string(&v).unwrap_or_else(|_| text.to_string())
+    serde_json::to_string(&v).unwrap_or_default()
+}
+
+/// Handle a public WebSocket proxy connection (pure relay, no token injection).
+pub async fn handle_kraken_public_ws(bot_ws: WebSocket, upstream_url: String) {
+    let result = proxy_common::ws_relay::relay_public_ws(bot_ws, upstream_url).await;
+    if let Err(e) = result {
+        tracing::error!(error = %e, "Kraken public WS proxy connection error");
+    }
 }
 
 fn millis_nonce() -> String {
@@ -212,78 +277,4 @@ fn millis_nonce() -> String {
         .unwrap()
         .as_millis()
         .to_string()
-}
-
-/// Handle a public WebSocket proxy connection (no auth token injection).
-/// Relays bidirectionally between client and Kraken public WS.
-pub async fn handle_public_ws_connection(bot_ws: WebSocket, upstream_url: String) {
-    let result = run_public_ws_proxy(bot_ws, upstream_url).await;
-    if let Err(e) = result {
-        tracing::error!(error = %e, "Public WS proxy connection error");
-    }
-}
-
-async fn run_public_ws_proxy(bot_ws: WebSocket, upstream_url: String) -> Result<()> {
-    tracing::info!(url = upstream_url, "Public WS proxy: connecting upstream");
-    let (upstream_ws, _) = connect_async(&upstream_url).await?;
-    tracing::info!("Public WS proxy: upstream connected");
-
-    let (mut upstream_write, mut upstream_read) = upstream_ws.split();
-    let (mut bot_write, mut bot_read) = bot_ws.split();
-
-    let bot_to_upstream = tokio::spawn(async move {
-        while let Some(Ok(msg)) = bot_read.next().await {
-            match msg {
-                ws::Message::Text(text) => {
-                    if upstream_write
-                        .send(Message::Text(text.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                ws::Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    });
-
-    let upstream_to_bot = tokio::spawn(async move {
-        while let Some(Ok(msg)) = upstream_read.next().await {
-            match msg {
-                Message::Text(text) => {
-                    if bot_write
-                        .send(ws::Message::Text(text.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Message::Ping(data) => {
-                    if bot_write
-                        .send(ws::Message::Ping(data.into()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = bot_to_upstream => {
-            tracing::info!("Public WS proxy: bot disconnected");
-        }
-        _ = upstream_to_bot => {
-            tracing::info!("Public WS proxy: upstream disconnected");
-        }
-    }
-
-    Ok(())
 }

@@ -172,6 +172,7 @@ pub async fn send_add_order(
             token: token.to_string(),
         },
         req_id,
+        _priority: if request.urgent { Some("urgent".into()) } else { None },
     })
     .await
 }
@@ -195,6 +196,7 @@ pub async fn send_amend_order(
             token: token.to_string(),
         },
         req_id,
+        _priority: None,
     })
     .await
 }
@@ -213,6 +215,7 @@ pub async fn send_cancel(
             token: token.to_string(),
         },
         req_id,
+        _priority: None,
     })
     .await
 }

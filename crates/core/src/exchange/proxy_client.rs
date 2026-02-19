@@ -7,7 +7,7 @@ use crate::traits::ExchangeClient;
 use crate::types::PairInfo;
 use crate::types::ticker::TickerData;
 
-/// Exchange client that routes requests through the kraken-proxy.
+/// Exchange client that routes requests through the proxy.
 /// The proxy holds the actual API keys and signs requests.
 pub struct ProxyClient {
     proxy_base_url: String,
@@ -24,7 +24,7 @@ impl ProxyClient {
         }
     }
 
-    /// Send a POST to the proxy, which forwards to Kraken's private API.
+    /// Send a POST to the proxy, which forwards to the exchange's private API.
     async fn proxy_post(&self, path: &str, body: &str) -> Result<serde_json::Value> {
         let resp: serde_json::Value = self
             .client
@@ -40,7 +40,7 @@ impl ProxyClient {
         Ok(resp)
     }
 
-    /// Send a GET to the proxy, which forwards to Kraken's public API.
+    /// Send a GET to the proxy, which forwards to the exchange's public API.
     async fn proxy_get(&self, path: &str) -> Result<serde_json::Value> {
         let url = format!("{}{}", self.proxy_base_url, path);
         let http_resp = self
@@ -213,7 +213,7 @@ impl ExchangeClient for ProxyClient {
 fn check_error(resp: &serde_json::Value) -> Result<()> {
     if let Some(errors) = resp["error"].as_array() {
         if !errors.is_empty() {
-            bail!("Kraken API error: {:?}", errors);
+            bail!("Exchange API error: {:?}", errors);
         }
     }
     Ok(())

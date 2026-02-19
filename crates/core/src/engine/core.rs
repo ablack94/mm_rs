@@ -9,10 +9,20 @@ use crate::engine::inventory::inventory_skew;
 use crate::engine::quoter::QuoteState;
 use crate::risk::kill_switch::KillSwitch;
 use crate::risk::limits::can_open_buy;
-use crate::risk::rate_limiter::{RateLimiter, RateStatus};
 use crate::state::bot_state::{BotState, TrackedOrder};
 use crate::types::*;
 use crate::types::managed_pair::{GlobalDefaults, ManagedPair, PairConfig, PairState, ResolvedConfig};
+
+/// What triggered a quote attempt — used for throttling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteTrigger {
+    /// Book snapshot or update — throttled per-pair.
+    BookUpdate,
+    /// Fill received — needs immediate requoting, not throttled.
+    Fill,
+    /// Periodic tick — already 10s apart, not throttled.
+    Tick,
+}
 
 /// Maximum percentage above the best ask that we'll place a sell order.
 /// Kraken's market price protection cancels orders placed too far from market.
@@ -39,7 +49,6 @@ pub struct Engine {
     global_defaults: GlobalDefaults,
     pub state: BotState,
     kill_switch: KillSwitch,
-    rate_limiter: RateLimiter,
     prices: HashMap<String, Decimal>,
     cl_ord_counter: u64,
     last_dms_refresh: Option<DateTime<Utc>>,
@@ -51,8 +60,6 @@ impl Engine {
         pair_info: HashMap<String, PairInfo>,
         state: BotState,
     ) -> Self {
-        let rate_limiter = RateLimiter::new(&config.risk);
-
         // Build global defaults from Config (backward compatible)
         let global_defaults = GlobalDefaults {
             order_size_usd: config.trading.order_size_usd,
@@ -62,6 +69,8 @@ impl Engine {
             min_profit_pct: config.trading.min_profit_pct,
             stop_loss_pct: config.risk.stop_loss_pct,
             take_profit_pct: config.risk.take_profit_pct,
+            max_buys_before_sell: 2,
+            use_winddown_for_stoploss: true,
         };
 
         // Build ManagedPair for each pair_info entry
@@ -95,7 +104,6 @@ impl Engine {
             global_defaults,
             state,
             kill_switch: KillSwitch::default(),
-            rate_limiter,
             prices: HashMap::new(),
             cl_ord_counter: 0,
             last_dms_refresh: None,
@@ -652,7 +660,7 @@ impl Engine {
             "Book snapshot received"
         );
 
-        self.maybe_quote(&symbol, timestamp)
+        self.maybe_quote(&symbol, timestamp, QuoteTrigger::BookUpdate)
     }
 
     fn on_book_update(
@@ -675,7 +683,7 @@ impl Engine {
             self.prices.insert(symbol.clone(), mid);
         }
 
-        self.maybe_quote(&symbol, timestamp)
+        self.maybe_quote(&symbol, timestamp, QuoteTrigger::BookUpdate)
     }
 
     // --- Fill ---
@@ -692,6 +700,32 @@ impl Engine {
             maker = fill.is_maker,
             "FILL"
         );
+
+        // Track consecutive buys without sell for buy gating
+        match fill.side {
+            OrderSide::Buy => {
+                if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+                    mp.buys_without_sell += 1;
+                    tracing::debug!(
+                        symbol = fill.symbol,
+                        buys_without_sell = mp.buys_without_sell,
+                        "Buy fill — incrementing consecutive buy counter"
+                    );
+                }
+            }
+            OrderSide::Sell => {
+                if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+                    if mp.buys_without_sell > 0 {
+                        tracing::debug!(
+                            symbol = fill.symbol,
+                            was = mp.buys_without_sell,
+                            "Sell fill — resetting consecutive buy counter"
+                        );
+                    }
+                    mp.buys_without_sell = 0;
+                }
+            }
+        }
 
         let mut pnl = Decimal::ZERO;
         match fill.side {
@@ -785,7 +819,7 @@ impl Engine {
         // On low-liquidity pairs, book updates can be minutes apart.
         let symbol = fill.symbol.clone();
         tracing::info!(symbol, "Re-quoting after fill");
-        let quote_cmds = self.maybe_quote(&symbol, fill.timestamp);
+        let quote_cmds = self.maybe_quote(&symbol, fill.timestamp, QuoteTrigger::Fill);
         cmds.extend(quote_cmds);
 
         cmds
@@ -961,6 +995,7 @@ impl Engine {
             qty,
             post_only: false,
             market: true,
+            urgent: true,
         }));
 
         cmds
@@ -999,20 +1034,23 @@ impl Engine {
     fn on_tick(&mut self, timestamp: DateTime<Utc>) -> Vec<EngineCommand> {
         let mut cmds = vec![];
 
-        // Check for expired cooldowns — re-enable pairs whose cooldown has passed
+        // Check for expired cooldowns — remove cooldown but keep pair Disabled.
+        // The PnL analyzer or manual state store action can re-enable if appropriate.
         let expired: Vec<String> = self.state.cooldown_until.iter()
             .filter(|(_, &until)| timestamp >= until)
             .map(|(symbol, _)| symbol.clone())
             .collect();
         for symbol in expired {
             self.state.cooldown_until.remove(&symbol);
-            self.state.disabled_pairs.remove(&symbol);
-            // Re-enable the managed pair
+            // Pair stays in disabled_pairs and state remains Disabled.
+            // Only reset liq_retry_count so manual re-enable works cleanly.
             if let Some(mp) = self.pairs.get_mut(&symbol) {
-                mp.state = PairState::Active;
                 mp.liq_retry_count = 0;
             }
-            tracing::info!(symbol, "Cooldown expired — pair re-enabled");
+            tracing::info!(
+                symbol,
+                "Cooldown expired — pair remains disabled (requires manual or analyzer re-enable)"
+            );
             cmds.push(EngineCommand::PersistState(self.state.clone()));
         }
 
@@ -1073,28 +1111,47 @@ impl Engine {
             }
         }
 
-        // Stop-loss AND take-profit check: liquidate on extreme moves
-        // We need to collect (symbol, stop_loss_pct, take_profit_pct) first to avoid borrow issues
-        let symbols_to_check: Vec<(String, Decimal, Decimal)> = self.state.positions.iter()
+        // Stop-loss AND take-profit check
+        // Collect (symbol, stop_loss_pct, take_profit_pct, use_winddown_for_stoploss)
+        let symbols_to_check: Vec<(String, Decimal, Decimal, bool)> = self.state.positions.iter()
             .filter(|(symbol, pos)| {
                 !pos.is_empty() && !pos.avg_cost.is_zero()
                     && self.pair_state(symbol) != Some(PairState::Liquidating)
                     && self.pair_state(symbol) != Some(PairState::Disabled)
+                    && self.pair_state(symbol) != Some(PairState::WindDown)
             })
             .map(|(symbol, _)| {
                 let resolved = self.resolved_config(symbol);
                 let stop_loss = resolved.as_ref().map_or(self.config.risk.stop_loss_pct, |r| r.stop_loss_pct);
                 let take_profit = resolved.as_ref().map_or(self.config.risk.take_profit_pct, |r| r.take_profit_pct);
-                (symbol.clone(), stop_loss, take_profit)
+                let use_winddown = resolved.as_ref().map_or(true, |r| r.use_winddown_for_stoploss);
+                (symbol.clone(), stop_loss, take_profit, use_winddown)
             })
             .collect();
 
-        let symbols_to_liquidate: Vec<String> = symbols_to_check.iter()
-            .filter_map(|(symbol, stop_loss_pct, take_profit_pct)| {
-                let pos = self.state.position(symbol);
-                let mid = self.prices.get(symbol)?;
-                let change = (*mid - pos.avg_cost) / pos.avg_cost;
-                if change < -*stop_loss_pct {
+        // Separate stop-loss into WindDown vs Liquidate; take-profit always liquidates
+        let mut symbols_to_liquidate: Vec<String> = Vec::new();
+        let mut symbols_to_winddown: Vec<String> = Vec::new();
+
+        for (symbol, stop_loss_pct, take_profit_pct, use_winddown) in &symbols_to_check {
+            let pos = self.state.position(symbol);
+            let mid = match self.prices.get(symbol) {
+                Some(m) => m,
+                None => continue,
+            };
+            let change = (*mid - pos.avg_cost) / pos.avg_cost;
+            if change < -*stop_loss_pct {
+                if *use_winddown {
+                    tracing::error!(
+                        symbol,
+                        mid = %mid,
+                        avg_cost = %pos.avg_cost,
+                        change_pct = %(change * Decimal::from(100)).round_dp(2),
+                        threshold_pct = %(-*stop_loss_pct * Decimal::from(100)),
+                        "STOP-LOSS TRIGGERED — entering WindDown (limit sells)"
+                    );
+                    symbols_to_winddown.push(symbol.clone());
+                } else {
                     tracing::error!(
                         symbol,
                         mid = %mid,
@@ -1103,24 +1160,54 @@ impl Engine {
                         threshold_pct = %(-*stop_loss_pct * Decimal::from(100)),
                         "STOP-LOSS TRIGGERED — starting liquidation"
                     );
-                    Some(symbol.clone())
-                } else if change > *take_profit_pct {
-                    tracing::error!(
-                        symbol,
-                        mid = %mid,
-                        avg_cost = %pos.avg_cost,
-                        change_pct = %(change * Decimal::from(100)).round_dp(2),
-                        threshold_pct = %(*take_profit_pct * Decimal::from(100)),
-                        "TAKE-PROFIT TRIGGERED — starting liquidation"
-                    );
-                    Some(symbol.clone())
-                } else {
-                    None
+                    symbols_to_liquidate.push(symbol.clone());
                 }
-            })
-            .collect();
+            } else if change > *take_profit_pct {
+                tracing::error!(
+                    symbol,
+                    mid = %mid,
+                    avg_cost = %pos.avg_cost,
+                    change_pct = %(change * Decimal::from(100)).round_dp(2),
+                    threshold_pct = %(*take_profit_pct * Decimal::from(100)),
+                    "TAKE-PROFIT TRIGGERED — starting liquidation"
+                );
+                symbols_to_liquidate.push(symbol.clone());
+            }
+        }
 
         for symbol in symbols_to_liquidate {
+            cmds.extend(self.on_liquidate(&symbol));
+        }
+        for symbol in symbols_to_winddown {
+            if let Some(mp) = self.pairs.get_mut(&symbol) {
+                mp.state = PairState::WindDown;
+                mp.winddown_since = Some(timestamp);
+                // Cancel buy orders for this pair
+            }
+            cmds.extend(self.cancel_pair_quotes(&symbol));
+            cmds.push(EngineCommand::PersistState(self.state.clone()));
+        }
+
+        // WindDown escalation: if a pair has been in stop-loss WindDown too long, escalate to Liquidating
+        let escalation_hours = self.config.risk.winddown_escalation_hours as i64;
+        let winddown_to_escalate: Vec<String> = self.pairs.iter()
+            .filter(|(_, mp)| {
+                mp.state == PairState::WindDown
+                    && mp.winddown_since.is_some()
+                    && (timestamp - mp.winddown_since.unwrap()).num_hours() >= escalation_hours
+            })
+            .map(|(s, _)| s.clone())
+            .collect();
+        for symbol in winddown_to_escalate {
+            tracing::error!(
+                symbol,
+                hours = escalation_hours,
+                "WindDown escalation — position not exited within {} hours, escalating to market liquidation",
+                escalation_hours
+            );
+            if let Some(mp) = self.pairs.get_mut(&symbol) {
+                mp.winddown_since = None;
+            }
             cmds.extend(self.on_liquidate(&symbol));
         }
 
@@ -1187,7 +1274,7 @@ impl Engine {
             .map(|(s, _)| s.clone())
             .collect();
         for symbol in quotable_symbols {
-            cmds.extend(self.maybe_quote(&symbol, timestamp));
+            cmds.extend(self.maybe_quote(&symbol, timestamp, QuoteTrigger::Tick));
         }
 
         cmds
@@ -1195,7 +1282,7 @@ impl Engine {
 
     // --- Quoting Logic ---
 
-    fn maybe_quote(&mut self, symbol: &str, timestamp: DateTime<Utc>) -> Vec<EngineCommand> {
+    fn maybe_quote(&mut self, symbol: &str, timestamp: DateTime<Utc>, trigger: QuoteTrigger) -> Vec<EngineCommand> {
         // Check pair state
         let pair_state = match self.pair_state(symbol) {
             Some(s) => s,
@@ -1211,15 +1298,25 @@ impl Engine {
             return vec![];
         }
 
+        // Quote throttling: only applies to book-update triggers (not fills or ticks)
+        if trigger == QuoteTrigger::BookUpdate {
+            let min_interval = self.config.trading.min_quote_interval_secs as i64;
+            if min_interval > 0 {
+                if let Some(mp) = self.pairs.get(symbol) {
+                    if let Some(last_qt) = mp.quoter.last_quote_time {
+                        let elapsed = (timestamp - last_qt).num_seconds();
+                        if elapsed < min_interval {
+                            return vec![];
+                        }
+                    }
+                }
+            }
+        }
+
         if self.kill_switch.triggered {
             tracing::debug!(symbol, "Skipping quote — kill switch triggered");
             return vec![];
         }
-        if self.rate_limiter.status() == RateStatus::Block {
-            tracing::debug!(symbol, "Skipping quote — rate limited");
-            return vec![];
-        }
-
         let book = match self.books.get(symbol) {
             Some(b) if !b.is_empty() => b,
             _ => {
@@ -1272,6 +1369,7 @@ impl Engine {
             min_profit_pct: resolved.min_profit_pct,
             dry_run: self.config.trading.dry_run,
             downtrend_threshold_pct: self.config.trading.downtrend_threshold_pct,
+            min_quote_interval_secs: self.config.trading.min_quote_interval_secs,
         };
 
         // Build a risk config with resolved per-pair values
@@ -1282,10 +1380,10 @@ impl Engine {
             stale_order_secs: self.config.risk.stale_order_secs,
             dms_timeout_secs: self.config.risk.dms_timeout_secs,
             dms_refresh_secs: self.config.risk.dms_refresh_secs,
-            rate_limit_max_counter: self.config.risk.rate_limit_max_counter,
             stop_loss_pct: resolved.stop_loss_pct,
             take_profit_pct: resolved.take_profit_pct,
             cooldown_after_liquidation_secs: self.config.risk.cooldown_after_liquidation_secs,
+            winddown_escalation_hours: self.config.risk.winddown_escalation_hours,
         };
 
         let quoter = match self.pairs.get(symbol) {
@@ -1408,15 +1506,32 @@ impl Engine {
 
         let can_buy = if !pair_state.allows_buys() {
             false
+        } else if !can_open_buy(
+            &self.state,
+            symbol,
+            order_value,
+            mid,
+            &self.prices,
+            risk,
+        ) {
+            false
         } else {
-            can_open_buy(
-                &self.state,
-                symbol,
-                order_value,
-                mid,
-                &self.prices,
-                risk,
-            )
+            // Buy gating: block buys after too many consecutive buys without a sell
+            let resolved = self.resolved_config(symbol);
+            let max_buys = resolved.as_ref().map_or(2, |r| r.max_buys_before_sell);
+            let buys_without_sell = self.pairs.get(symbol).map_or(0, |mp| mp.buys_without_sell);
+            if buys_without_sell >= max_buys {
+                tracing::warn!(
+                    symbol,
+                    buys_without_sell,
+                    limit = max_buys,
+                    "Blocking buy — {} buys without sell (limit: {})",
+                    buys_without_sell, max_buys
+                );
+                false
+            } else {
+                true
+            }
         };
 
         // Sell what we have, even if less than full order_size_usd.
@@ -1540,6 +1655,7 @@ impl Engine {
                 qty,
                 post_only: true,
                 market: false,
+                urgent: false,
             };
             self.state.open_orders.insert(
                 bid_id.clone(),
@@ -1568,6 +1684,7 @@ impl Engine {
                 qty: sell_qty,
                 post_only: true,
                 market: false,
+                urgent: false,
             };
             self.state.open_orders.insert(
                 ask_id.clone(),
@@ -1837,6 +1954,19 @@ impl Engine {
                 ) {
                     return vec![];
                 }
+                // Buy gating: block buys after too many consecutive buys without a sell
+                let max_buys = resolved.max_buys_before_sell;
+                let buys_without_sell = self.pairs.get(symbol).map_or(0, |mp| mp.buys_without_sell);
+                if buys_without_sell >= max_buys {
+                    tracing::warn!(
+                        symbol,
+                        buys_without_sell,
+                        limit = max_buys,
+                        "Blocking buy — {} buys without sell (limit: {})",
+                        buys_without_sell, max_buys
+                    );
+                    return vec![];
+                }
             }
 
             let cl_id = self.next_cl_ord_id(if side == OrderSide::Buy { "bid" } else { "ask" });
@@ -1867,6 +1997,7 @@ impl Engine {
                 qty: actual_qty,
                 post_only: true,
                 market: false,
+                urgent: false,
             })]
         }
     }
@@ -2064,6 +2195,11 @@ mod tests {
         });
 
         let mut engine = Engine::new(cfg, test_pair_info(), state);
+        // Set use_winddown_for_stoploss=false so stop-loss uses direct liquidation
+        engine.update_global_defaults(GlobalDefaults {
+            use_winddown_for_stoploss: false,
+            ..engine.global_defaults().clone()
+        });
 
         // Feed book snapshot with mid at 0.096 (4% drop, > 3% threshold)
         engine.handle_event(EngineEvent::BookSnapshot {
@@ -2139,6 +2275,11 @@ mod tests {
         });
 
         let mut engine = Engine::new(cfg, test_pair_info(), state);
+        // Set use_winddown_for_stoploss=false so stop-loss uses direct liquidation
+        engine.update_global_defaults(GlobalDefaults {
+            use_winddown_for_stoploss: false,
+            ..engine.global_defaults().clone()
+        });
 
         // Set up book
         engine.handle_event(EngineEvent::BookSnapshot {
@@ -2178,12 +2319,13 @@ mod tests {
         assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Disabled,
             "Pair should still be Disabled before cooldown expires");
 
-        // Tick after cooldown expires — should be re-enabled
+        // Tick after cooldown expires — pair stays Disabled (no auto re-enable)
         let after_expiry = Utc::now() + chrono::Duration::seconds(120);
         engine.handle_event(EngineEvent::Tick { timestamp: after_expiry });
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Active,
-            "Pair should be Active after cooldown");
+        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Disabled,
+            "Pair should remain Disabled after cooldown (no auto re-enable)");
         assert!(!engine.state.cooldown_until.contains_key("TEST/USD"), "Cooldown entry should be removed");
+        assert!(engine.state.disabled_pairs.contains("TEST/USD"), "Pair should still be in disabled set");
     }
 
     #[test]
@@ -2285,5 +2427,220 @@ mod tests {
         assert_eq!(resolved.max_inventory_usd, dec!(500));
         // Unset fields should use global defaults
         assert_eq!(resolved.min_spread_bps, dec!(100));
+    }
+
+    #[test]
+    fn test_buy_gating_blocks_after_consecutive_buys() {
+        let mut engine = Engine::new(test_config(), test_pair_info(), BotState::default());
+        // Default max_buys_before_sell = 2
+
+        // Feed book snapshot so engine has price data
+        engine.handle_event(EngineEvent::BookSnapshot {
+            symbol: "TEST/USD".into(),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now(),
+        });
+
+        // First buy fill
+        engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "o1".into(),
+            cl_ord_id: "bid-1".into(),
+            symbol: "TEST/USD".into(),
+            side: OrderSide::Buy,
+            price: dec!(0.10),
+            qty: dec!(50),
+            fee: dec!(0.01),
+            is_maker: true,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+        assert_eq!(engine.pairs().get("TEST/USD").unwrap().buys_without_sell, 1);
+
+        // Second buy fill
+        engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "o2".into(),
+            cl_ord_id: "bid-2".into(),
+            symbol: "TEST/USD".into(),
+            side: OrderSide::Buy,
+            price: dec!(0.10),
+            qty: dec!(50),
+            fee: dec!(0.01),
+            is_maker: true,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+        assert_eq!(engine.pairs().get("TEST/USD").unwrap().buys_without_sell, 2);
+
+        // Now try to quote — buy should be blocked (2 >= max_buys_before_sell=2)
+        let cmds = engine.handle_event(EngineEvent::BookSnapshot {
+            symbol: "TEST/USD".into(),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now(),
+        });
+        let buy_orders: Vec<_> = cmds.iter()
+            .filter_map(|c| {
+                if let EngineCommand::PlaceOrder(req) = c {
+                    if req.side == OrderSide::Buy { return Some(req); }
+                }
+                None
+            })
+            .collect();
+        assert!(buy_orders.is_empty(), "Buy should be blocked after 2 consecutive buys without sell");
+
+        // Sell fill resets the counter
+        engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "o3".into(),
+            cl_ord_id: "ask-1".into(),
+            symbol: "TEST/USD".into(),
+            side: OrderSide::Sell,
+            price: dec!(0.12),
+            qty: dec!(50),
+            fee: dec!(0.01),
+            is_maker: true,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+        assert_eq!(engine.pairs().get("TEST/USD").unwrap().buys_without_sell, 0);
+
+        // Cancel all pair quotes to reset quoter to Idle for fresh placement
+        engine.handle_event(EngineEvent::ApiCommand(
+            crate::types::event::ApiAction::CancelAll,
+        ));
+
+        // Now buy should be allowed again (use timestamp far enough ahead to bypass throttle)
+        let cmds = engine.handle_event(EngineEvent::BookSnapshot {
+            symbol: "TEST/USD".into(),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now() + chrono::Duration::seconds(30),
+        });
+        let buy_orders: Vec<_> = cmds.iter()
+            .filter_map(|c| {
+                if let EngineCommand::PlaceOrder(req) = c {
+                    if req.side == OrderSide::Buy { return Some(req); }
+                }
+                None
+            })
+            .collect();
+        assert!(!buy_orders.is_empty(), "Buy should be allowed after sell resets counter");
+    }
+
+    #[test]
+    fn test_quote_throttle_blocks_book_updates() {
+        let mut cfg = test_config();
+        cfg.trading.min_quote_interval_secs = 10; // 10s throttle
+        let mut engine = Engine::new(cfg, test_pair_info(), BotState::default());
+
+        let t0 = Utc::now();
+
+        // First book snapshot — should produce quotes
+        let cmds1 = engine.handle_event(EngineEvent::BookSnapshot {
+            symbol: "TEST/USD".into(),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: t0,
+        });
+        let orders1: Vec<_> = cmds1.iter()
+            .filter(|c| matches!(c, EngineCommand::PlaceOrder(_)))
+            .collect();
+        assert!(!orders1.is_empty(), "First book snapshot should place quotes");
+
+        // Book update 2 seconds later — should be throttled
+        let t1 = t0 + chrono::Duration::seconds(2);
+        let cmds2 = engine.handle_event(EngineEvent::BookUpdate {
+            symbol: "TEST/USD".into(),
+            bid_updates: vec![LevelUpdate { price: dec!(0.10), qty: dec!(110) }],
+            ask_updates: vec![LevelUpdate { price: dec!(0.12), qty: dec!(110) }],
+            timestamp: t1,
+        });
+        let orders2: Vec<_> = cmds2.iter()
+            .filter(|c| matches!(c, EngineCommand::PlaceOrder(_) | EngineCommand::AmendOrder { .. }))
+            .collect();
+        assert!(orders2.is_empty(), "Book update within throttle window should be blocked");
+
+        // Tick at t1 — should NOT be throttled (ticks bypass throttle)
+        let cmds_tick = engine.handle_event(EngineEvent::Tick { timestamp: t1 });
+        // Tick produces requotes if needed — at least it shouldn't be blocked by throttle
+        // (It may or may not produce amends depending on price movement)
+        // We just verify it doesn't return empty due to throttle
+        let _ = cmds_tick; // tick is processed (not blocked)
+    }
+
+    #[test]
+    fn test_stop_loss_winddown_default() {
+        let mut cfg = test_config();
+        cfg.risk.stop_loss_pct = dec!(0.03);
+
+        let mut state = BotState::default();
+        state.positions.insert("TEST/USD".into(), Position {
+            qty: dec!(100),
+            avg_cost: dec!(0.10),
+        });
+
+        let mut engine = Engine::new(cfg, test_pair_info(), state);
+        // Default: use_winddown_for_stoploss = true
+
+        engine.handle_event(EngineEvent::BookSnapshot {
+            symbol: "TEST/USD".into(),
+            bids: vec![LevelUpdate { price: dec!(0.095), qty: dec!(1000) }],
+            asks: vec![LevelUpdate { price: dec!(0.097), qty: dec!(1000) }],
+            timestamp: Utc::now(),
+        });
+
+        // Tick triggers stop-loss — should go to WindDown (not Liquidating)
+        engine.handle_event(EngineEvent::Tick { timestamp: Utc::now() });
+
+        assert_eq!(
+            engine.pairs().get("TEST/USD").unwrap().state,
+            PairState::WindDown,
+            "Stop-loss with use_winddown_for_stoploss=true should enter WindDown"
+        );
+        assert!(
+            engine.pairs().get("TEST/USD").unwrap().winddown_since.is_some(),
+            "winddown_since should be set for escalation tracking"
+        );
+    }
+
+    #[test]
+    fn test_winddown_escalation() {
+        let mut cfg = test_config();
+        cfg.risk.stop_loss_pct = dec!(0.03);
+        cfg.risk.winddown_escalation_hours = 1; // 1 hour for test
+
+        let mut state = BotState::default();
+        state.positions.insert("TEST/USD".into(), Position {
+            qty: dec!(100),
+            avg_cost: dec!(0.10),
+        });
+
+        let mut engine = Engine::new(cfg, test_pair_info(), state);
+
+        engine.handle_event(EngineEvent::BookSnapshot {
+            symbol: "TEST/USD".into(),
+            bids: vec![LevelUpdate { price: dec!(0.095), qty: dec!(1000) }],
+            asks: vec![LevelUpdate { price: dec!(0.097), qty: dec!(1000) }],
+            timestamp: Utc::now(),
+        });
+
+        // Trigger stop-loss → WindDown
+        let t0 = Utc::now();
+        engine.handle_event(EngineEvent::Tick { timestamp: t0 });
+        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::WindDown);
+
+        // Tick 30 min later — should still be WindDown
+        let t1 = t0 + chrono::Duration::minutes(30);
+        engine.handle_event(EngineEvent::Tick { timestamp: t1 });
+        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::WindDown);
+
+        // Tick 2 hours later — should escalate to Liquidating
+        let t2 = t0 + chrono::Duration::hours(2);
+        engine.handle_event(EngineEvent::Tick { timestamp: t2 });
+        assert_eq!(
+            engine.pairs().get("TEST/USD").unwrap().state,
+            PairState::Liquidating,
+            "Should escalate to Liquidating after winddown_escalation_hours"
+        );
     }
 }

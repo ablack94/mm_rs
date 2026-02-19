@@ -39,10 +39,10 @@ mod tests {
             stale_order_secs: 300,
             dms_timeout_secs: 60,
             dms_refresh_secs: 20,
-            rate_limit_max_counter: 60,
             stop_loss_pct: dec!(0.03),
             take_profit_pct: dec!(0.10),
             cooldown_after_liquidation_secs: 3600,
+            winddown_escalation_hours: 4,
         }
     }
 

@@ -1,3 +1,7 @@
+mod auth;
+mod rest;
+mod ws;
+
 use anyhow::Result;
 use axum::{
     Router,
@@ -9,8 +13,11 @@ use axum::{
 use clap::Parser;
 use std::sync::Arc;
 
-use kraken_core::proxy::rest_proxy::{build_proxy_router, ProxyState};
-use kraken_core::proxy::ws_proxy::{handle_public_ws_connection, handle_ws_connection, WsProxyState};
+use proxy_common::auth::check_ws_auth;
+use proxy_common::rate_limit::TokenBucketConfig;
+
+use crate::rest::{KrakenRestState, build_kraken_rest_router};
+use crate::ws::{KrakenWsState, handle_kraken_private_ws, handle_kraken_public_ws};
 
 #[derive(Parser)]
 #[command(name = "kraken-proxy", about = "Kraken API proxy — holds keys, signs requests")]
@@ -52,7 +59,7 @@ async fn main() -> Result<()> {
     );
 
     // REST proxy state
-    let rest_state = Arc::new(ProxyState {
+    let rest_state = Arc::new(KrakenRestState {
         api_key: api_key.clone(),
         api_secret: api_secret.clone(),
         proxy_token: proxy_token.clone(),
@@ -60,16 +67,37 @@ async fn main() -> Result<()> {
         client: reqwest::Client::new(),
     });
 
+    // Rate limit config from env vars
+    let rate_limit_config = TokenBucketConfig {
+        max_tokens: std::env::var("RATE_LIMIT_MAX_TOKENS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(40.0),
+        refill_rate: std::env::var("RATE_LIMIT_REFILL_RATE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+        order_cost: std::env::var("RATE_LIMIT_ORDER_COST")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(2.0),
+        cancel_cost: std::env::var("RATE_LIMIT_CANCEL_COST")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+    };
+
+    tracing::info!(
+        max_tokens = rate_limit_config.max_tokens,
+        refill_rate = rate_limit_config.refill_rate,
+        order_cost = rate_limit_config.order_cost,
+        cancel_cost = rate_limit_config.cancel_cost,
+        "Rate limit config"
+    );
+
     // WS proxy state
-    let ws_state = Arc::new(WsProxyState::new(
+    let ws_state = Arc::new(KrakenWsState::new(
         api_key,
         api_secret,
         kraken_ws_url,
         kraken_base_url,
+        rate_limit_config,
     ));
 
     // Build combined router
-    let rest_router = build_proxy_router(rest_state);
+    let rest_router = build_kraken_rest_router(rest_state);
     let ws_token = proxy_token;
 
     let ws_token_pub = ws_token.clone();
@@ -79,27 +107,11 @@ async fn main() -> Result<()> {
             get(
                 move |headers: HeaderMap,
                       ws: WebSocketUpgrade,
-                      State(state): State<Arc<WsProxyState>>| async move {
-                    // Check bearer token
-                    let auth = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-
-                    // Also accept token via Sec-WebSocket-Protocol for clients
-                    // that can't set Authorization headers on WS upgrades.
-                    let token_from_protocol = headers
-                        .get("sec-websocket-protocol")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-
-                    if auth != format!("Bearer {}", ws_token)
-                        && token_from_protocol != ws_token
-                    {
+                      State(state): State<Arc<KrakenWsState>>| async move {
+                    if !check_ws_auth(&headers, &ws_token) {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-
-                    ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+                    ws.on_upgrade(move |socket| handle_kraken_private_ws(socket, state))
                         .into_response()
                 },
             ),
@@ -109,23 +121,11 @@ async fn main() -> Result<()> {
             get(
                 move |headers: HeaderMap,
                       ws: WebSocketUpgrade| async move {
-                    let auth = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let token_from_protocol = headers
-                        .get("sec-websocket-protocol")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-
-                    if auth != format!("Bearer {}", ws_token_pub)
-                        && token_from_protocol != ws_token_pub
-                    {
+                    if !check_ws_auth(&headers, &ws_token_pub) {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-
                     let url = kraken_public_ws_url.clone();
-                    ws.on_upgrade(move |socket| handle_public_ws_connection(socket, url))
+                    ws.on_upgrade(move |socket| handle_kraken_public_ws(socket, url))
                         .into_response()
                 },
             ),
@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
     let app = rest_router.merge(ws_router);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", args.port)).await?;
-    tracing::info!(port = args.port, "Proxy listening");
+    tracing::info!(port = args.port, "Kraken proxy listening");
 
     axum::serve(listener, app).await?;
     Ok(())

@@ -10,10 +10,11 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::exchange::auth::sign_request;
+use crate::auth::sign_request;
+use proxy_common::auth::check_auth;
 
-/// Shared state for the REST proxy.
-pub struct ProxyState {
+/// Shared state for the Kraken REST proxy.
+pub struct KrakenRestState {
     pub api_key: String,
     pub api_secret: String,
     pub proxy_token: String,
@@ -21,21 +22,9 @@ pub struct ProxyState {
     pub client: reqwest::Client,
 }
 
-type AppState = Arc<ProxyState>;
+type AppState = Arc<KrakenRestState>;
 
-fn check_auth(headers: &HeaderMap, token: &str) -> Result<(), (StatusCode, Json<Value>)> {
-    let auth = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if auth == format!("Bearer {}", token) {
-        Ok(())
-    } else {
-        Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))))
-    }
-}
-
-pub fn build_proxy_router(state: Arc<ProxyState>) -> Router {
+pub fn build_kraken_rest_router(state: Arc<KrakenRestState>) -> Router {
     Router::new()
         // Private endpoints (proxy signs them)
         .route("/0/private/GetWebSocketsToken", post(proxy_private))
@@ -72,7 +61,6 @@ async fn proxy_private(
     let urlpath = uri.path();
     let nonce = millis_nonce();
 
-    // Build the POST body: always include nonce, append any extra params
     let post_data = if body.is_empty() {
         format!("nonce={}", nonce)
     } else {

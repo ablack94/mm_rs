@@ -19,7 +19,7 @@ use kraken_core::types::*;
 use kraken_core::types::event::StateStoreAction;
 
 #[derive(Parser)]
-#[command(name = "kraken-mm", about = "Kraken low-liquidity market making bot")]
+#[command(name = "kraken-mm", about = "Low-liquidity market making bot (exchange-agnostic via proxy)")]
 struct Args {
     /// Paper trading mode (logs orders, doesn't send them)
     #[arg(long)]
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
         mode,
         proxy_url = config.exchange.proxy_url,
         state_store_url,
-        "Starting Kraken Market Maker"
+        "Starting Market Maker"
     );
 
     // State store channels:

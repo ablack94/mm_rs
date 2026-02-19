@@ -70,6 +70,8 @@ struct AppState {
     api_token: String,
     analyzer_config: AnalyzerConfig,
     start_time: Instant,
+    /// Timestamp of the most recently processed fill (for staleness detection).
+    last_fill_time: RwLock<Option<chrono::DateTime<Utc>>>,
 }
 
 #[tokio::main]
@@ -129,6 +131,7 @@ async fn main() -> Result<()> {
         api_token,
         analyzer_config,
         start_time: Instant::now(),
+        last_fill_time: RwLock::new(None),
     });
 
     // WS connection info for execution feeds
@@ -248,14 +251,35 @@ async fn process_fill_feed(ws: &mut WsConnection, shared: &Arc<AppState>) {
         let msg = parse_ws_message(&raw);
         match msg {
             WsMessage::ExecutionSnapshot(reports) => {
-                let trade_count = reports.iter().filter(|r| r.exec_type == "trade").count();
+                let trade_reports: Vec<_> = reports.into_iter()
+                    .filter(|r| r.exec_type == "trade")
+                    .collect();
+                let total = trade_reports.len();
+
+                // Process snapshot fills that we haven't seen before.
+                // This recovers fills missed during disconnection.
+                // Deduplication via seen_order_ids prevents double-counting.
+                let mut processed = 0u32;
+                let mut skipped = 0u32;
+                for report in trade_reports {
+                    let dedup_key = format!("{}:{}", report.order_id, report.last_qty);
+                    let is_new = {
+                        let seen = shared.seen_order_ids.read().await;
+                        !seen.contains(&dedup_key)
+                    };
+                    if is_new {
+                        apply_exec_report(report, shared).await;
+                        processed += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                }
                 tracing::info!(
-                    count = trade_count,
-                    "Ignoring execution snapshot (historical fills inflate PnL due to incomplete cost basis)"
+                    total,
+                    processed,
+                    skipped,
+                    "Execution snapshot — processed new fills, skipped already-seen"
                 );
-                // Do NOT process — snapshot sells without prior buys get avg_cost=0,
-                // causing full proceeds to be counted as profit. State is persisted
-                // to pnl_state.json between restarts, so the snapshot is unnecessary.
             }
             WsMessage::Execution(report) if report.exec_type == "trade" => {
                 apply_exec_report(report, shared).await;
@@ -341,6 +365,12 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
         .write()
         .await
         .insert(fill.symbol.clone(), fill.price);
+
+    // Track last fill time for staleness detection
+    {
+        let mut lft = shared.last_fill_time.write().await;
+        *lft = Some(fill.timestamp);
+    }
 
     // Record in edge tracker
     let trade = PnlTrade {
@@ -661,6 +691,7 @@ async fn get_pnl(
     let tracker = shared.tracker.read().await;
     let prices = shared.prices.read().await;
     let pnl_summary = tracker.summary(&prices);
+    let last_fill_time = shared.last_fill_time.read().await;
 
     (
         StatusCode::OK,
@@ -682,6 +713,7 @@ async fn get_pnl(
                 "pair_count": summary.pair_count,
             },
             "uptime_secs": uptime,
+            "last_fill_time": *last_fill_time,
         })),
     )
 }

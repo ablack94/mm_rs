@@ -184,6 +184,7 @@ mod tests {
             min_profit_pct: dec!(0.01),
             dry_run: false,
             downtrend_threshold_pct: dec!(-5.0),
+            min_quote_interval_secs: 5,
         }
     }
 

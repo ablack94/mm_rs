@@ -53,6 +53,8 @@ pub struct AddOrderMsg {
     pub method: &'static str,
     pub params: AddOrderParams,
     pub req_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _priority: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,6 +77,8 @@ pub struct AmendOrderMsg {
     pub method: &'static str,
     pub params: AmendOrderParams,
     pub req_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _priority: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +97,8 @@ pub struct CancelOrderMsg {
     pub method: &'static str,
     pub params: CancelOrderParams,
     pub req_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _priority: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,17 +1,19 @@
-# Kraken Market-Making Bot
+# Market-Making Bot
 
 ## Project Structure
 
-Cargo workspace with 8 crates under `crates/`:
+Cargo workspace with 10 crates under `crates/`:
 
 | Crate | Type | Binary | Description |
 |-------|------|--------|-------------|
 | `core` | library | — | Shared engine, exchange adapters, types, traits, config (`kraken_core`) |
-| `bot` | binary | `kraken-mm` | Market-making executor (dumb, no REST API, connects to state store) |
+| `bot` | binary | `kraken-mm` | Market-making executor (exchange-agnostic, connects via proxy + state store) |
 | `state-store` | binary | `state-store` | CRUD service for pair configs/states, WS relay to bot (standalone, no `kraken-core` dep) |
 | `pnl-analyzer` | binary | `pnl-analyzer` | Edge metrics, pair promotion/demotion, writes to state store |
-| `mock-exchange` | binary | `mock-exchange` | Simulated Kraken exchange for testing (random walk + deterministic scenario mode) |
-| `proxy` | binary | `kraken-proxy` | Signing proxy (holds API keys, signs requests) |
+| `mock-exchange` | binary | `mock-exchange` | Simulated exchange for testing (random walk + deterministic scenario mode) |
+| `proxy-common` | library | — | Shared proxy types, auth middleware, WS relay framework, rate limiter |
+| `proxy-kraken` | binary | `kraken-proxy` | Kraken signing proxy (holds keys, signs requests, relays WS) |
+| `proxy-coinbase` | binary | `coinbase-proxy` | Coinbase proxy (signs requests, translates REST/WS protocol) |
 | `recorder` | binary | `recorder` | Records live WS data to JSONL for replay |
 | `scanner` | binary | `scanner` | Scans Kraken pairs for MM opportunities (standalone, no `kraken-core` dep) |
 
@@ -59,24 +61,35 @@ Caps per-pair exposure at `max_inventory_usd` and total at `max_total_exposure_u
 - **Kill switch**: shuts down if cumulative PnL drops below `kill_switch_loss_usd`
 - **Stop-loss**: liquidates position if price drops `stop_loss_pct` below avg_cost
 - **Take-profit**: liquidates if price rises `take_profit_pct` above avg_cost
-- **Dead man's switch**: Kraken cancels all orders if heartbeat not refreshed
-- **Rate limiter**: tracks Kraken's rate counter, delays when approaching limit
+- **Dead man's switch**: exchange cancels all orders if heartbeat not refreshed
+- **Rate limiter**: token bucket in proxy, delays when approaching limit
 
 ### Exchange Adapters
-- `exchange/live.rs` — Real Kraken connection (splits private WS into read/write loops)
-- `exchange/rest.rs` — Direct REST client with HMAC-SHA512 signing
-- `exchange/proxy_client.rs` — REST client that routes through signing proxy
+- `exchange/live.rs` — Live exchange connection via proxy (splits private WS into read/write loops)
+- `exchange/rest.rs` — Direct Kraken REST client with HMAC-SHA512 signing (scanner/recorder only)
+- `exchange/proxy_client.rs` — REST client that routes through signing proxy (bot uses this)
 - `exchange/ws.rs` — WebSocket connection helpers (including `connect_with_token` for proxy auth)
 - `exchange/replay.rs` — Replay recorded JSONL for testing
-- `exchange/messages.rs` — Kraken WS v2 message types and parser
+- `exchange/messages.rs` — WS message types and parser (Kraken WS v2 format as protocol)
 
-### Proxy Architecture
-The bot always connects through a proxy — there is no direct-to-Kraken path.
+### Proxy Architecture (Multi-Exchange)
+The bot is exchange-agnostic — it talks a standard WS/REST protocol to a proxy. The proxy handles exchange-specific translation, signing, and rate limiting. Different proxy binaries for different exchanges, same bot binary.
+
+```
+Bot (generic) ──► Kraken Proxy (kraken-proxy)   ──► Kraken API
+               ──► Coinbase Proxy (coinbase-proxy) ──► Coinbase API
+```
+
 Set `PROXY_URL` (required) and `PROXY_TOKEN` env vars. WS URLs are derived from `PROXY_URL`:
 - Private WS: `ws://{proxy}/ws/private`
 - Public WS: `ws://{proxy}/ws/public`
 - REST: routes through `ProxyClient` to `{proxy}/0/...`
 The bot never sees API keys (proxy holds them).
+
+**Proxy crate structure:**
+- `proxy-common` — shared auth middleware, WS relay framework, rate limiter
+- `proxy-kraken` — Kraken HMAC-SHA512 signing, WS v2 relay, token injection
+- `proxy-coinbase` — Coinbase HMAC-SHA256 signing, REST↔WS translation, pair format conversion (BTC-USD ↔ BTC/USD)
 
 ## Key Types
 - `TickerData` → `types/ticker.rs`
@@ -92,7 +105,7 @@ The bot never sees API keys (proxy holds them).
 | `order_size_usd` | $100 | Per-side order size |
 | `min_spread_bps` | 100 | Minimum spread to quote |
 | `spread_capture_pct` | 50% | How much of spread to capture (rest is edge) |
-| `maker_fee_pct` | 0.23% | Kraken maker fee at current tier |
+| `maker_fee_pct` | 0.23% | Maker fee at current tier (exchange-specific) |
 | `min_profit_pct` | 1% | Minimum profit margin on sells |
 | `max_inventory_usd` | $200 | Max position per pair |
 | `max_total_exposure_usd` | $2000 | Max total across all pairs |
