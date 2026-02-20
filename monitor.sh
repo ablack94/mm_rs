@@ -120,6 +120,31 @@ json.dump({
 
     echo "[$(date -u +%H:%M:%S)] Session P&L: \$${session_pnl} | Net: \$$(python3 -c "print(round(${net},2))") | Realized: \$$(python3 -c "print(round(${realized},2))") | Unrealized: \$$(python3 -c "print(round(${unrealized},2))") | Fees: \$${fees} | Trades: ${trades}"
 
+    # PnL staleness check: warn if last_fill_time is >5 min old
+    last_fill_time=$(echo "$pnl_json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    lft = d.get('last_fill_time')
+    if lft:
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(lft.replace('Z', '+00:00'))
+        age_secs = (datetime.now(timezone.utc) - ts).total_seconds()
+        if age_secs > 300:
+            print(f'STALE:{int(age_secs // 60)}')
+        else:
+            print('OK')
+    else:
+        print('NONE')
+except:
+    print('ERR')
+" 2>/dev/null || echo "ERR")
+
+    if echo "$last_fill_time" | grep -q "^STALE:"; then
+        stale_mins=$(echo "$last_fill_time" | cut -d: -f2)
+        echo "[$(date -u +%H:%M:%S)] WARNING: PnL data stale — last fill was ${stale_mins} minutes ago"
+    fi
+
     # Check if session loss exceeds limit
     is_blown=$(python3 -c "print('yes' if ${session_pnl} < -${SESSION_LOSS_LIMIT} else 'no')" 2>/dev/null || echo "no")
     if [ "$is_blown" = "yes" ]; then

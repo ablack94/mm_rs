@@ -1224,6 +1224,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
+ "trading-primitives",
  "uuid",
 ]
 

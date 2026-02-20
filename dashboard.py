@@ -182,6 +182,11 @@ def build_dashboard_data() -> dict:
         edge_section = pnl_data.get("edge", {})
         overall_edge = edge_section.get("overall_edge")
 
+    # 4b. Last fill time for staleness detection
+    last_fill_time = None
+    if pnl_up:
+        last_fill_time = pnl_data.get("last_fill_time")
+
     # 5. PnL analyzer per-pair — edge metrics and positions
     pnl_pairs_resp = _pnl_get("/pairs")
     pnl_pairs_map = {}
@@ -382,6 +387,7 @@ def build_dashboard_data() -> dict:
         "positions": positions,
         "recent_trades": recent_trades,
         "session": session_data,
+        "last_fill_time": last_fill_time,
     }
 
 
@@ -596,6 +602,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .badge-buy  { background: rgba(63,185,80,0.15); color: var(--green); }
   .badge-sell { background: rgba(248,81,73,0.15); color: var(--red); }
 
+  /* Staleness warning banner */
+  .stale-banner {
+    display: none;
+    background: rgba(248,81,73,0.15);
+    border: 1px solid var(--red);
+    border-radius: 8px;
+    padding: 10px 16px;
+    margin-bottom: 16px;
+    color: var(--red);
+    font-weight: 600;
+    font-size: 0.9em;
+  }
+  .stale-banner.visible { display: block; }
+
   @media (max-width: 600px) {
     .summary-grid { grid-template-columns: repeat(2, 1fr); }
     .defaults-grid { grid-template-columns: repeat(2, 1fr); }
@@ -618,6 +638,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div class="refresh-bar"><div id="refreshBar" class="refresh-bar-inner"></div></div>
+
+<div id="staleBanner" class="stale-banner">
+  PnL data may be stale — no fills received in over 5 minutes. Dashboard numbers may not reflect recent trades.
+</div>
 
 <!-- Summary Cards -->
 <div class="summary-grid">
@@ -849,6 +873,21 @@ function updateDashboard(data) {
   }
 
   document.getElementById('lastUpdate').textContent = data.timestamp || '--';
+
+  // Staleness warning: show banner if last_fill_time is >5 min old while bot is connected
+  const staleBanner = document.getElementById('staleBanner');
+  if (data.bot_connected && data.last_fill_time) {
+    const fillAge = (new Date() - new Date(data.last_fill_time)) / 1000;
+    if (fillAge > 300) {
+      const mins = Math.floor(fillAge / 60);
+      staleBanner.textContent = 'PnL data may be stale \u2014 last fill was ' + mins + ' minutes ago. Dashboard numbers may not reflect recent trades.';
+      staleBanner.classList.add('visible');
+    } else {
+      staleBanner.classList.remove('visible');
+    }
+  } else {
+    staleBanner.classList.remove('visible');
+  }
 
   // Summary cards
   document.getElementById('portfolioValue').textContent = fmtUsd(data.portfolio_value);
