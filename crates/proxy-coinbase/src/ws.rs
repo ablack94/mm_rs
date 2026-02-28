@@ -260,6 +260,8 @@ async fn run_private_ws_proxy(
     let bot_write_for_upstream = bot_write.clone();
     let order_id_map_for_cleanup = order_id_map.clone();
     let coinbase_to_bot = tokio::spawn(async move {
+        let mut fill_tracker = translate::FillTracker::new();
+
         while let Some(Ok(msg)) = coinbase_read.next().await {
             match msg {
                 Message::Text(text) => {
@@ -276,7 +278,8 @@ async fn run_private_ws_proxy(
                             // Clean up order_id_map for terminal order states
                             cleanup_terminal_orders(&parsed, &order_id_map_for_cleanup).await;
 
-                            let kraken_msgs = translate::coinbase_user_to_kraken(&parsed);
+                            let kraken_msgs =
+                                translate::coinbase_user_to_kraken(&parsed, &mut fill_tracker);
                             let mut writer = bot_write_for_upstream.lock().await;
                             for msg in kraken_msgs {
                                 if writer.send(ws::Message::Text(msg.into())).await.is_err() {

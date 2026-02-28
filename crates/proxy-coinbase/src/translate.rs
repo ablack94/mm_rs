@@ -7,7 +7,78 @@
 
 use crate::pairs;
 use serde_json::Value;
+use std::collections::HashMap;
 use trading_primitives::protocol;
+
+/// Tracks cumulative fill data per order to compute incremental fill deltas.
+///
+/// Coinbase reports cumulative quantities (total filled so far), but the bot
+/// expects incremental quantities (just this fill). The tracker converts between
+/// the two by remembering previous cumulative values per cl_ord_id.
+pub struct FillTracker {
+    /// cl_ord_id → (cumulative_qty, cumulative_cost, cumulative_fees)
+    state: HashMap<String, (f64, f64, f64)>,
+}
+
+impl FillTracker {
+    pub fn new() -> Self {
+        Self {
+            state: HashMap::new(),
+        }
+    }
+
+    /// Seed the tracker with current cumulative values without emitting a fill.
+    /// Used for snapshot events where we don't want to generate fills for
+    /// already-existing partial fills.
+    pub fn seed(&mut self, cl_ord_id: &str, cum_qty: f64, avg_price: f64, total_fees: f64) {
+        if cum_qty > 0.0 {
+            let cum_cost = avg_price * cum_qty;
+            self.state
+                .insert(cl_ord_id.to_string(), (cum_qty, cum_cost, total_fees));
+        }
+    }
+
+    /// Given cumulative fill data, compute the incremental fill since last update.
+    /// Returns Some((inc_qty, inc_price, inc_fees)) if there's a new fill.
+    /// Returns None if no new fill (duplicate update or zero delta).
+    pub fn incremental(
+        &mut self,
+        cl_ord_id: &str,
+        cum_qty: f64,
+        avg_price: f64,
+        total_fees: f64,
+    ) -> Option<(f64, f64, f64)> {
+        let (prev_qty, prev_cost, prev_fees) =
+            self.state.get(cl_ord_id).copied().unwrap_or((0.0, 0.0, 0.0));
+        let inc_qty = cum_qty - prev_qty;
+        if inc_qty < 1e-12 {
+            return None; // no new fill
+        }
+
+        let cum_cost = avg_price * cum_qty;
+        let inc_cost = cum_cost - prev_cost;
+        let inc_price = if inc_qty > 0.0 {
+            inc_cost / inc_qty
+        } else {
+            avg_price
+        };
+        let inc_fees = (total_fees - prev_fees).max(0.0);
+
+        self.state
+            .insert(cl_ord_id.to_string(), (cum_qty, cum_cost, total_fees));
+        Some((inc_qty, inc_price, inc_fees))
+    }
+
+    /// Remove tracking for an order (on terminal states).
+    pub fn remove(&mut self, cl_ord_id: &str) {
+        self.state.remove(cl_ord_id);
+    }
+
+    /// Number of tracked orders.
+    pub fn len(&self) -> usize {
+        self.state.len()
+    }
+}
 
 /// Translate a Coinbase level2 (l2_data) message to proxy protocol book format.
 #[cfg(test)]
@@ -65,7 +136,14 @@ pub fn coinbase_book_to_kraken_mapped(
 }
 
 /// Translate a Coinbase user channel message to proxy protocol execution format.
-pub fn coinbase_user_to_kraken(coinbase_msg: &Value) -> Vec<String> {
+///
+/// The `fill_tracker` converts Coinbase's cumulative fill data to incremental
+/// quantities expected by the bot. For snapshot events, it seeds the tracker
+/// without emitting fills; for updates, it computes deltas and emits trade events.
+pub fn coinbase_user_to_kraken(
+    coinbase_msg: &Value,
+    fill_tracker: &mut FillTracker,
+) -> Vec<String> {
     let mut results = Vec::new();
 
     let events = match coinbase_msg.get("events").and_then(|e| e.as_array()) {
@@ -81,9 +159,14 @@ pub fn coinbase_user_to_kraken(coinbase_msg: &Value) -> Vec<String> {
         };
 
         if event_type == "snapshot" {
+            // Seed the fill tracker with current cumulative state but don't emit fills.
+            // Snapshot orders reflect pre-existing state, not new fills.
             let exec_reports: Vec<Value> = orders
                 .iter()
-                .filter_map(|order| translate_order_to_exec(order))
+                .filter_map(|order| {
+                    seed_tracker_from_order(order, fill_tracker);
+                    translate_order_to_exec(order)
+                })
                 .collect();
 
             if !exec_reports.is_empty() {
@@ -91,7 +174,9 @@ pub fn coinbase_user_to_kraken(coinbase_msg: &Value) -> Vec<String> {
             }
         } else {
             for order in orders {
-                if let Some(exec_report) = translate_order_to_exec(order) {
+                if let Some(exec_report) =
+                    translate_order_to_exec_tracked(order, fill_tracker)
+                {
                     results.push(protocol::build_execution_update(exec_report));
                 }
             }
@@ -163,6 +248,179 @@ fn translate_order_to_exec(order: &Value) -> Option<Value> {
         timestamp,
         cancel_reason,
     ))
+}
+
+/// Extract cumulative fill data from a Coinbase order and seed the fill tracker.
+/// Used during snapshots to establish baseline state without emitting fills.
+fn seed_tracker_from_order(order: &Value, tracker: &mut FillTracker) {
+    let cl_ord_id = order
+        .get("client_order_id")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    if cl_ord_id.is_empty() {
+        return;
+    }
+    let cum_qty: f64 = order
+        .get("cumulative_quantity")
+        .and_then(|q| q.as_str())
+        .and_then(|q| q.parse().ok())
+        .unwrap_or(0.0);
+    let avg_price: f64 = order
+        .get("avg_price")
+        .and_then(|p| p.as_str())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0.0);
+    let total_fees: f64 = order
+        .get("total_fees")
+        .and_then(|f| f.as_str())
+        .and_then(|f| f.parse().ok())
+        .unwrap_or(0.0);
+    tracker.seed(cl_ord_id, cum_qty, avg_price, total_fees);
+}
+
+/// Translate a Coinbase order to a protocol exec report, using the fill tracker
+/// to convert cumulative quantities to incremental.
+///
+/// Key behaviors:
+/// - OPEN + cumulative_qty > 0 with new fill delta → exec_type "trade" (partial fill)
+/// - OPEN + no new fill → exec_type "new" (order ack or duplicate update)
+/// - FILLED → exec_type "trade" with incremental delta from last partial
+/// - Terminal states (CANCELLED/EXPIRED/FAILED) → clean up tracker
+fn translate_order_to_exec_tracked(
+    order: &Value,
+    tracker: &mut FillTracker,
+) -> Option<Value> {
+    let status = order.get("status")?.as_str()?;
+    let product_id = order.get("product_id")?.as_str()?;
+    let symbol = pairs::to_internal(product_id);
+    let order_id = order.get("order_id")?.as_str().unwrap_or("");
+    let client_order_id = order.get("client_order_id")?.as_str().unwrap_or("");
+    let side = order.get("order_side")?.as_str().unwrap_or("").to_lowercase();
+
+    let cum_qty: f64 = order
+        .get("cumulative_quantity")
+        .and_then(|q| q.as_str())
+        .and_then(|q| q.parse().ok())
+        .unwrap_or(0.0);
+    let avg_price: f64 = order
+        .get("avg_price")
+        .and_then(|p| p.as_str())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0.0);
+    let total_fees: f64 = order
+        .get("total_fees")
+        .and_then(|f| f.as_str())
+        .and_then(|f| f.parse().ok())
+        .unwrap_or(0.0);
+
+    let timestamp = order
+        .get("creation_time")
+        .and_then(|t| t.as_str())
+        .unwrap_or("1970-01-01T00:00:00Z");
+    let cancel_reason = order
+        .get("cancel_reason")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.is_empty());
+
+    match status {
+        "FILLED" | "OPEN" => {
+            // Check if there's a new incremental fill
+            if let Some((inc_qty, inc_price, inc_fees)) =
+                tracker.incremental(client_order_id, cum_qty, avg_price, total_fees)
+            {
+                // There's a new fill (partial or complete)
+                let order_status = if status == "FILLED" { "filled" } else { "open" };
+                if status == "FILLED" {
+                    tracker.remove(client_order_id);
+                }
+                Some(protocol::build_exec_report(
+                    "trade",
+                    order_id,
+                    client_order_id,
+                    &symbol,
+                    &side,
+                    inc_qty,
+                    inc_price,
+                    inc_fees,
+                    order_status,
+                    "m",
+                    timestamp,
+                    cancel_reason,
+                ))
+            } else if status == "OPEN" {
+                // No fill delta — this is an order ack or duplicate update
+                Some(protocol::build_exec_report(
+                    "new",
+                    order_id,
+                    client_order_id,
+                    &symbol,
+                    &side,
+                    0.0,
+                    0.0,
+                    0.0,
+                    "open",
+                    "m",
+                    timestamp,
+                    cancel_reason,
+                ))
+            } else {
+                // FILLED with no delta (e.g., duplicate) — still report it
+                tracker.remove(client_order_id);
+                Some(protocol::build_exec_report(
+                    "trade",
+                    order_id,
+                    client_order_id,
+                    &symbol,
+                    &side,
+                    cum_qty,
+                    avg_price,
+                    total_fees,
+                    "filled",
+                    "m",
+                    timestamp,
+                    cancel_reason,
+                ))
+            }
+        }
+        "PENDING" => Some(protocol::build_exec_report(
+            "pending_new",
+            order_id,
+            client_order_id,
+            &symbol,
+            &side,
+            0.0,
+            0.0,
+            0.0,
+            "pending",
+            "m",
+            timestamp,
+            cancel_reason,
+        )),
+        "CANCELLED" | "EXPIRED" | "FAILED" => {
+            tracker.remove(client_order_id);
+            let (exec_type, order_status) = match status {
+                "CANCELLED" => ("canceled", "canceled"),
+                "EXPIRED" => ("expired", "expired"),
+                "FAILED" => ("canceled", "canceled"),
+                _ => unreachable!(),
+            };
+            Some(protocol::build_exec_report(
+                exec_type,
+                order_id,
+                client_order_id,
+                &symbol,
+                &side,
+                0.0,
+                0.0,
+                0.0,
+                order_status,
+                "m",
+                timestamp,
+                cancel_reason,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Translate a protocol subscribe message to Coinbase format.
@@ -335,7 +593,8 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&coinbase);
+        let mut tracker = FillTracker::new();
+        let results = coinbase_user_to_kraken(&coinbase, &mut tracker);
         assert_eq!(results.len(), 1);
         // Verify it parses correctly through the protocol parser
         match parse_ws_message(&results[0]) {
@@ -369,7 +628,8 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&coinbase);
+        let mut tracker = FillTracker::new();
+        let results = coinbase_user_to_kraken(&coinbase, &mut tracker);
         assert_eq!(results.len(), 1);
         match parse_ws_message(&results[0]) {
             WsMessage::Execution(report) => {
@@ -377,6 +637,238 @@ mod tests {
                 assert_eq!(report.cancel_reason, Some("USER_CANCEL".to_string()));
             }
             other => panic!("Expected Execution, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_partial_fill_incremental_quantities() {
+        let mut tracker = FillTracker::new();
+
+        // First partial fill: 0.3 of 1.0 at price 100
+        let msg1 = json!({
+            "channel": "user",
+            "events": [{
+                "type": "update",
+                "orders": [{
+                    "order_id": "cb-order-pf",
+                    "client_order_id": "mm_buy_pf_001",
+                    "product_id": "BTC-USD",
+                    "order_side": "BUY",
+                    "status": "OPEN",
+                    "avg_price": "100",
+                    "cumulative_quantity": "0.3",
+                    "total_fees": "0.03",
+                    "creation_time": "2024-01-01T00:00:00Z",
+                    "cancel_reason": ""
+                }]
+            }]
+        });
+
+        let results = coinbase_user_to_kraken(&msg1, &mut tracker);
+        assert_eq!(results.len(), 1);
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "trade");
+                // Incremental: 0.3 (first fill, no previous)
+                assert_eq!(report.last_qty.to_string(), "0.3");
+            }
+            other => panic!("Expected Execution trade, got {:?}", other),
+        }
+
+        // Second partial fill: cumulative 0.7 at weighted avg price 95
+        // Incremental: 0.4 units, cost delta = 0.7*95 - 0.3*100 = 66.5 - 30 = 36.5, price = 91.25
+        let msg2 = json!({
+            "channel": "user",
+            "events": [{
+                "type": "update",
+                "orders": [{
+                    "order_id": "cb-order-pf",
+                    "client_order_id": "mm_buy_pf_001",
+                    "product_id": "BTC-USD",
+                    "order_side": "BUY",
+                    "status": "OPEN",
+                    "avg_price": "95",
+                    "cumulative_quantity": "0.7",
+                    "total_fees": "0.07",
+                    "creation_time": "2024-01-01T00:00:00Z",
+                    "cancel_reason": ""
+                }]
+            }]
+        });
+
+        let results = coinbase_user_to_kraken(&msg2, &mut tracker);
+        assert_eq!(results.len(), 1);
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "trade");
+                // Incremental qty: 0.7 - 0.3 = 0.4
+                let qty_f64: f64 = report.last_qty.to_string().parse().unwrap();
+                assert!((qty_f64 - 0.4).abs() < 0.001,
+                    "Expected incremental qty ~0.4, got {}", qty_f64);
+            }
+            other => panic!("Expected Execution trade, got {:?}", other),
+        }
+
+        // Final fill: cumulative 1.0 at weighted avg price 90
+        let msg3 = json!({
+            "channel": "user",
+            "events": [{
+                "type": "update",
+                "orders": [{
+                    "order_id": "cb-order-pf",
+                    "client_order_id": "mm_buy_pf_001",
+                    "product_id": "BTC-USD",
+                    "order_side": "BUY",
+                    "status": "FILLED",
+                    "avg_price": "90",
+                    "cumulative_quantity": "1.0",
+                    "total_fees": "0.10",
+                    "creation_time": "2024-01-01T00:00:00Z",
+                    "cancel_reason": ""
+                }]
+            }]
+        });
+
+        let results = coinbase_user_to_kraken(&msg3, &mut tracker);
+        assert_eq!(results.len(), 1);
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "trade");
+                // Incremental qty: 1.0 - 0.7 = 0.3
+                let qty_f64: f64 = report.last_qty.to_string().parse().unwrap();
+                assert!((qty_f64 - 0.3).abs() < 0.001,
+                    "Expected incremental qty ~0.3, got {}", qty_f64);
+            }
+            other => panic!("Expected Execution trade, got {:?}", other),
+        }
+
+        // Tracker should have cleaned up after FILLED
+        assert_eq!(tracker.len(), 0);
+    }
+
+    #[test]
+    fn test_open_no_fill_emits_ack() {
+        let mut tracker = FillTracker::new();
+
+        // OPEN with zero cumulative_quantity is just an ack
+        let msg = json!({
+            "channel": "user",
+            "events": [{
+                "type": "update",
+                "orders": [{
+                    "order_id": "cb-order-new",
+                    "client_order_id": "mm_buy_new_001",
+                    "product_id": "ETH-USD",
+                    "order_side": "BUY",
+                    "status": "OPEN",
+                    "avg_price": "0",
+                    "cumulative_quantity": "0",
+                    "total_fees": "0",
+                    "creation_time": "2024-01-01T00:00:00Z",
+                    "cancel_reason": ""
+                }]
+            }]
+        });
+
+        let results = coinbase_user_to_kraken(&msg, &mut tracker);
+        assert_eq!(results.len(), 1);
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "new");
+            }
+            other => panic!("Expected Execution new, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_seeds_tracker_no_fills() {
+        let mut tracker = FillTracker::new();
+
+        // Snapshot with an order that has partial fills
+        let msg = json!({
+            "channel": "user",
+            "events": [{
+                "type": "snapshot",
+                "orders": [{
+                    "order_id": "cb-order-existing",
+                    "client_order_id": "mm_buy_exist_001",
+                    "product_id": "BTC-USD",
+                    "order_side": "BUY",
+                    "status": "OPEN",
+                    "avg_price": "50000",
+                    "cumulative_quantity": "0.5",
+                    "total_fees": "1.0",
+                    "creation_time": "2024-01-01T00:00:00Z",
+                    "cancel_reason": ""
+                }]
+            }]
+        });
+
+        let results = coinbase_user_to_kraken(&msg, &mut tracker);
+        // Snapshot should produce an execution snapshot message (ack, not trade)
+        assert_eq!(results.len(), 1);
+
+        // Now if an update arrives with the SAME cumulative_quantity, no fill should be emitted
+        let update = json!({
+            "channel": "user",
+            "events": [{
+                "type": "update",
+                "orders": [{
+                    "order_id": "cb-order-existing",
+                    "client_order_id": "mm_buy_exist_001",
+                    "product_id": "BTC-USD",
+                    "order_side": "BUY",
+                    "status": "OPEN",
+                    "avg_price": "50000",
+                    "cumulative_quantity": "0.5",
+                    "total_fees": "1.0",
+                    "creation_time": "2024-01-01T00:00:00Z",
+                    "cancel_reason": ""
+                }]
+            }]
+        });
+
+        let results = coinbase_user_to_kraken(&update, &mut tracker);
+        assert_eq!(results.len(), 1);
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                // No new fill, should be an ack
+                assert_eq!(report.exec_type, "new");
+            }
+            other => panic!("Expected Execution new (no fill delta), got {:?}", other),
+        }
+
+        // But a NEW partial fill SHOULD be emitted
+        let update2 = json!({
+            "channel": "user",
+            "events": [{
+                "type": "update",
+                "orders": [{
+                    "order_id": "cb-order-existing",
+                    "client_order_id": "mm_buy_exist_001",
+                    "product_id": "BTC-USD",
+                    "order_side": "BUY",
+                    "status": "OPEN",
+                    "avg_price": "49000",
+                    "cumulative_quantity": "0.8",
+                    "total_fees": "1.5",
+                    "creation_time": "2024-01-01T00:00:00Z",
+                    "cancel_reason": ""
+                }]
+            }]
+        });
+
+        let results = coinbase_user_to_kraken(&update2, &mut tracker);
+        assert_eq!(results.len(), 1);
+        match parse_ws_message(&results[0]) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "trade");
+                // Incremental: 0.8 - 0.5 = 0.3
+                let qty_f64: f64 = report.last_qty.to_string().parse().unwrap();
+                assert!((qty_f64 - 0.3).abs() < 0.001,
+                    "Expected incremental qty ~0.3, got {}", qty_f64);
+            }
+            other => panic!("Expected Execution trade, got {:?}", other),
         }
     }
 
