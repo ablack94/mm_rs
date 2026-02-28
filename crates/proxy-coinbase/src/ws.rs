@@ -3,6 +3,7 @@ use axum::extract::ws::{self, WebSocket};
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::auth::{build_jwt, build_ws_jwt};
@@ -144,11 +145,15 @@ async fn run_private_ws_proxy(
     let order_id_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
+    // DMS timer handle — spawned on cancel_all_orders_after, aborted on reset/disconnect
+    let dms_timer: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
     // Bot -> Coinbase: intercept order commands, translate to REST
     let state_for_orders = state.clone();
     let bot_write_for_orders = bot_write.clone();
     let subscribed_for_orders = subscribed.clone();
     let order_id_map_for_orders = order_id_map.clone();
+    let dms_timer_for_orders = dms_timer.clone();
     let coinbase_write = Arc::new(Mutex::new(coinbase_write));
     let coinbase_write_for_sub = coinbase_write.clone();
 
@@ -245,8 +250,36 @@ async fn run_private_ws_proxy(
                             handle_cancel_all(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
                         }
                         "cancel_all_orders_after" => {
-                            // DMS: Coinbase doesn't support this. Send success acknowledgment.
                             let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
+                            let timeout_secs = parsed
+                                .get("params")
+                                .and_then(|p| p.get("timeout"))
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+
+                            // Abort any existing DMS timer
+                            {
+                                let mut timer = dms_timer_for_orders.lock().await;
+                                if let Some(handle) = timer.take() {
+                                    handle.abort();
+                                }
+                            }
+
+                            // Spawn new timer if timeout > 0 (timeout = 0 disables DMS)
+                            if timeout_secs > 0 {
+                                let state_for_dms = state_for_orders.clone();
+                                let order_id_map_for_dms = order_id_map_for_orders.clone();
+                                let dms_timer_ref = dms_timer_for_orders.clone();
+                                let handle = tokio::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
+                                    tracing::warn!(timeout_secs, "DMS timer expired — cancelling all orders");
+                                    cancel_all_orders(&state_for_dms, &order_id_map_for_dms).await;
+                                    // Clear self from the handle slot
+                                    *dms_timer_ref.lock().await = None;
+                                });
+                                dms_timer_for_orders.lock().await.replace(handle);
+                            }
+
                             let resp = translate::order_response_success(
                                 "cancel_all_orders_after",
                                 req_id,
@@ -383,6 +416,10 @@ async fn run_private_ws_proxy(
     tracing::info!("Coinbase private WS proxy: bot disconnected");
     coinbase_to_bot.abort();
     heartbeat_handle.abort();
+    // Abort DMS timer on disconnect
+    if let Some(handle) = dms_timer.lock().await.take() {
+        handle.abort();
+    }
     Ok(())
 }
 
@@ -626,22 +663,18 @@ async fn handle_cancel_order(
     }
 }
 
-/// Handle cancel_all: cancel all open orders via Coinbase REST
-async fn handle_cancel_all(
-    parsed: &serde_json::Value,
+/// Cancel all open orders via Coinbase REST API and clear the order_id_map.
+/// Used by both the `cancel_all` WS handler and the DMS timer.
+async fn cancel_all_orders(
     state: &CoinbaseWsState,
-    bot_write: &Arc<Mutex<BotWriter>>,
     order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
 ) {
-    let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
-
-    // First get all open orders, then cancel them
     let path = "/api/v3/brokerage/orders/historical/batch?order_status=OPEN&limit=250";
     let host = state.api_host();
     let jwt = match build_jwt(&state.api_key, &state.api_secret, "GET", host, path) {
         Ok(j) => j,
         Err(e) => {
-            send_error(bot_write, "cancel_all", req_id, &format!("JWT error: {}", e)).await;
+            tracing::error!(error = %e, "cancel_all_orders: JWT error");
             return;
         }
     };
@@ -657,7 +690,7 @@ async fn handle_cancel_all(
     {
         Ok(r) => r,
         Err(e) => {
-            send_error(bot_write, "cancel_all", req_id, &format!("REST error: {}", e)).await;
+            tracing::error!(error = %e, "cancel_all_orders: REST error");
             return;
         }
     };
@@ -665,7 +698,7 @@ async fn handle_cancel_all(
     let data: serde_json::Value = match resp.json().await {
         Ok(d) => d,
         Err(e) => {
-            send_error(bot_write, "cancel_all", req_id, &format!("Parse error: {}", e)).await;
+            tracing::error!(error = %e, "cancel_all_orders: parse error");
             return;
         }
     };
@@ -680,13 +713,13 @@ async fn handle_cancel_all(
         })
         .unwrap_or_default();
 
-    tracing::info!(count = order_ids.len(), "cancel_all: found open orders to cancel");
+    tracing::info!(count = order_ids.len(), "cancel_all_orders: found open orders to cancel");
 
     if !order_ids.is_empty() {
         let body = serde_json::json!({"order_ids": order_ids});
         match state.rest_post("/api/v3/brokerage/orders/batch_cancel", &body).await {
-            Ok(_) => tracing::info!("cancel_all: batch cancel succeeded"),
-            Err(e) => tracing::error!(error = %e, "cancel_all: batch cancel failed"),
+            Ok(_) => tracing::info!("cancel_all_orders: batch cancel succeeded"),
+            Err(e) => tracing::error!(error = %e, "cancel_all_orders: batch cancel failed"),
         }
     }
 
@@ -696,10 +729,20 @@ async fn handle_cancel_all(
         let count = map.len();
         map.clear();
         if count > 0 {
-            tracing::debug!(cleared = count, "cancel_all: cleared order_id_map");
+            tracing::debug!(cleared = count, "cancel_all_orders: cleared order_id_map");
         }
     }
+}
 
+/// Handle cancel_all: cancel all open orders via Coinbase REST
+async fn handle_cancel_all(
+    parsed: &serde_json::Value,
+    state: &CoinbaseWsState,
+    bot_write: &Arc<Mutex<BotWriter>>,
+    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+) {
+    let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
+    cancel_all_orders(state, order_id_map).await;
     let response = translate::order_response_success("cancel_all", req_id, "", "");
     let mut writer = bot_write.lock().await;
     let _ = writer.send(ws::Message::Text(response.into())).await;

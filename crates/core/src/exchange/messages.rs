@@ -3,7 +3,7 @@ use serde::{Serialize, Serializer};
 
 // Re-export protocol types and parser from trading-primitives.
 pub use trading_primitives::protocol::{
-    WsMessage, ExecReport, ExchangeCapabilities, parse_ws_message,
+    WsMessage, ExecReport, parse_ws_message,
     // Builder functions (used by proxies, re-exported for convenience).
     build_book_message, build_book_level,
     build_execution_update, build_execution_snapshot, build_exec_report,

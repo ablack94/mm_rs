@@ -41,7 +41,7 @@ pub fn build_coinbase_rest_router(state: Arc<CoinbaseRestState>) -> Router {
 }
 
 async fn capabilities() -> (StatusCode, Json<Value>) {
-    (StatusCode::OK, Json(json!({"dead_man_switch": false})))
+    (StatusCode::OK, Json(json!({"dead_man_switch": true})))
 }
 
 async fn health() -> (StatusCode, Json<Value>) {

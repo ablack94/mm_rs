@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
-use trading_primitives::{ExchangeCapabilities, Ticker};
+use trading_primitives::Ticker;
 use crate::traits::ExchangeClient;
 use crate::types::PairInfo;
 use crate::types::ticker::TickerData;
@@ -39,13 +39,6 @@ impl ProxyClient {
             .await?;
         check_error(&resp)?;
         Ok(resp)
-    }
-
-    /// Query the proxy's capabilities (DMS support, etc.).
-    pub async fn get_capabilities(&self) -> Result<ExchangeCapabilities> {
-        let resp = self.proxy_get("/capabilities").await?;
-        let caps: ExchangeCapabilities = serde_json::from_value(resp)?;
-        Ok(caps)
     }
 
     /// Send a GET to the proxy, which forwards to the exchange's public API.
