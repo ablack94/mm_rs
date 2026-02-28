@@ -93,12 +93,13 @@ The bot never sees API keys (proxy holds them).
 - `proxy-coinbase` — Coinbase HMAC-SHA256 signing, REST↔WS translation, pair format conversion (BTC-USD ↔ BTC/USD)
 
 ## Key Types
-- `TickerData` → `types/ticker.rs`
-- `PairInfo` → `types/pair.rs` (decimals, minimums, fees)
-- `Position` → `types/position.rs` (qty, avg_cost, realized_pnl)
-- `OrderState` → `types/order.rs` (price, qty, side, acked status)
-- `Fill` → `types/fill.rs`
-- `BookLevel` → `types/book.rs`
+- `Symbol` → `trading-primitives/src/symbol.rs` (newtype for currency: "BTC", "USD")
+- `Ticker` → `trading-primitives/src/symbol.rs` (trading pair: base/quote Symbol, e.g. "BTC/USD")
+- `PairInfo` → `trading-primitives/src/pair.rs` (decimals, minimums, fees; field `pair: Ticker`)
+- `Position` → `trading-primitives/src/position.rs` (qty, avg_cost, realized_pnl)
+- `OrderRequest` → `trading-primitives/src/order.rs` (price, qty, side; field `pair: Ticker`)
+- `Fill` → `trading-primitives/src/fill.rs` (field `pair: Ticker`)
+- `BookLevel` / `Spread` → `trading-primitives/src/book.rs`
 
 ## Config Defaults
 | Parameter | Default | Description |

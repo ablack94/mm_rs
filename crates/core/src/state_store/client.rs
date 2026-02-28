@@ -28,7 +28,7 @@ pub enum StateStoreCommand {
     /// A single pair was updated.
     PairUpdated(super::messages::PairRecord),
     /// A pair was removed -- engine should cancel orders and stop quoting.
-    PairRemoved { symbol: String },
+    PairRemoved { pair: trading_primitives::Ticker },
     /// Global defaults changed.
     DefaultsUpdated(crate::types::GlobalDefaults),
 }
@@ -60,7 +60,7 @@ impl Default for StateStoreConfig {
 /// Data for a single pair report, collected from the engine.
 #[derive(Debug, Clone)]
 pub struct PairReportData {
-    pub symbol: String,
+    pub pair: trading_primitives::Ticker,
     pub position_qty: Decimal,
     pub position_avg_cost: Decimal,
     pub exposure_usd: Decimal,
@@ -257,7 +257,7 @@ impl StateStoreClient {
                     if let Some(ref snap) = latest_snapshot {
                         for report in &snap.pair_reports {
                             let msg = BotMessage::PairReport {
-                                symbol: report.symbol.clone(),
+                                pair: report.pair.clone(),
                                 position_qty: report.position_qty,
                                 position_avg_cost: report.position_avg_cost,
                                 exposure_usd: report.exposure_usd,
@@ -290,7 +290,7 @@ impl StateStoreClient {
                 );
                 for p in &pairs {
                     tracing::info!(
-                        symbol = p.symbol,
+                        pair = %p.pair,
                         state = ?p.state,
                         "  pair in snapshot"
                     );
@@ -302,7 +302,7 @@ impl StateStoreClient {
             }
             StateStoreMessage::PairUpdated { pair } => {
                 tracing::info!(
-                    symbol = pair.symbol,
+                    pair = %pair.pair,
                     state = ?pair.state,
                     "Received pair_updated from state store"
                 );
@@ -311,10 +311,10 @@ impl StateStoreClient {
                     .await
                     .map_err(|_| anyhow::anyhow!("Engine command channel closed"))?;
             }
-            StateStoreMessage::PairRemoved { symbol } => {
-                tracing::info!(symbol, "Received pair_removed from state store");
+            StateStoreMessage::PairRemoved { pair } => {
+                tracing::info!(pair = %pair, "Received pair_removed from state store");
                 self.cmd_tx
-                    .send(StateStoreCommand::PairRemoved { symbol })
+                    .send(StateStoreCommand::PairRemoved { pair })
                     .await
                     .map_err(|_| anyhow::anyhow!("Engine command channel closed"))?;
             }

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::book::LevelUpdate;
+use crate::symbol::Ticker;
 
 // ---------------------------------------------------------------------------
 // Exchange capabilities (proxy → bot, queried at startup via REST)
@@ -39,12 +40,12 @@ impl Default for ExchangeCapabilities {
 #[derive(Debug)]
 pub enum WsMessage {
     BookSnapshot {
-        symbol: String,
+        pair: Ticker,
         bids: Vec<LevelUpdate>,
         asks: Vec<LevelUpdate>,
     },
     BookUpdate {
-        symbol: String,
+        pair: Ticker,
         bid_updates: Vec<LevelUpdate>,
         ask_updates: Vec<LevelUpdate>,
     },
@@ -72,7 +73,7 @@ pub struct ExecReport {
     pub exec_type: String,
     pub order_id: String,
     pub cl_ord_id: String,
-    pub symbol: String,
+    pub pair: Ticker,
     pub side: String,
     pub last_qty: Decimal,
     pub last_price: Decimal,
@@ -122,14 +123,14 @@ fn parse_book(v: &Value) -> WsMessage {
         Some(d) => d,
         None => return WsMessage::Unknown(v.to_string()),
     };
-    let symbol = data["symbol"].as_str().unwrap_or("").to_string();
+    let pair = Ticker::from(data["symbol"].as_str().unwrap_or(""));
     let bids = parse_levels(&data["bids"]);
     let asks = parse_levels(&data["asks"]);
 
     match msg_type {
-        "snapshot" => WsMessage::BookSnapshot { symbol, bids, asks },
+        "snapshot" => WsMessage::BookSnapshot { pair, bids, asks },
         "update" => WsMessage::BookUpdate {
-            symbol,
+            pair,
             bid_updates: bids,
             ask_updates: asks,
         },
@@ -194,7 +195,7 @@ fn parse_single_exec(data: &Value) -> Option<ExecReport> {
         exec_type: data["exec_type"].as_str().unwrap_or("").to_string(),
         order_id: data["order_id"].as_str().unwrap_or("").to_string(),
         cl_ord_id: data["cl_ord_id"].as_str().unwrap_or("").to_string(),
-        symbol: data["symbol"].as_str().unwrap_or("").to_string(),
+        pair: Ticker::from(data["symbol"].as_str().unwrap_or("")),
         side: data["side"].as_str().unwrap_or("").to_string(),
         last_qty: Decimal::try_from(data["last_qty"].as_f64().unwrap_or(0.0)).unwrap_or_default(),
         last_price: Decimal::try_from(data["last_price"].as_f64().unwrap_or(0.0)).unwrap_or_default(),
@@ -382,8 +383,8 @@ mod tests {
         }"#;
         let msg = parse_ws_message(raw);
         match msg {
-            WsMessage::BookSnapshot { symbol, bids, asks } => {
-                assert_eq!(symbol, "CAMP/USD");
+            WsMessage::BookSnapshot { pair, bids, asks } => {
+                assert_eq!(pair, Ticker::from("CAMP/USD"));
                 assert_eq!(bids.len(), 2);
                 assert_eq!(asks.len(), 2);
                 assert_eq!(bids[0].price, dec!(0.0039));
@@ -407,8 +408,8 @@ mod tests {
         }"#;
         let msg = parse_ws_message(raw);
         match msg {
-            WsMessage::BookUpdate { symbol, bid_updates, ask_updates } => {
-                assert_eq!(symbol, "BTC/USD");
+            WsMessage::BookUpdate { pair, bid_updates, ask_updates } => {
+                assert_eq!(pair, Ticker::from("BTC/USD"));
                 assert_eq!(bid_updates.len(), 1);
                 assert_eq!(ask_updates.len(), 1);
             }
@@ -471,7 +472,7 @@ mod tests {
         match msg {
             WsMessage::ExecutionSnapshot(trades) => {
                 assert_eq!(trades.len(), 1);
-                assert_eq!(trades[0].symbol, "ETH/USD");
+                assert_eq!(trades[0].pair, Ticker::from("ETH/USD"));
             }
             other => panic!("Expected ExecutionSnapshot, got {:?}", other),
         }
@@ -582,8 +583,8 @@ mod tests {
             vec![build_book_level(50001.0, 0.8)],
         );
         match parse_ws_message(&msg) {
-            WsMessage::BookSnapshot { symbol, bids, asks } => {
-                assert_eq!(symbol, "BTC/USD");
+            WsMessage::BookSnapshot { pair, bids, asks } => {
+                assert_eq!(pair, Ticker::from("BTC/USD"));
                 assert_eq!(bids.len(), 1);
                 assert_eq!(asks.len(), 1);
             }

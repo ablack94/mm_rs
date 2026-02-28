@@ -3,10 +3,10 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
+use trading_primitives::{ExchangeCapabilities, Ticker};
 use crate::traits::ExchangeClient;
 use crate::types::PairInfo;
 use crate::types::ticker::TickerData;
-use trading_primitives::ExchangeCapabilities;
 
 /// Exchange client that routes requests through the proxy.
 /// The proxy holds the actual API keys and signs requests.
@@ -78,7 +78,7 @@ impl ExchangeClient for ProxyClient {
         Ok("proxy-managed".to_string())
     }
 
-    async fn get_pair_info(&self, target_symbols: &[String]) -> Result<HashMap<String, PairInfo>> {
+    async fn get_pair_info(&self, target_symbols: &[Ticker]) -> Result<HashMap<Ticker, PairInfo>> {
         if target_symbols.is_empty() {
             return Ok(HashMap::new());
         }
@@ -103,7 +103,7 @@ impl ExchangeClient for ProxyClient {
 
         let mut pairs = HashMap::new();
         for symbol in target_symbols {
-            if let Some((rest_key, info)) = ws_lookup.get(symbol) {
+            if let Some((rest_key, info)) = ws_lookup.get(&symbol.to_string()) {
                 let fees_maker = info["fees_maker"]
                     .as_array()
                     .and_then(|a| a.first())
@@ -120,25 +120,25 @@ impl ExchangeClient for ProxyClient {
                 pairs.insert(
                     symbol.clone(),
                     PairInfo {
-                        symbol: symbol.clone(),
+                        pair: symbol.clone(),
                         rest_key: rest_key.to_string(),
                         min_order_qty: parse_decimal_field(info, "ordermin"),
                         min_cost: parse_decimal_field(info, "costmin"),
                         price_decimals: info["pair_decimals"].as_u64().unwrap_or(8) as u32,
                         qty_decimals: info["lot_decimals"].as_u64().unwrap_or(8) as u32,
                         maker_fee_pct: Decimal::try_from(fees_maker).unwrap_or_default(),
-                        base_asset,
+                        exchange_base_asset: base_asset,
                     },
                 );
             } else {
-                tracing::warn!(symbol, "Pair not found in AssetPairs");
+                tracing::warn!(pair = %symbol, "Pair not found in AssetPairs");
             }
         }
 
         Ok(pairs)
     }
 
-    async fn get_tickers(&self, pair_info: &HashMap<String, PairInfo>) -> Result<HashMap<String, TickerData>> {
+    async fn get_tickers(&self, pair_info: &HashMap<Ticker, PairInfo>) -> Result<HashMap<Ticker, TickerData>> {
         let rest_keys: Vec<&str> = pair_info.values().map(|pi| pi.rest_key.as_str()).collect();
         let pair_param = rest_keys.join(",");
 
@@ -151,15 +151,15 @@ impl ExchangeClient for ProxyClient {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Invalid Ticker response"))?;
 
-        let rest_to_ws: HashMap<&str, &str> = pair_info
+        let rest_to_ws: HashMap<&str, &Ticker> = pair_info
             .iter()
-            .map(|(ws_sym, pi)| (pi.rest_key.as_str(), ws_sym.as_str()))
+            .map(|(ws_sym, pi)| (pi.rest_key.as_str(), ws_sym))
             .collect();
 
         let mut tickers = HashMap::new();
         for (rest_key, data) in result {
             let ws_symbol = match rest_to_ws.get(rest_key.as_str()) {
-                Some(s) => s.to_string(),
+                Some(t) => (*t).clone(),
                 None => continue,
             };
 

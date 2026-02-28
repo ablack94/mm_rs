@@ -90,12 +90,12 @@ impl EdgeTracker {
     pub fn record_trade(&mut self, trade: &PnlTrade) {
         self.trades.push_back(trade.clone());
         self.last_trade_per_pair
-            .insert(trade.symbol.clone(), trade.timestamp);
+            .insert(trade.pair.to_string(), trade.timestamp);
 
         // Update cumulative stats
         let stats = self
             .cumulative
-            .entry(trade.symbol.clone())
+            .entry(trade.pair.to_string())
             .or_default();
         stats.realized_pnl += trade.pnl;
         stats.total_fees += trade.fee;
@@ -124,7 +124,7 @@ impl EdgeTracker {
         edge.last_trade_at = self.last_trade_per_pair.get(symbol).copied();
 
         for trade in &self.trades {
-            if trade.symbol != symbol || trade.timestamp < cutoff {
+            if trade.pair.to_string() != symbol || trade.timestamp < cutoff {
                 continue;
             }
             let notional = trade.price * trade.qty;

@@ -67,21 +67,21 @@ impl EventSource for ReplaySource {
             let msg = parse_ws_message(&recorded.raw);
             let event = match msg {
                 WsMessage::BookSnapshot {
-                    symbol,
+                    pair,
                     bids,
                     asks,
                 } => Some(EngineEvent::BookSnapshot {
-                    symbol,
+                    pair,
                     bids,
                     asks,
                     timestamp: recorded.timestamp,
                 }),
                 WsMessage::BookUpdate {
-                    symbol,
+                    pair,
                     bid_updates,
                     ask_updates,
                 } => Some(EngineEvent::BookUpdate {
-                    symbol,
+                    pair,
                     bid_updates,
                     ask_updates,
                     timestamp: recorded.timestamp,
@@ -96,7 +96,7 @@ impl EventSource for ReplaySource {
                         "trade" | "filled" => Some(EngineEvent::Fill(Fill {
                             order_id: report.order_id,
                             cl_ord_id: report.cl_ord_id,
-                            symbol: report.symbol,
+                            pair: report.pair,
                             side,
                             price: report.last_price,
                             qty: report.last_qty,

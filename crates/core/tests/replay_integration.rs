@@ -16,6 +16,7 @@ use kraken_core::exchange::replay::ReplaySource;
 use kraken_core::state::bot_state::BotState;
 use kraken_core::traits::EventSource;
 use kraken_core::types::*;
+use trading_primitives::Ticker;
 
 const DATA_PATH: &str = "../../test_data/recorded.jsonl";
 
@@ -36,14 +37,14 @@ fn test_config(pairs: Vec<String>) -> Config {
 
 fn test_pair_info(symbol: &str) -> PairInfo {
     PairInfo {
-        symbol: symbol.to_string(),
+        pair: Ticker::from(symbol),
         rest_key: symbol.replace('/', ""),
         min_order_qty: dec!(1),
         min_cost: dec!(0.5),
         price_decimals: 7,
         qty_decimals: 5,
         maker_fee_pct: dec!(0.0023),
-        base_asset: symbol.split('/').next().unwrap_or("").to_string(),
+        exchange_base_asset: symbol.split('/').next().unwrap_or("").to_string(),
     }
 }
 
@@ -55,10 +56,10 @@ fn default_pairs() -> Vec<String> {
     ]
 }
 
-fn default_pair_info_map() -> HashMap<String, PairInfo> {
+fn default_pair_info_map() -> HashMap<Ticker, PairInfo> {
     let mut m = HashMap::new();
     for p in &default_pairs() {
-        m.insert(p.clone(), test_pair_info(p));
+        m.insert(Ticker::from(p.as_str()), test_pair_info(p));
     }
     m
 }
@@ -74,7 +75,7 @@ struct RecordedMessage {
 fn run_sync_replay(
     path: &str,
     config: Config,
-    pair_info: HashMap<String, PairInfo>,
+    pair_info: HashMap<Ticker, PairInfo>,
     state: BotState,
 ) -> (Engine, Vec<EngineCommand>) {
     let mut engine = Engine::new(config, pair_info, state);
@@ -95,20 +96,20 @@ fn run_sync_replay(
 
         let msg = parse_ws_message(&recorded.raw);
         let event = match msg {
-            WsMessage::BookSnapshot { symbol, bids, asks } => {
+            WsMessage::BookSnapshot { pair, bids, asks } => {
                 Some(EngineEvent::BookSnapshot {
-                    symbol,
+                    pair,
                     bids,
                     asks,
                     timestamp: recorded.timestamp,
                 })
             }
             WsMessage::BookUpdate {
-                symbol,
+                pair,
                 bid_updates,
                 ask_updates,
             } => Some(EngineEvent::BookUpdate {
-                symbol,
+                pair,
                 bid_updates,
                 ask_updates,
                 timestamp: recorded.timestamp,
@@ -181,7 +182,8 @@ async fn replay_async_through_channels() {
 
     // Verify book state
     for symbol in &["CAMP/USD", "SUP/USD", "MIM/USD"] {
-        let book = engine.books().get(*symbol).expect("Book should exist");
+        let ticker = Ticker::from(*symbol);
+        let book = engine.books().get(&ticker).expect("Book should exist");
         let bid = book.best_bid().expect("Should have bids").price;
         let ask = book.best_ask().expect("Should have asks").price;
         assert!(bid < ask, "{symbol} bid {bid} >= ask {ask}");
@@ -207,7 +209,7 @@ fn no_sells_without_inventory() {
         sell_orders.len(),
         sell_orders
             .iter()
-            .map(|o| format!("{} {} @ {}", o.symbol, o.side, o.price))
+            .map(|o| format!("{} {} @ {}", o.pair, o.side, o.price))
             .collect::<Vec<_>>()
     );
 }
@@ -233,22 +235,21 @@ fn cold_start_only_buys_with_valid_prices() {
             OrderSide::Buy,
             "Cold start should only place buys, got {} for {}",
             order.side,
-            order.symbol
+            order.pair
         );
 
         // Valid price and qty
         assert!(order.price > Decimal::ZERO, "Price must be > 0: {:?}", order);
         assert!(order.qty > Decimal::ZERO, "Qty must be > 0: {:?}", order);
-        assert!(!order.symbol.is_empty(), "Symbol must not be empty");
         assert!(!order.cl_ord_id.is_empty(), "cl_ord_id must not be empty");
 
         // Bid should be below best ask (post-only safe)
-        if let Some(book) = engine.books().get(&order.symbol) {
+        if let Some(book) = engine.books().get(&order.pair) {
             if let Some(level) = book.best_ask() {
                 assert!(
                     order.price < level.price,
                     "{} bid {} would cross best ask {}",
-                    order.symbol,
+                    order.pair,
                     order.price,
                     level.price
                 );
@@ -258,10 +259,11 @@ fn cold_start_only_buys_with_valid_prices() {
 
     // Should have orders for each pair (all 3 have wide spreads)
     let symbols_with_orders: std::collections::HashSet<_> =
-        orders.iter().map(|o| o.symbol.as_str()).collect();
+        orders.iter().map(|o| &o.pair).collect();
     for pair in &["CAMP/USD", "SUP/USD", "MIM/USD"] {
+        let ticker = Ticker::from(*pair);
         assert!(
-            symbols_with_orders.contains(pair),
+            symbols_with_orders.contains(&ticker),
             "Expected orders for {pair}, only got: {:?}",
             symbols_with_orders
         );
@@ -280,7 +282,7 @@ fn with_inventory_places_sells() {
     for symbol in &["CAMP/USD", "SUP/USD", "MIM/USD"] {
         let mut pos = Position::default();
         pos.apply_buy(dec!(50000), dec!(0.001)); // $50 worth at current prices
-        state.positions.insert(symbol.to_string(), pos);
+        state.positions.insert(Ticker::from(*symbol), pos);
     }
 
     let mut config = test_config(default_pairs());
@@ -300,14 +302,14 @@ fn with_inventory_places_sells() {
         "With inventory below max, should still place buy orders"
     );
 
-    // All sell prices should be above all buy prices for the same symbol
+    // All sell prices should be above all buy prices for the same pair
     for sell in &sell_orders {
         for buy in &buy_orders {
-            if sell.symbol == buy.symbol {
+            if sell.pair == buy.pair {
                 assert!(
                     sell.price > buy.price,
                     "{}: sell {} should be > buy {}",
-                    sell.symbol,
+                    sell.pair,
                     sell.price,
                     buy.price
                 );
@@ -334,7 +336,7 @@ fn replay_is_deterministic() {
     for (i, (c1, c2)) in cmds1.iter().zip(cmds2.iter()).enumerate() {
         match (c1, c2) {
             (EngineCommand::PlaceOrder(r1), EngineCommand::PlaceOrder(r2)) => {
-                assert_eq!(r1.symbol, r2.symbol, "Cmd {i}: symbol");
+                assert_eq!(r1.pair, r2.pair, "Cmd {i}: pair");
                 assert_eq!(r1.side, r2.side, "Cmd {i}: side");
                 assert_eq!(r1.price, r2.price, "Cmd {i}: price");
                 assert_eq!(r1.qty, r2.qty, "Cmd {i}: qty");
@@ -456,11 +458,11 @@ fn order_qty_meets_minimums() {
 
     for cmd in &commands {
         if let EngineCommand::PlaceOrder(req) = cmd {
-            if let Some(info) = pair_info.get(&req.symbol) {
+            if let Some(info) = pair_info.get(&req.pair) {
                 assert!(
                     req.qty >= info.min_order_qty,
                     "{}: qty {} < min {}",
-                    req.symbol,
+                    req.pair,
                     req.qty,
                     info.min_order_qty
                 );

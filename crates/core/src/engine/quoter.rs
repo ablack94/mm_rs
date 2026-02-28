@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use trading_primitives::Ticker;
 use crate::config::TradingConfig;
 use crate::types::PairInfo;
 
@@ -15,7 +16,7 @@ pub enum QuoteState {
 /// Per-pair quoting state and logic.
 #[derive(Debug, Clone)]
 pub struct Quoter {
-    pub symbol: String,
+    pub pair: Ticker,
     pub state: QuoteState,
     pub bid_cl_ord_id: Option<String>,
     pub ask_cl_ord_id: Option<String>,
@@ -24,9 +25,9 @@ pub struct Quoter {
 }
 
 impl Quoter {
-    pub fn new(symbol: String) -> Self {
+    pub fn new(pair: Ticker) -> Self {
         Self {
-            symbol,
+            pair,
             state: QuoteState::Idle,
             bid_cl_ord_id: None,
             ask_cl_ord_id: None,
@@ -190,9 +191,9 @@ mod tests {
 
     fn test_pair_info() -> PairInfo {
         PairInfo {
-            symbol: "TEST/USD".into(),
+            pair: "TEST/USD".into(),
             rest_key: "TESTUSD".into(),
-            base_asset: "TEST".into(),
+            exchange_base_asset: "TEST".into(),
             price_decimals: 5,
             qty_decimals: 5,
             min_order_qty: dec!(10),

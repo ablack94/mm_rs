@@ -10,6 +10,7 @@ use std::str::FromStr;
 use kraken_core::pnl::tracker::PnlTracker;
 use kraken_core::types::fill::Fill;
 use kraken_core::types::order::OrderSide;
+use trading_primitives::Ticker;
 
 #[derive(Parser)]
 #[command(
@@ -120,7 +121,7 @@ async fn main() -> Result<()> {
             let fill = Fill {
                 order_id: trade["ordertxid"].as_str().unwrap_or("").to_string(),
                 cl_ord_id: txid.clone(),
-                symbol,
+                pair: Ticker::from(symbol.as_str()),
                 side,
                 price,
                 qty,
@@ -163,7 +164,7 @@ async fn main() -> Result<()> {
         if matches!(fill.side, OrderSide::Sell) {
             let held = tracker
                 .positions
-                .get(&fill.symbol)
+                .get(&fill.pair)
                 .map(|p| p.qty)
                 .unwrap_or(Decimal::ZERO);
             if held < fill.qty {
@@ -171,7 +172,7 @@ async fn main() -> Result<()> {
                 let seed = Fill {
                     order_id: String::new(),
                     cl_ord_id: String::new(),
-                    symbol: fill.symbol.clone(),
+                    pair: fill.pair.clone(),
                     side: OrderSide::Buy,
                     price: fill.price,
                     qty: shortfall,
@@ -181,7 +182,7 @@ async fn main() -> Result<()> {
                     timestamp: fill.timestamp,
                 };
                 tracing::warn!(
-                    symbol = fill.symbol,
+                    pair = %fill.pair,
                     shortfall = %shortfall,
                     price = %fill.price,
                     "Seeding cost basis for pre-bootstrap position (PnL will be 0 for this sell)"
@@ -198,7 +199,7 @@ async fn main() -> Result<()> {
     }
 
     // Step 5: Print summary
-    let prices = HashMap::new();
+    let prices: HashMap<Ticker, Decimal> = HashMap::new();
     let summary = tracker.summary(&prices);
     tracing::info!(
         realized_pnl = %summary.realized_pnl,
@@ -210,7 +211,7 @@ async fn main() -> Result<()> {
 
     for (sym, pos) in &summary.positions {
         tracing::info!(
-            symbol = sym,
+            pair = %sym,
             qty = %pos.qty,
             avg_cost = %pos.avg_cost,
             "Open position"

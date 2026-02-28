@@ -28,6 +28,7 @@ use kraken_core::pnl::tracker::{PnlTrade, PnlTracker};
 use kraken_core::traits::ExchangeClient;
 use kraken_core::types::fill::Fill;
 use kraken_core::types::order::OrderSide;
+use trading_primitives::Ticker;
 
 use crate::config::AnalyzerConfig;
 use crate::edge::EdgeTracker;
@@ -63,7 +64,7 @@ struct Args {
 struct AppState {
     tracker: RwLock<PnlTracker>,
     edge_tracker: RwLock<EdgeTracker>,
-    prices: RwLock<HashMap<String, Decimal>>,
+    prices: RwLock<HashMap<Ticker, Decimal>>,
     seen_order_ids: RwLock<HashSet<String>>,
     pnl_state_file: PathBuf,
     analyzer_state_file: PathBuf,
@@ -300,7 +301,7 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
         if !seen.insert(dedup_key) {
             tracing::debug!(
                 order_id = report.order_id,
-                symbol = report.symbol,
+                pair = %report.pair,
                 "Skipping duplicate fill"
             );
             return;
@@ -320,7 +321,7 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
     let fill = Fill {
         order_id: report.order_id,
         cl_ord_id: report.cl_ord_id,
-        symbol: report.symbol.clone(),
+        pair: report.pair.clone(),
         side,
         price: report.last_price,
         qty: report.last_qty,
@@ -331,7 +332,7 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
     };
 
     tracing::info!(
-        symbol = fill.symbol,
+        pair = %fill.pair,
         side = %fill.side,
         price = %fill.price,
         qty = %fill.qty,
@@ -343,7 +344,7 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
     let pnl;
     {
         let mut tracker = shared.tracker.write().await;
-        let pos = tracker.positions.get(&fill.symbol);
+        let pos = tracker.positions.get(&fill.pair);
         pnl = match fill.side {
             OrderSide::Sell => {
                 let avg_cost = pos.map(|p| p.avg_cost).unwrap_or_default();
@@ -364,7 +365,7 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
         .prices
         .write()
         .await
-        .insert(fill.symbol.clone(), fill.price);
+        .insert(fill.pair.clone(), fill.price);
 
     // Track last fill time for staleness detection
     {
@@ -375,7 +376,7 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
     // Record in edge tracker
     let trade = PnlTrade {
         timestamp: fill.timestamp,
-        symbol: fill.symbol,
+        pair: fill.pair,
         side: fill.side.to_string(),
         price: fill.price,
         qty: fill.qty,
@@ -739,7 +740,7 @@ async fn get_trades(
             let value = t.price * t.qty;
             json!({
                 "timestamp": t.timestamp,
-                "symbol": t.symbol,
+                "symbol": t.pair.to_string(),
                 "side": t.side,
                 "price": t.price,
                 "qty": t.qty,
@@ -807,13 +808,14 @@ async fn get_pair_detail(
 
     // Support both OMG-USD and OMG/USD in the URL
     let symbol = symbol_raw.replace('-', "/");
+    let ticker = Ticker::from(symbol.as_str());
 
     let et = shared.edge_tracker.read().await;
     let tracker = shared.tracker.read().await;
     let prices = shared.prices.read().await;
 
     let last_trade = et.last_trade_time(&symbol);
-    if last_trade.is_none() && !tracker.positions.contains_key(&symbol) {
+    if last_trade.is_none() && !tracker.positions.contains_key(&ticker) {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "pair not found"})),
@@ -835,8 +837,8 @@ async fn get_pair_detail(
         })
         .collect();
 
-    let position = tracker.positions.get(&symbol).map(|pos| {
-        let current_price = prices.get(&symbol).copied().unwrap_or_default();
+    let position = tracker.positions.get(&ticker).map(|pos| {
+        let current_price = prices.get(&ticker).copied().unwrap_or_default();
         json!({
             "qty": pos.qty,
             "avg_cost": pos.avg_cost,

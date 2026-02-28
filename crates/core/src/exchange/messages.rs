@@ -154,6 +154,7 @@ pub struct PingMsg {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+    use trading_primitives::Ticker;
 
     #[test]
     fn test_book_snapshot_parsing() {
@@ -175,8 +176,8 @@ mod tests {
         }"#;
         let msg = parse_ws_message(raw);
         match msg {
-            WsMessage::BookSnapshot { symbol, bids, asks } => {
-                assert_eq!(symbol, "CAMP/USD");
+            WsMessage::BookSnapshot { pair, bids, asks } => {
+                assert_eq!(pair, Ticker::from("CAMP/USD"));
                 assert_eq!(bids.len(), 2);
                 assert_eq!(asks.len(), 2);
                 assert_eq!(bids[0].price, dec!(0.0039));
@@ -206,8 +207,8 @@ mod tests {
         }"#;
         let msg = parse_ws_message(raw);
         match msg {
-            WsMessage::BookUpdate { symbol, bid_updates, ask_updates } => {
-                assert_eq!(symbol, "BTC/USD");
+            WsMessage::BookUpdate { pair, bid_updates, ask_updates } => {
+                assert_eq!(pair, Ticker::from("BTC/USD"));
                 assert_eq!(bid_updates.len(), 1);
                 assert_eq!(ask_updates.len(), 1);
                 assert_eq!(bid_updates[0].price, dec!(97500.0));
@@ -244,7 +245,7 @@ mod tests {
                 assert_eq!(report.exec_type, "trade");
                 assert_eq!(report.order_id, "ORD-ABC-123");
                 assert_eq!(report.cl_ord_id, "mm_buy_camp_001");
-                assert_eq!(report.symbol, "CAMP/USD");
+                assert_eq!(report.pair, Ticker::from("CAMP/USD"));
                 assert_eq!(report.side, "buy");
                 assert_eq!(report.last_qty, dec!(10000.0));
                 assert_eq!(report.last_price, dec!(0.0039));
@@ -280,7 +281,7 @@ mod tests {
             WsMessage::ExecutionSnapshot(trades) => {
                 assert_eq!(trades.len(), 1);
                 assert_eq!(trades[0].order_id, "ORD-OLD-999");
-                assert_eq!(trades[0].symbol, "ETH/USD");
+                assert_eq!(trades[0].pair, Ticker::from("ETH/USD"));
             }
             other => panic!("Expected ExecutionSnapshot, got {:?}", other),
         }

@@ -1265,6 +1265,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trading-primitives",
 ]
 
 [[package]]

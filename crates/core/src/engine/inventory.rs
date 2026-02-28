@@ -1,5 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use trading_primitives::Ticker;
 use crate::state::bot_state::BotState;
 
 /// Compute inventory skew for a pair.
@@ -11,14 +12,14 @@ use crate::state::bot_state::BotState;
 /// Used to shift quotes: positive skew tightens bid, widens ask.
 pub fn inventory_skew(
     state: &BotState,
-    symbol: &str,
+    pair: &Ticker,
     current_price: Decimal,
     max_inventory_usd: Decimal,
 ) -> Decimal {
     if max_inventory_usd.is_zero() {
         return Decimal::ONE;
     }
-    let exposure = state.pair_exposure_usd(symbol, current_price);
+    let exposure = state.pair_exposure_usd(pair, current_price);
     let skew = Decimal::ONE - (dec!(2) * exposure / max_inventory_usd);
     skew.max(dec!(-1)).min(Decimal::ONE)
 }
@@ -31,31 +32,31 @@ mod tests {
     #[test]
     fn test_no_position_skew_is_one() {
         let state = BotState::default();
-        let skew = inventory_skew(&state, "TEST/USD", dec!(100), dec!(200));
+        let skew = inventory_skew(&state, &Ticker::from("TEST/USD"), dec!(100), dec!(200));
         assert_eq!(skew, Decimal::ONE);
     }
 
     #[test]
     fn test_half_inventory_skew_is_zero() {
         let mut state = BotState::default();
-        state.positions.insert("TEST/USD".into(), Position {
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
             qty: dec!(1),
             avg_cost: dec!(100),
         });
         // exposure = 1 * 100 = 100, max = 200
         // skew = 1 - 2*100/200 = 1 - 1 = 0
-        let skew = inventory_skew(&state, "TEST/USD", dec!(100), dec!(200));
+        let skew = inventory_skew(&state, &Ticker::from("TEST/USD"), dec!(100), dec!(200));
         assert_eq!(skew, Decimal::ZERO);
     }
 
     #[test]
     fn test_full_inventory_skew_is_negative_one() {
         let mut state = BotState::default();
-        state.positions.insert("TEST/USD".into(), Position {
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
             qty: dec!(2),
             avg_cost: dec!(100),
         });
-        let skew = inventory_skew(&state, "TEST/USD", dec!(100), dec!(200));
+        let skew = inventory_skew(&state, &Ticker::from("TEST/USD"), dec!(100), dec!(200));
         assert_eq!(skew, dec!(-1));
     }
 }

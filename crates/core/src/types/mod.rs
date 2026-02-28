@@ -16,4 +16,5 @@ pub use command::*;
 pub use fill::*;
 pub use position::Position;
 pub use ticker::TickerData;
+pub use trading_primitives::Ticker;
 pub use managed_pair::{PairState, PairConfig, GlobalDefaults, ResolvedConfig, ManagedPair};

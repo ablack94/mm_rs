@@ -163,7 +163,7 @@ pub async fn send_add_order(
         params: AddOrderParams {
             order_type,
             side: request.side.to_string(),
-            symbol: request.symbol.clone(),
+            symbol: request.pair.to_string(),
             limit_price: request.price,
             order_qty: request.qty,
             post_only: if request.market { false } else { request.post_only },

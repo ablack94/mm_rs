@@ -540,8 +540,8 @@ mod tests {
         let result = coinbase_book_to_kraken(&coinbase).unwrap();
         // Verify it parses correctly through the protocol parser
         match parse_ws_message(&result) {
-            WsMessage::BookSnapshot { symbol, bids, asks } => {
-                assert_eq!(symbol, "BTC/USDC");
+            WsMessage::BookSnapshot { pair, bids, asks } => {
+                assert_eq!(pair.to_string(), "BTC/USDC");
                 assert_eq!(bids.len(), 2);
                 assert_eq!(asks.len(), 1);
             }
@@ -565,8 +565,8 @@ mod tests {
 
         let result = coinbase_book_to_kraken(&coinbase).unwrap();
         match parse_ws_message(&result) {
-            WsMessage::BookUpdate { symbol, .. } => {
-                assert_eq!(symbol, "ETH/USDC");
+            WsMessage::BookUpdate { pair, .. } => {
+                assert_eq!(pair.to_string(), "ETH/USDC");
             }
             other => panic!("Expected BookUpdate, got {:?}", other),
         }
@@ -600,7 +600,7 @@ mod tests {
         match parse_ws_message(&results[0]) {
             WsMessage::Execution(report) => {
                 assert_eq!(report.exec_type, "trade");
-                assert_eq!(report.symbol, "BTC/USDC");
+                assert_eq!(report.pair.to_string(), "BTC/USDC");
                 assert_eq!(report.side, "buy");
             }
             other => panic!("Expected Execution, got {:?}", other),
@@ -914,7 +914,7 @@ mod tests {
                 assert_eq!(report.exec_type, "new");
                 assert_eq!(report.order_id, "cb-order-789");
                 assert_eq!(report.cl_ord_id, "mm_buy_doge_001");
-                assert_eq!(report.symbol, "DOGE/USDC");
+                assert_eq!(report.pair.to_string(), "DOGE/USDC");
                 assert_eq!(report.side, "buy");
             }
             other => panic!("Expected Execution, got {:?}", other),
@@ -928,7 +928,7 @@ mod tests {
             WsMessage::Execution(report) => {
                 assert_eq!(report.exec_type, "canceled");
                 assert_eq!(report.cl_ord_id, "mm_sell_xrp_002");
-                assert_eq!(report.symbol, "XRP/USDC");
+                assert_eq!(report.pair.to_string(), "XRP/USDC");
                 assert_eq!(report.cancel_reason, Some("USER_CANCEL".to_string()));
             }
             other => panic!("Expected Execution, got {:?}", other),

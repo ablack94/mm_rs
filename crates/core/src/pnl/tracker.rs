@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use trading_primitives::Ticker;
 
 use crate::types::position::Position;
 use crate::types::fill::Fill;
@@ -14,7 +15,7 @@ use crate::types::order::OrderSide;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PnlTrade {
     pub timestamp: DateTime<Utc>,
-    pub symbol: String,
+    pub pair: Ticker,
     pub side: String,
     pub price: Decimal,
     pub qty: Decimal,
@@ -30,13 +31,13 @@ pub struct PnlSummary {
     pub total_fees: Decimal,
     pub net_pnl: Decimal,
     pub trade_count: u64,
-    pub positions: HashMap<String, Position>,
+    pub positions: HashMap<Ticker, Position>,
 }
 
 /// Core P&L tracker. Maintains positions and trade history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PnlTracker {
-    pub positions: HashMap<String, Position>,
+    pub positions: HashMap<Ticker, Position>,
     pub realized_pnl: Decimal,
     pub total_fees: Decimal,
     pub trade_count: u64,
@@ -64,15 +65,15 @@ impl PnlTracker {
 
         match fill.side {
             OrderSide::Buy => {
-                let pos = self.positions.entry(fill.symbol.clone()).or_default();
+                let pos = self.positions.entry(fill.pair.clone()).or_default();
                 pos.apply_buy(fill.qty, fill.price);
             }
             OrderSide::Sell => {
-                let pos = self.positions.entry(fill.symbol.clone()).or_default();
+                let pos = self.positions.entry(fill.pair.clone()).or_default();
                 pnl = pos.apply_sell(fill.qty, fill.price) - fill.fee;
                 self.realized_pnl += pnl;
                 if pos.is_empty() {
-                    self.positions.remove(&fill.symbol);
+                    self.positions.remove(&fill.pair);
                 }
             }
         }
@@ -82,7 +83,7 @@ impl PnlTracker {
 
         self.recent_trades.push(PnlTrade {
             timestamp: fill.timestamp,
-            symbol: fill.symbol.clone(),
+            pair: fill.pair.clone(),
             side: fill.side.to_string(),
             price: fill.price,
             qty: fill.qty,
@@ -98,10 +99,10 @@ impl PnlTracker {
     }
 
     /// Compute unrealized P&L given current market prices.
-    pub fn unrealized_pnl(&self, prices: &HashMap<String, Decimal>) -> Decimal {
+    pub fn unrealized_pnl(&self, prices: &HashMap<Ticker, Decimal>) -> Decimal {
         let mut total = Decimal::ZERO;
-        for (symbol, pos) in &self.positions {
-            if let Some(&price) = prices.get(symbol) {
+        for (pair, pos) in &self.positions {
+            if let Some(&price) = prices.get(pair) {
                 total += pos.qty * (price - pos.avg_cost);
             }
         }
@@ -109,7 +110,7 @@ impl PnlTracker {
     }
 
     /// Get a full P&L summary.
-    pub fn summary(&self, prices: &HashMap<String, Decimal>) -> PnlSummary {
+    pub fn summary(&self, prices: &HashMap<Ticker, Decimal>) -> PnlSummary {
         let unrealized = self.unrealized_pnl(prices);
         PnlSummary {
             realized_pnl: self.realized_pnl,
@@ -160,7 +161,7 @@ mod tests {
         Fill {
             order_id: "test".into(),
             cl_ord_id: "test".into(),
-            symbol: symbol.into(),
+            pair: symbol.into(),
             side,
             price,
             qty,
@@ -176,7 +177,7 @@ mod tests {
         let mut tracker = PnlTracker::new();
 
         tracker.apply_fill(&make_fill("TEST/USD", OrderSide::Buy, dec!(100), dec!(10), dec!(0.23)));
-        assert_eq!(tracker.positions["TEST/USD"].qty, dec!(10));
+        assert_eq!(tracker.positions[&Ticker::from("TEST/USD")].qty, dec!(10));
 
         tracker.apply_fill(&make_fill("TEST/USD", OrderSide::Sell, dec!(120), dec!(10), dec!(0.28)));
         assert!(tracker.positions.is_empty());
@@ -193,7 +194,7 @@ mod tests {
         tracker.apply_fill(&make_fill("TEST/USD", OrderSide::Buy, dec!(100), dec!(10), dec!(0)));
 
         let mut prices = HashMap::new();
-        prices.insert("TEST/USD".into(), dec!(110));
+        prices.insert(Ticker::from("TEST/USD"), dec!(110));
         assert_eq!(tracker.unrealized_pnl(&prices), dec!(100));
     }
 }

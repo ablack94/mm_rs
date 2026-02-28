@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use trading_primitives::Ticker;
 
 use crate::engine::quoter::Quoter;
 use crate::types::pair::PairInfo;
@@ -9,7 +10,7 @@ pub use trading_primitives::config::{PairState, PairConfig, GlobalDefaults, Reso
 
 /// A self-contained managed pair with state, config, quoter, position, and info.
 pub struct ManagedPair {
-    pub symbol: String,
+    pub pair: Ticker,
     pub state: PairState,
     pub config: PairConfig,
     pub quoter: Quoter,
@@ -24,10 +25,10 @@ pub struct ManagedPair {
 
 impl ManagedPair {
     /// Create a new managed pair with default config and Active state.
-    pub fn new(symbol: String, pair_info: Option<PairInfo>) -> Self {
-        let quoter = Quoter::new(symbol.clone());
+    pub fn new(pair: Ticker, pair_info: Option<PairInfo>) -> Self {
+        let quoter = Quoter::new(pair.clone());
         Self {
-            symbol,
+            pair,
             state: PairState::Active,
             config: PairConfig::default(),
             quoter,
@@ -40,14 +41,14 @@ impl ManagedPair {
 
     /// Create a new managed pair with specific state and config.
     pub fn with_state_and_config(
-        symbol: String,
+        pair: Ticker,
         state: PairState,
         config: PairConfig,
         pair_info: Option<PairInfo>,
     ) -> Self {
-        let quoter = Quoter::new(symbol.clone());
+        let quoter = Quoter::new(pair.clone());
         Self {
-            symbol,
+            pair,
             state,
             config,
             quoter,

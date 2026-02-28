@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use trading_primitives::Ticker;
 use super::fill::Fill;
 use super::pair::PairInfo;
 
@@ -12,13 +13,13 @@ pub use trading_primitives::book::LevelUpdate;
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     BookSnapshot {
-        symbol: String,
+        pair: Ticker,
         bids: Vec<LevelUpdate>,
         asks: Vec<LevelUpdate>,
         timestamp: DateTime<Utc>,
     },
     BookUpdate {
-        symbol: String,
+        pair: Ticker,
         bid_updates: Vec<LevelUpdate>,
         ask_updates: Vec<LevelUpdate>,
         timestamp: DateTime<Utc>,
@@ -30,13 +31,13 @@ pub enum EngineEvent {
     },
     OrderCancelled {
         cl_ord_id: String,
-        symbol: String,
+        pair: Ticker,
         /// Reason for cancellation from exchange (e.g., "Market price protection").
         reason: Option<String>,
     },
     OrderRejected {
         cl_ord_id: String,
-        symbol: String,
+        pair: Ticker,
         reason: String,
     },
     /// Periodic heartbeat for stale order checks and DMS refresh.
@@ -49,7 +50,7 @@ pub enum EngineEvent {
     StateStoreCommand(StateStoreAction),
     /// Pair info fetched for newly discovered pairs (from state store).
     PairInfoFetched {
-        info: HashMap<String, PairInfo>,
+        info: HashMap<Ticker, PairInfo>,
     },
 }
 
@@ -60,15 +61,15 @@ pub enum ApiAction {
     Pause,
     Resume,
     Shutdown,
-    Liquidate { symbol: String },
+    Liquidate { pair: Ticker },
     /// Disable a pair: cancel its orders, stop quoting.
-    DisablePair { symbol: String },
+    DisablePair { pair: Ticker },
     /// Re-enable a disabled pair (clears cooldown too).
-    EnablePair { symbol: String },
+    EnablePair { pair: Ticker },
     /// Add a new pair at runtime.
-    AddPair { symbol: String },
+    AddPair { pair: Ticker },
     /// Remove a pair: liquidate position + permanently disable.
-    RemovePair { symbol: String },
+    RemovePair { pair: Ticker },
 }
 
 /// Actions received from the state store WS client.
@@ -82,7 +83,7 @@ pub enum StateStoreAction {
     /// A single pair was created or updated.
     PairUpdated(crate::state_store::PairRecord),
     /// A pair was removed.
-    PairRemoved { symbol: String },
+    PairRemoved { pair: Ticker },
     /// Global defaults were updated.
     DefaultsUpdated(super::managed_pair::GlobalDefaults),
 }

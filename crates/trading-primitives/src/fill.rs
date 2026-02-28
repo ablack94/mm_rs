@@ -2,13 +2,14 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use crate::order::OrderSide;
+use crate::symbol::Ticker;
 
 /// An execution fill from the exchange.
 #[derive(Debug, Clone)]
 pub struct Fill {
     pub order_id: String,
     pub cl_ord_id: String,
-    pub symbol: String,
+    pub pair: Ticker,
     pub side: OrderSide,
     pub price: Decimal,
     pub qty: Decimal,
@@ -22,7 +23,8 @@ pub struct Fill {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRecord {
     pub timestamp: DateTime<Utc>,
-    pub symbol: String,
+    #[serde(alias = "symbol")]
+    pub pair: Ticker,
     pub side: String,
     pub price: Decimal,
     pub qty: Decimal,

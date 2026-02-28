@@ -1,13 +1,15 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use trading_primitives::Ticker;
 
 use crate::types::{GlobalDefaults, PairConfig, PairState};
 
 /// A pair record as received from the state store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairRecord {
-    pub symbol: String,
+    #[serde(alias = "symbol")]
+    pub pair: Ticker,
     pub state: PairState,
     pub config: PairConfig,
     pub disabled_reason: Option<String>,
@@ -31,7 +33,7 @@ pub enum StateStoreMessage {
     },
     /// A pair was removed.
     PairRemoved {
-        symbol: String,
+        pair: Ticker,
     },
     /// Global defaults were updated.
     DefaultsUpdated {
@@ -51,7 +53,7 @@ pub enum BotMessage {
     },
     /// Per-pair position/status report.
     PairReport {
-        symbol: String,
+        pair: Ticker,
         position_qty: Decimal,
         position_avg_cost: Decimal,
         exposure_usd: Decimal,

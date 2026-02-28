@@ -40,7 +40,7 @@ impl TradeLogger for CsvTradeLogger {
             file,
             "{},{},{},{},{},{},{},{},{}",
             record.timestamp.format("%Y-%m-%d %H:%M:%S"),
-            record.symbol,
+            record.pair,
             record.side,
             record.price,
             record.qty,

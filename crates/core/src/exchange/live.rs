@@ -240,7 +240,7 @@ impl OrderManager for LiveExchange {
             params: AddOrderParams {
                 order_type,
                 side: request.side.to_string(),
-                symbol: request.symbol.clone(),
+                symbol: request.pair.to_string(),
                 limit_price: request.price,
                 order_qty: request.qty,
                 post_only: if request.market { false } else { request.post_only },
@@ -366,7 +366,7 @@ async fn run_private_read_loop(
                             OrderSide::Sell
                         };
                         tracing::info!(
-                            symbol = report.symbol,
+                            pair = %report.pair,
                             side = report.side,
                             price = %report.last_price,
                             qty = %report.last_qty,
@@ -376,7 +376,7 @@ async fn run_private_read_loop(
                         Some(EngineEvent::Fill(Fill {
                             order_id: report.order_id,
                             cl_ord_id: report.cl_ord_id,
-                            symbol: report.symbol,
+                            pair: report.pair,
                             side,
                             price: report.last_price,
                             qty: report.last_qty,
@@ -389,7 +389,7 @@ async fn run_private_read_loop(
                     "filled" => {
                         tracing::info!(
                             cl_ord_id = report.cl_ord_id,
-                            symbol = report.symbol,
+                            pair = %report.pair,
                             "Order fully filled (status update)"
                         );
                         None
@@ -409,14 +409,14 @@ async fn run_private_read_loop(
                     "canceled" | "expired" => {
                         tracing::info!(
                             cl_ord_id = report.cl_ord_id,
-                            symbol = report.symbol,
+                            pair = %report.pair,
                             exec_type = report.exec_type,
                             cancel_reason = report.cancel_reason.as_deref().unwrap_or("none"),
                             "Order cancelled/expired"
                         );
                         Some(EngineEvent::OrderCancelled {
                             cl_ord_id: report.cl_ord_id,
-                            symbol: report.symbol,
+                            pair: report.pair,
                             reason: report.cancel_reason,
                         })
                     }
@@ -453,7 +453,7 @@ async fn run_private_read_loop(
                     );
                     resolved_id.map(|id| EngineEvent::OrderRejected {
                         cl_ord_id: id,
-                        symbol: String::new(),
+                        pair: trading_primitives::Ticker::from("UNKNOWN/UNKNOWN"),
                         reason: err_msg.to_string(),
                     })
                 } else {
@@ -550,12 +550,12 @@ async fn run_book_feed_dynamic(
             let msg = parse_ws_message(&raw);
             match msg {
                 WsMessage::BookSnapshot {
-                    symbol,
+                    pair,
                     bids,
                     asks,
                 } => {
                     tx.send(EngineEvent::BookSnapshot {
-                        symbol,
+                        pair,
                         bids,
                         asks,
                         timestamp: Utc::now(),
@@ -563,12 +563,12 @@ async fn run_book_feed_dynamic(
                     .await?;
                 }
                 WsMessage::BookUpdate {
-                    symbol,
+                    pair,
                     bid_updates,
                     ask_updates,
                 } => {
                     tx.send(EngineEvent::BookUpdate {
-                        symbol,
+                        pair,
                         bid_updates,
                         ask_updates,
                         timestamp: Utc::now(),

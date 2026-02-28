@@ -1,6 +1,8 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::symbol::Ticker;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderSide {
@@ -20,7 +22,8 @@ impl std::fmt::Display for OrderSide {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub cl_ord_id: String,
-    pub symbol: String,
+    #[serde(alias = "symbol")]
+    pub pair: Ticker,
     pub side: OrderSide,
     pub price: Decimal,
     pub qty: Decimal,

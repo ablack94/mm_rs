@@ -18,6 +18,7 @@ use kraken_core::state_store::{
 use kraken_core::traits::*;
 use kraken_core::types::*;
 use kraken_core::types::event::StateStoreAction;
+use kraken_core::types::Ticker;
 
 #[derive(Parser)]
 #[command(name = "kraken-mm", about = "Low-liquidity market making bot (exchange-agnostic via proxy)")]
@@ -81,8 +82,8 @@ async fn main() -> Result<()> {
     // Wait for initial snapshot from state store to get pair list
     let (initial_snapshot, ss_cmd_rx) = wait_for_snapshot(ss_cmd_rx).await?;
 
-    let pairs: Vec<String> = initial_snapshot.pairs.iter()
-        .map(|p| p.symbol.clone())
+    let pairs: Vec<Ticker> = initial_snapshot.pairs.iter()
+        .map(|p| p.pair.clone())
         .collect();
 
     if pairs.is_empty() {
@@ -116,9 +117,9 @@ async fn main() -> Result<()> {
     } else {
         tracing::info!("Fetching pair info...");
         let info = exchange.get_pair_info(&pairs).await?;
-        for (symbol, pi) in &info {
+        for (pair, pi) in &info {
             tracing::info!(
-                symbol,
+                pair = %pair,
                 min_order = %pi.min_order_qty,
                 price_dec = pi.price_decimals,
                 qty_dec = pi.qty_decimals,
@@ -208,7 +209,7 @@ fn build_engine_snapshot(engine: &Engine) -> EngineSnapshot {
 
     // Build per-pair reports
     let pair_reports: Vec<PairReportData> = pairs.values().map(|mp| {
-        let pos = state.position(&mp.symbol);
+        let pos = state.position(&mp.pair);
         // Use avg_cost as a rough price proxy if no live price available
         let price_estimate = pos.avg_cost;
         let exposure_usd = pos.qty * price_estimate;
@@ -220,7 +221,7 @@ fn build_engine_snapshot(engine: &Engine) -> EngineSnapshot {
         };
         let has_open_orders = mp.quoter.bid_cl_ord_id.is_some() || mp.quoter.ask_cl_ord_id.is_some();
         PairReportData {
-            symbol: mp.symbol.clone(),
+            pair: mp.pair.clone(),
             position_qty: pos.qty,
             position_avg_cost: pos.avg_cost,
             exposure_usd,
@@ -249,8 +250,8 @@ fn state_store_cmd_to_event(cmd: StateStoreCommand) -> EngineEvent {
         StateStoreCommand::PairUpdated(record) => {
             EngineEvent::StateStoreCommand(StateStoreAction::PairUpdated(record))
         }
-        StateStoreCommand::PairRemoved { symbol } => {
-            EngineEvent::StateStoreCommand(StateStoreAction::PairRemoved { symbol })
+        StateStoreCommand::PairRemoved { pair } => {
+            EngineEvent::StateStoreCommand(StateStoreAction::PairRemoved { pair })
         }
         StateStoreCommand::DefaultsUpdated(defaults) => {
             EngineEvent::StateStoreCommand(StateStoreAction::DefaultsUpdated(defaults))
@@ -261,7 +262,7 @@ fn state_store_cmd_to_event(cmd: StateStoreCommand) -> EngineEvent {
 async fn run_dry(
     config: Config,
     engine: Engine,
-    pairs: Vec<String>,
+    pairs: Vec<Ticker>,
     event_tx: mpsc::Sender<EngineEvent>,
     event_rx: mpsc::Receiver<EngineEvent>,
     cmd_tx: mpsc::Sender<EngineCommand>,
@@ -288,12 +289,13 @@ async fn run_dry(
     let depth = config.exchange.book_depth;
 
     // Subscribe to initial pairs
+    let pair_strings: Vec<String> = pairs.iter().map(|t| t.to_string()).collect();
     if !pairs.is_empty() {
         let sub_msg = serde_json::to_string(&SubscribeBookMsg {
             method: "subscribe",
             params: SubscribeBookParams {
                 channel: "book",
-                symbol: pairs.clone(),
+                symbol: pair_strings.clone(),
                 depth,
             },
         })?;
@@ -313,11 +315,11 @@ async fn run_dry(
                         Some(text) => {
                             let msg = parse_ws_message(&text);
                             let event = match msg {
-                                WsMessage::BookSnapshot { symbol, bids, asks } => {
-                                    Some(EngineEvent::BookSnapshot { symbol, bids, asks, timestamp: Utc::now() })
+                                WsMessage::BookSnapshot { pair, bids, asks } => {
+                                    Some(EngineEvent::BookSnapshot { pair, bids, asks, timestamp: Utc::now() })
                                 }
-                                WsMessage::BookUpdate { symbol, bid_updates, ask_updates } => {
-                                    Some(EngineEvent::BookUpdate { symbol, bid_updates, ask_updates, timestamp: Utc::now() })
+                                WsMessage::BookUpdate { pair, bid_updates, ask_updates } => {
+                                    Some(EngineEvent::BookUpdate { pair, bid_updates, ask_updates, timestamp: Utc::now() })
                                 }
                                 WsMessage::SubscribeConfirmed { channel } => {
                                     tracing::info!(channel, "Subscription confirmed");
@@ -369,22 +371,22 @@ async fn run_dry(
     // Forward state store commands to the engine, enriching new pairs with pair_info
     let tx3 = event_tx.clone();
     let ss_forward_handle = tokio::spawn(async move {
-        let mut known_symbols: HashSet<String> = pairs.into_iter().collect();
+        let mut known_pairs: HashSet<Ticker> = pairs.into_iter().collect();
 
         while let Some(cmd) = ss_cmd_rx.recv().await {
-            // Extract new symbols from Snapshot or PairUpdated
-            let new_symbols: Vec<String> = match &cmd {
+            // Extract new pairs from Snapshot or PairUpdated
+            let new_pairs: Vec<Ticker> = match &cmd {
                 StateStoreCommand::Snapshot { pairs, .. } => {
                     pairs.iter()
-                        .filter(|p| !known_symbols.contains(&p.symbol))
-                        .map(|p| p.symbol.clone())
+                        .filter(|p| !known_pairs.contains(&p.pair))
+                        .map(|p| p.pair.clone())
                         .collect()
                 }
                 StateStoreCommand::PairUpdated(record) => {
-                    if known_symbols.contains(&record.symbol) {
+                    if known_pairs.contains(&record.pair) {
                         vec![]
                     } else {
-                        vec![record.symbol.clone()]
+                        vec![record.pair.clone()]
                     }
                 }
                 _ => vec![],
@@ -397,15 +399,16 @@ async fn run_dry(
             }
 
             // For new pairs: fetch pair_info, send to engine, subscribe to book
-            if !new_symbols.is_empty() {
-                tracing::info!(?new_symbols, "New pairs discovered — fetching pair info");
-                match exchange.get_pair_info(&new_symbols).await {
+            if !new_pairs.is_empty() {
+                tracing::info!(?new_pairs, "New pairs discovered — fetching pair info");
+                match exchange.get_pair_info(&new_pairs).await {
                     Ok(info) => {
                         if !info.is_empty() {
-                            for symbol in info.keys() {
-                                tracing::info!(symbol, "Pair info fetched for new pair");
+                            for pair in info.keys() {
+                                tracing::info!(pair = %pair, "Pair info fetched for new pair");
                             }
-                            let subscribed: Vec<String> = info.keys().cloned().collect();
+                            let subscribed: Vec<Ticker> = info.keys().cloned().collect();
+                            let subscribed_strings: Vec<String> = subscribed.iter().map(|t| t.to_string()).collect();
 
                             // Send PairInfoFetched to engine
                             let pi_event = EngineEvent::PairInfoFetched { info };
@@ -414,19 +417,19 @@ async fn run_dry(
                             }
 
                             // Subscribe to book data for new pairs
-                            if let Err(e) = book_sub_tx.send(subscribed.clone()).await {
+                            if let Err(e) = book_sub_tx.send(subscribed_strings).await {
                                 tracing::error!(error = %e, "Failed to send book subscription");
                             }
 
-                            known_symbols.extend(subscribed);
+                            known_pairs.extend(subscribed);
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, ?new_symbols, "Failed to fetch pair info for new pairs");
+                        tracing::error!(error = %e, ?new_pairs, "Failed to fetch pair info for new pairs");
                     }
                 }
                 // Track as known even if pair_info fetch failed
-                known_symbols.extend(new_symbols);
+                known_pairs.extend(new_pairs);
             }
         }
     });
@@ -465,7 +468,7 @@ async fn run_dry(
             match &cmd {
                 EngineCommand::PlaceOrder(req) => {
                     tracing::info!(
-                        side = %req.side, symbol = req.symbol,
+                        side = %req.side, pair = %req.pair,
                         price = %req.price, qty = %req.qty,
                         "[DRY-RUN] Would place order"
                     );
@@ -528,7 +531,7 @@ async fn run_dry(
 async fn run_live(
     config: Config,
     engine: Engine,
-    pairs: Vec<String>,
+    pairs: Vec<Ticker>,
     event_tx: mpsc::Sender<EngineEvent>,
     event_rx: mpsc::Receiver<EngineEvent>,
     cmd_tx: mpsc::Sender<EngineCommand>,
@@ -550,28 +553,29 @@ async fn run_live(
     let (book_sub_tx, book_sub_rx) = mpsc::channel::<Vec<String>>(16);
 
     // Spawn feeds (private WS read loop already spawned by connect)
-    let book_handle = live.spawn_book_feed(event_tx.clone(), &pairs, Some(book_sub_rx)).await?;
+    let pair_strings: Vec<String> = pairs.iter().map(|t| t.to_string()).collect();
+    let book_handle = live.spawn_book_feed(event_tx.clone(), &pair_strings, Some(book_sub_rx)).await?;
     let ticker_handle = live.spawn_ticker(event_tx.clone(), 10);
 
     // Forward state store commands to the engine, enriching new pairs with pair_info
     let tx_ss = event_tx.clone();
     let ss_forward_handle = tokio::spawn(async move {
-        let mut known_symbols: HashSet<String> = pairs.into_iter().collect();
+        let mut known_pairs: HashSet<Ticker> = pairs.into_iter().collect();
 
         while let Some(cmd) = ss_cmd_rx.recv().await {
-            // Extract new symbols from Snapshot or PairUpdated
-            let new_symbols: Vec<String> = match &cmd {
+            // Extract new pairs from Snapshot or PairUpdated
+            let new_pairs: Vec<Ticker> = match &cmd {
                 StateStoreCommand::Snapshot { pairs, .. } => {
                     pairs.iter()
-                        .filter(|p| !known_symbols.contains(&p.symbol))
-                        .map(|p| p.symbol.clone())
+                        .filter(|p| !known_pairs.contains(&p.pair))
+                        .map(|p| p.pair.clone())
                         .collect()
                 }
                 StateStoreCommand::PairUpdated(record) => {
-                    if known_symbols.contains(&record.symbol) {
+                    if known_pairs.contains(&record.pair) {
                         vec![]
                     } else {
-                        vec![record.symbol.clone()]
+                        vec![record.pair.clone()]
                     }
                 }
                 _ => vec![],
@@ -584,15 +588,16 @@ async fn run_live(
             }
 
             // For new pairs: fetch pair_info, send to engine, subscribe to book
-            if !new_symbols.is_empty() {
-                tracing::info!(?new_symbols, "New pairs discovered — fetching pair info");
-                match exchange.get_pair_info(&new_symbols).await {
+            if !new_pairs.is_empty() {
+                tracing::info!(?new_pairs, "New pairs discovered — fetching pair info");
+                match exchange.get_pair_info(&new_pairs).await {
                     Ok(info) => {
                         if !info.is_empty() {
-                            for symbol in info.keys() {
-                                tracing::info!(symbol, "Pair info fetched for new pair");
+                            for pair in info.keys() {
+                                tracing::info!(pair = %pair, "Pair info fetched for new pair");
                             }
-                            let subscribed: Vec<String> = info.keys().cloned().collect();
+                            let subscribed: Vec<Ticker> = info.keys().cloned().collect();
+                            let subscribed_strings: Vec<String> = subscribed.iter().map(|t| t.to_string()).collect();
 
                             // Send PairInfoFetched to engine
                             let pi_event = EngineEvent::PairInfoFetched { info };
@@ -601,19 +606,19 @@ async fn run_live(
                             }
 
                             // Subscribe to book data for new pairs
-                            if let Err(e) = book_sub_tx.send(subscribed.clone()).await {
+                            if let Err(e) = book_sub_tx.send(subscribed_strings).await {
                                 tracing::error!(error = %e, "Failed to send book subscription");
                             }
 
-                            known_symbols.extend(subscribed);
+                            known_pairs.extend(subscribed);
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, ?new_symbols, "Failed to fetch pair info for new pairs");
+                        tracing::error!(error = %e, ?new_pairs, "Failed to fetch pair info for new pairs");
                     }
                 }
                 // Track as known even if pair_info fetch failed, to avoid retrying every message
-                known_symbols.extend(new_symbols);
+                known_pairs.extend(new_pairs);
             }
         }
     });
@@ -656,7 +661,7 @@ async fn run_live(
                 match cmd {
                     EngineCommand::PlaceOrder(req) => {
                         tracing::info!(
-                            symbol = req.symbol,
+                            pair = %req.pair,
                             side = %req.side,
                             price = %req.price,
                             qty = %req.qty,

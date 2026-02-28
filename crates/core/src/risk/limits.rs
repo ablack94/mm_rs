@@ -1,18 +1,19 @@
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use trading_primitives::Ticker;
 use crate::config::RiskConfig;
 use crate::state::bot_state::BotState;
 
 /// Check if opening a new buy position is allowed by risk limits.
 pub fn can_open_buy(
     state: &BotState,
-    symbol: &str,
+    pair: &Ticker,
     size_usd: Decimal,
     current_price: Decimal,
-    prices: &HashMap<String, Decimal>,
+    prices: &HashMap<Ticker, Decimal>,
     config: &RiskConfig,
 ) -> bool {
-    let pair_exposure = state.pair_exposure_usd(symbol, current_price);
+    let pair_exposure = state.pair_exposure_usd(pair, current_price);
     if pair_exposure + size_usd > config.max_inventory_usd {
         return false;
     }

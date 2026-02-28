@@ -3,6 +3,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+use trading_primitives::Ticker;
 
 use crate::config::Config;
 use crate::engine::inventory::inventory_skew;
@@ -41,15 +42,15 @@ fn truncate_decimal(value: Decimal, dp: u32) -> Decimal {
 /// Contains no I/O — fully deterministic and testable.
 pub struct Engine {
     config: Config,
-    books: HashMap<String, OrderBook>,
+    books: HashMap<Ticker, OrderBook>,
     /// Per-pair managed state: replaces disabled_pairs, sell_only_pairs,
     /// pending_liquidation, cooldown_until, quoters, and pair_info.
-    pairs: HashMap<String, ManagedPair>,
+    pairs: HashMap<Ticker, ManagedPair>,
     /// Global defaults for per-pair config resolution.
     global_defaults: GlobalDefaults,
     pub state: BotState,
     kill_switch: KillSwitch,
-    prices: HashMap<String, Decimal>,
+    prices: HashMap<Ticker, Decimal>,
     cl_ord_counter: u64,
     last_dms_refresh: Option<DateTime<Utc>>,
 }
@@ -57,7 +58,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(
         config: Config,
-        pair_info: HashMap<String, PairInfo>,
+        pair_info: HashMap<Ticker, PairInfo>,
         state: BotState,
     ) -> Self {
         // Build global defaults from Config (backward compatible)
@@ -75,19 +76,19 @@ impl Engine {
 
         // Build ManagedPair for each pair_info entry
         let mut pairs = HashMap::new();
-        for (symbol, info) in pair_info {
-            let pair_state = if state.disabled_pairs.contains(&symbol) {
+        for (pair, info) in pair_info {
+            let pair_state = if state.disabled_pairs.contains(&pair) {
                 PairState::Disabled
             } else {
                 PairState::Active
             };
             let mp = ManagedPair::with_state_and_config(
-                symbol.clone(),
+                pair.clone(),
                 pair_state,
                 PairConfig::default(),
                 Some(info),
             );
-            pairs.insert(symbol, mp);
+            pairs.insert(pair, mp);
         }
 
         if !state.disabled_pairs.is_empty() {
@@ -117,14 +118,14 @@ impl Engine {
     }
 
     /// Restore positions from Kraken balances.
-    /// Maps base_asset balances to managed pair symbols and sets qty.
+    /// Maps exchange_base_asset balances to managed pair symbols and sets qty.
     /// For any pair that has a position but is Disabled, overrides to WindDown
     /// so the bot can sell the position.
     pub fn restore_balances(&mut self, balances: &HashMap<String, Decimal>) {
-        // Build base_asset → symbol map from pair_info
-        let asset_to_symbol: HashMap<String, String> = self.pairs.iter()
-            .filter_map(|(symbol, mp)| {
-                mp.pair_info.as_ref().map(|pi| (pi.base_asset.clone(), symbol.clone()))
+        // Build exchange_base_asset → pair map from pair_info
+        let asset_to_pair: HashMap<String, Ticker> = self.pairs.iter()
+            .filter_map(|(pair, mp)| {
+                mp.pair_info.as_ref().map(|pi| (pi.exchange_base_asset.clone(), pair.clone()))
             })
             .collect();
 
@@ -132,15 +133,15 @@ impl Engine {
             if balance.is_zero() {
                 continue;
             }
-            if let Some(symbol) = asset_to_symbol.get(asset) {
+            if let Some(pair) = asset_to_pair.get(asset) {
                 // We don't know avg_cost from balances alone — use zero as placeholder.
                 // The engine will update avg_cost from fills, and the cost floor
                 // on sells will use mid price as a fallback when avg_cost is zero.
-                let position = self.state.positions.entry(symbol.clone()).or_default();
+                let position = self.state.positions.entry(pair.clone()).or_default();
                 if position.qty.is_zero() {
                     position.qty = balance;
                     tracing::info!(
-                        symbol,
+                        pair = %pair,
                         asset,
                         qty = %balance,
                         "Restored position from exchange balance"
@@ -149,20 +150,20 @@ impl Engine {
 
                 // If this pair is Disabled but has a position, override to WindDown
                 // UNLESS the position is below exchange minimums (dust — unsellable)
-                if let Some(mp) = self.pairs.get_mut(symbol) {
+                if let Some(mp) = self.pairs.get_mut(pair) {
                     if mp.state == PairState::Disabled {
                         let is_dust = mp.pair_info.as_ref().map_or(false, |pi| {
                             balance < pi.min_order_qty
                         });
                         if is_dust {
                             tracing::info!(
-                                symbol,
+                                pair = %pair,
                                 qty = %balance,
                                 "Pair is Disabled with dust position below exchange minimums — keeping Disabled"
                             );
                         } else {
                             tracing::warn!(
-                                symbol,
+                                pair = %pair,
                                 qty = %balance,
                                 "Pair is Disabled but holds position — overriding to WindDown"
                             );
@@ -176,9 +177,9 @@ impl Engine {
 
     /// Mark pairs as sell-only (downtrend filter). No new buys will be placed.
     /// Sets their state to WindDown if currently Active.
-    pub fn set_sell_only(&mut self, pair_symbols: std::collections::HashSet<String>) {
-        for symbol in &pair_symbols {
-            if let Some(mp) = self.pairs.get_mut(symbol) {
+    pub fn set_sell_only(&mut self, pair_symbols: std::collections::HashSet<Ticker>) {
+        for pair in &pair_symbols {
+            if let Some(mp) = self.pairs.get_mut(pair) {
                 if mp.state == PairState::Active {
                     mp.state = PairState::WindDown;
                 }
@@ -186,12 +187,12 @@ impl Engine {
         }
     }
 
-    pub fn books(&self) -> &HashMap<String, OrderBook> {
+    pub fn books(&self) -> &HashMap<Ticker, OrderBook> {
         &self.books
     }
 
     /// Access managed pairs (for testing/inspection).
-    pub fn pairs(&self) -> &HashMap<String, ManagedPair> {
+    pub fn pairs(&self) -> &HashMap<Ticker, ManagedPair> {
         &self.pairs
     }
 
@@ -206,8 +207,8 @@ impl Engine {
     }
 
     /// Update a pair's state and config (e.g., from state store).
-    pub fn update_pair(&mut self, symbol: &str, new_state: PairState, new_config: PairConfig) {
-        if let Some(mp) = self.pairs.get_mut(symbol) {
+    pub fn update_pair(&mut self, pair: &Ticker, new_state: PairState, new_config: PairConfig) {
+        if let Some(mp) = self.pairs.get_mut(pair) {
             mp.state = new_state;
             mp.config = new_config;
         }
@@ -215,29 +216,29 @@ impl Engine {
 
     /// Add a new managed pair at runtime.
     pub fn add_managed_pair(&mut self, mp: ManagedPair) {
-        self.pairs.insert(mp.symbol.clone(), mp);
+        self.pairs.insert(mp.pair.clone(), mp);
     }
 
     /// Remove a managed pair. Returns cancel commands for its orders.
-    pub fn remove_managed_pair(&mut self, symbol: &str) -> Vec<EngineCommand> {
-        let cmds = self.cancel_all_pair_orders(symbol);
-        self.pairs.remove(symbol);
+    pub fn remove_managed_pair(&mut self, pair: &Ticker) -> Vec<EngineCommand> {
+        let cmds = self.cancel_all_pair_orders(pair);
+        self.pairs.remove(pair);
         cmds
     }
 
     // Helper: check if a pair is in a given state
-    fn pair_state(&self, symbol: &str) -> Option<PairState> {
-        self.pairs.get(symbol).map(|mp| mp.state)
+    fn pair_state(&self, pair: &Ticker) -> Option<PairState> {
+        self.pairs.get(pair).map(|mp| mp.state)
     }
 
     // Helper: get resolved config for a pair
-    fn resolved_config(&self, symbol: &str) -> Option<ResolvedConfig> {
-        self.pairs.get(symbol).map(|mp| mp.resolved_config(&self.global_defaults))
+    fn resolved_config(&self, pair: &Ticker) -> Option<ResolvedConfig> {
+        self.pairs.get(pair).map(|mp| mp.resolved_config(&self.global_defaults))
     }
 
     // Helper: get pair_info for a pair
-    fn pair_info(&self, symbol: &str) -> Option<&PairInfo> {
-        self.pairs.get(symbol).and_then(|mp| mp.pair_info.as_ref())
+    fn pair_info(&self, pair: &Ticker) -> Option<&PairInfo> {
+        self.pairs.get(pair).and_then(|mp| mp.pair_info.as_ref())
     }
 
     /// Process a single event and return resulting commands.
@@ -245,17 +246,17 @@ impl Engine {
     pub fn handle_event(&mut self, event: EngineEvent) -> Vec<EngineCommand> {
         match event {
             EngineEvent::BookSnapshot {
-                symbol,
+                pair,
                 bids,
                 asks,
                 timestamp,
-            } => self.on_book_snapshot(symbol, bids, asks, timestamp),
+            } => self.on_book_snapshot(pair, bids, asks, timestamp),
             EngineEvent::BookUpdate {
-                symbol,
+                pair,
                 bid_updates,
                 ask_updates,
                 timestamp,
-            } => self.on_book_update(symbol, bid_updates, ask_updates, timestamp),
+            } => self.on_book_update(pair, bid_updates, ask_updates, timestamp),
             EngineEvent::Fill(fill) => self.on_fill(fill),
             EngineEvent::OrderAcknowledged { cl_ord_id, order_id } => {
                 if let Some(order) = self.state.open_orders.get_mut(&cl_ord_id) {
@@ -263,7 +264,7 @@ impl Engine {
                     tracing::info!(
                         cl_ord_id,
                         order_id,
-                        symbol = order.symbol,
+                        pair = %order.pair,
                         side = %order.side,
                         price = %order.price,
                         "Order live on exchange"
@@ -273,22 +274,22 @@ impl Engine {
                 }
                 vec![]
             }
-            EngineEvent::OrderCancelled { cl_ord_id, symbol, reason } => {
-                // Look up symbol from tracked orders if not provided (Kraken
-                // often omits symbol on cancel execution reports)
-                let sym = if symbol.is_empty() {
+            EngineEvent::OrderCancelled { cl_ord_id, pair, reason } => {
+                // Look up pair from tracked orders if not provided (Kraken
+                // often omits pair on cancel execution reports)
+                let sym = if pair == Ticker::from("UNKNOWN/UNKNOWN") {
                     self.state
                         .open_orders
                         .get(&cl_ord_id)
-                        .map(|o| o.symbol.clone())
-                        .unwrap_or_default()
+                        .map(|o| o.pair.clone())
+                        .unwrap_or_else(|| Ticker::from("UNKNOWN/UNKNOWN"))
                 } else {
-                    symbol
+                    pair
                 };
                 if let Some(ref reason) = reason {
                     tracing::warn!(
                         cl_ord_id,
-                        symbol = sym,
+                        pair = %sym,
                         reason,
                         "Order cancelled by exchange"
                     );
@@ -297,24 +298,24 @@ impl Engine {
             }
             EngineEvent::OrderRejected {
                 cl_ord_id,
-                symbol,
+                pair,
                 reason,
             } => {
-                // Look up symbol from tracked orders if not provided
-                let sym = if symbol.is_empty() {
+                // Look up pair from tracked orders if not provided
+                let sym = if pair == Ticker::from("UNKNOWN/UNKNOWN") {
                     self.state
                         .open_orders
                         .get(&cl_ord_id)
-                        .map(|o| o.symbol.clone())
-                        .unwrap_or_default()
+                        .map(|o| o.pair.clone())
+                        .unwrap_or_else(|| Ticker::from("UNKNOWN/UNKNOWN"))
                 } else {
-                    symbol
+                    pair
                 };
-                tracing::warn!(cl_ord_id, symbol = sym, reason, "Order rejected");
+                tracing::warn!(cl_ord_id, pair = %sym, reason, "Order rejected");
 
                 // If pair is restricted (jurisdiction/permissions), disable it permanently
                 if reason.contains("restricted") || reason.contains("Invalid permissions") {
-                    tracing::warn!(symbol = sym, reason, "Pair restricted — disabling permanently");
+                    tracing::warn!(pair = %sym, reason, "Pair restricted — disabling permanently");
                     if let Some(mp) = self.pairs.get_mut(&sym) {
                         mp.state = PairState::Disabled;
                     }
@@ -333,7 +334,7 @@ impl Engine {
                         let pos = self.state.position(&sym);
                         tracing::error!(
                             cl_ord_id,
-                            symbol = sym,
+                            pair = %sym,
                             reason,
                             retry = mp.liq_retry_count,
                             state_qty = %pos.qty,
@@ -350,11 +351,11 @@ impl Engine {
             EngineEvent::ApiCommand(action) => self.on_api_command(action),
             EngineEvent::StateStoreCommand(action) => self.on_state_store_command(action),
             EngineEvent::PairInfoFetched { info } => {
-                for (symbol, pair_info) in info {
-                    if let Some(mp) = self.pairs.get_mut(&symbol) {
+                for (pair, pair_info) in info {
+                    if let Some(mp) = self.pairs.get_mut(&pair) {
                         if mp.pair_info.is_none() {
                             tracing::info!(
-                                symbol,
+                                pair = %pair,
                                 min_order = %pair_info.min_order_qty,
                                 price_dec = pair_info.price_decimals,
                                 qty_dec = pair_info.qty_decimals,
@@ -387,7 +388,7 @@ impl Engine {
             ApiAction::CancelOrder { cl_ord_id } => {
                 tracing::info!(cl_ord_id, "API: Cancel order");
                 if let Some(order) = self.state.open_orders.remove(&cl_ord_id) {
-                    if let Some(mp) = self.pairs.get_mut(&order.symbol) {
+                    if let Some(mp) = self.pairs.get_mut(&order.pair) {
                         mp.quoter.mark_cancelled(&cl_ord_id);
                     }
                 }
@@ -428,57 +429,57 @@ impl Engine {
                     EngineCommand::Shutdown { reason: "API shutdown request".into() },
                 ]
             }
-            ApiAction::Liquidate { symbol } => {
-                tracing::info!(symbol, "API: Liquidate position");
-                self.on_liquidate(&symbol)
+            ApiAction::Liquidate { pair } => {
+                tracing::info!(pair = %pair, "API: Liquidate position");
+                self.on_liquidate(&pair)
             }
-            ApiAction::DisablePair { symbol } => {
-                tracing::info!(symbol, "API: Disable pair");
-                if let Some(mp) = self.pairs.get_mut(&symbol) {
+            ApiAction::DisablePair { pair } => {
+                tracing::info!(pair = %pair, "API: Disable pair");
+                if let Some(mp) = self.pairs.get_mut(&pair) {
                     mp.state = PairState::Disabled;
                 }
-                self.state.disabled_pairs.insert(symbol.clone());
-                let mut cmds = self.cancel_pair_quotes(&symbol);
+                self.state.disabled_pairs.insert(pair.clone());
+                let mut cmds = self.cancel_pair_quotes(&pair);
                 cmds.push(EngineCommand::PersistState(self.state.clone()));
                 cmds
             }
-            ApiAction::EnablePair { symbol } => {
-                tracing::info!(symbol, "API: Enable pair (manual override)");
-                if let Some(mp) = self.pairs.get_mut(&symbol) {
+            ApiAction::EnablePair { pair } => {
+                tracing::info!(pair = %pair, "API: Enable pair (manual override)");
+                if let Some(mp) = self.pairs.get_mut(&pair) {
                     mp.state = PairState::Active;
                     mp.liq_retry_count = 0;
                 }
-                self.state.disabled_pairs.remove(&symbol);
-                self.state.cooldown_until.remove(&symbol);
+                self.state.disabled_pairs.remove(&pair);
+                self.state.cooldown_until.remove(&pair);
                 vec![EngineCommand::PersistState(self.state.clone())]
             }
-            ApiAction::AddPair { symbol } => {
-                tracing::info!(symbol, "API: Add pair");
-                if self.pairs.contains_key(&symbol) {
-                    tracing::warn!(symbol, "Pair already exists");
+            ApiAction::AddPair { pair } => {
+                tracing::info!(pair = %pair, "API: Add pair");
+                if self.pairs.contains_key(&pair) {
+                    tracing::warn!(pair = %pair, "Pair already exists");
                     return vec![];
                 }
                 // Create managed pair — pair_info must be fetched externally.
-                let mp = ManagedPair::new(symbol.clone(), None);
-                self.pairs.insert(symbol.clone(), mp);
+                let mp = ManagedPair::new(pair.clone(), None);
+                self.pairs.insert(pair.clone(), mp);
                 // Remove from disabled if it was previously disabled
-                self.state.disabled_pairs.remove(&symbol);
-                self.state.cooldown_until.remove(&symbol);
+                self.state.disabled_pairs.remove(&pair);
+                self.state.cooldown_until.remove(&pair);
                 vec![EngineCommand::PersistState(self.state.clone())]
             }
-            ApiAction::RemovePair { symbol } => {
-                tracing::info!(symbol, "API: Remove pair — liquidating and disabling");
+            ApiAction::RemovePair { pair } => {
+                tracing::info!(pair = %pair, "API: Remove pair — liquidating and disabling");
                 let mut cmds = vec![];
                 // If position exists, liquidate first
-                if !self.state.position(&symbol).is_empty() {
-                    cmds.extend(self.on_liquidate(&symbol));
+                if !self.state.position(&pair).is_empty() {
+                    cmds.extend(self.on_liquidate(&pair));
                 } else {
                     // No position — just disable and cancel orders
-                    if let Some(mp) = self.pairs.get_mut(&symbol) {
+                    if let Some(mp) = self.pairs.get_mut(&pair) {
                         mp.state = PairState::Disabled;
                     }
-                    self.state.disabled_pairs.insert(symbol.clone());
-                    cmds.extend(self.cancel_pair_quotes(&symbol));
+                    self.state.disabled_pairs.insert(pair.clone());
+                    cmds.extend(self.cancel_pair_quotes(&pair));
                 }
                 cmds.push(EngineCommand::PersistState(self.state.clone()));
                 cmds
@@ -499,18 +500,18 @@ impl Engine {
 
                 // Apply snapshot: update existing pairs, add new ones, remove
                 // any pairs not present in the snapshot (that were state-store-managed).
-                let snapshot_symbols: std::collections::HashSet<String> =
-                    pairs.iter().map(|p| p.symbol.clone()).collect();
+                let snapshot_pairs: std::collections::HashSet<Ticker> =
+                    pairs.iter().map(|p| p.pair.clone()).collect();
 
                 for record in pairs {
-                    if let Some(mp) = self.pairs.get_mut(&record.symbol) {
+                    if let Some(mp) = self.pairs.get_mut(&record.pair) {
                         // Guard: don't disable a pair that still has a position
                         let effective_state = if record.state == PairState::Disabled
-                            && !self.state.position(&record.symbol).is_empty()
+                            && !self.state.position(&record.pair).is_empty()
                         {
                             tracing::warn!(
-                                symbol = record.symbol,
-                                qty = %self.state.position(&record.symbol).qty,
+                                pair = %record.pair,
+                                qty = %self.state.position(&record.pair).qty,
                                 "Snapshot wants Disabled but position held — overriding to WindDown"
                             );
                             PairState::WindDown
@@ -520,7 +521,7 @@ impl Engine {
                         mp.state = effective_state;
                         mp.config = record.config;
                         tracing::info!(
-                            symbol = record.symbol,
+                            pair = %record.pair,
                             state = ?effective_state,
                             "Updated pair from snapshot"
                         );
@@ -528,36 +529,36 @@ impl Engine {
                         // New pair from state store -- add it (no pair_info yet,
                         // will need to be fetched externally or provided)
                         let mp = ManagedPair::with_state_and_config(
-                            record.symbol.clone(),
+                            record.pair.clone(),
                             record.state,
                             record.config,
                             None,
                         );
                         tracing::info!(
-                            symbol = record.symbol,
+                            pair = %record.pair,
                             state = ?record.state,
                             "Added new pair from snapshot (pair_info pending)"
                         );
-                        self.pairs.insert(record.symbol, mp);
+                        self.pairs.insert(record.pair, mp);
                     }
                 }
 
-                let _ = snapshot_symbols; // used above in the loop
+                let _ = snapshot_pairs; // used above in the loop
 
                 vec![EngineCommand::PersistState(self.state.clone())]
             }
             StateStoreAction::PairUpdated(record) => {
                 let mut cmds = vec![];
-                if let Some(mp) = self.pairs.get_mut(&record.symbol) {
+                if let Some(mp) = self.pairs.get_mut(&record.pair) {
                     let old_state = mp.state;
                     // Guard: don't disable a pair that still has a position.
                     // Override to WindDown (sell-only) so the bot can exit.
                     let effective_state = if record.state == PairState::Disabled
-                        && !self.state.position(&record.symbol).is_empty()
+                        && !self.state.position(&record.pair).is_empty()
                     {
                         tracing::warn!(
-                            symbol = record.symbol,
-                            qty = %self.state.position(&record.symbol).qty,
+                            pair = %record.pair,
+                            qty = %self.state.position(&record.pair).qty,
                             "State store wants Disabled but position held — overriding to WindDown"
                         );
                         PairState::WindDown
@@ -567,40 +568,40 @@ impl Engine {
                     mp.state = effective_state;
                     mp.config = record.config;
                     tracing::info!(
-                        symbol = record.symbol,
+                        pair = %record.pair,
                         old_state = ?old_state,
                         new_state = ?effective_state,
                         "Pair updated from state store"
                     );
                     // If transitioning to Disabled, cancel orders for this pair
                     if effective_state == PairState::Disabled && old_state != PairState::Disabled {
-                        cmds.extend(self.cancel_pair_quotes(&record.symbol));
+                        cmds.extend(self.cancel_pair_quotes(&record.pair));
                     }
                     // If transitioning to Liquidating, start liquidation
                     if record.state == PairState::Liquidating && old_state != PairState::Liquidating {
-                        cmds.extend(self.on_liquidate(&record.symbol));
+                        cmds.extend(self.on_liquidate(&record.pair));
                     }
                 } else {
                     // New pair
                     let mp = ManagedPair::with_state_and_config(
-                        record.symbol.clone(),
+                        record.pair.clone(),
                         record.state,
                         record.config,
                         None,
                     );
                     tracing::info!(
-                        symbol = record.symbol,
+                        pair = %record.pair,
                         state = ?record.state,
                         "Added new pair from state store (pair_info pending)"
                     );
-                    self.pairs.insert(record.symbol, mp);
+                    self.pairs.insert(record.pair, mp);
                 }
                 cmds.push(EngineCommand::PersistState(self.state.clone()));
                 cmds
             }
-            StateStoreAction::PairRemoved { symbol } => {
-                tracing::info!(symbol, "Pair removed by state store");
-                let mut cmds = self.remove_managed_pair(&symbol);
+            StateStoreAction::PairRemoved { pair } => {
+                tracing::info!(pair = %pair, "Pair removed by state store");
+                let mut cmds = self.remove_managed_pair(&pair);
                 cmds.push(EngineCommand::PersistState(self.state.clone()));
                 cmds
             }
@@ -639,7 +640,7 @@ impl Engine {
 
     fn on_book_snapshot(
         &mut self,
-        symbol: String,
+        pair: Ticker,
         bids: Vec<LevelUpdate>,
         asks: Vec<LevelUpdate>,
         timestamp: DateTime<Utc>,
@@ -649,16 +650,16 @@ impl Engine {
             bids.into_iter().map(|l| (l.price, l.qty)),
             asks.into_iter().map(|l| (l.price, l.qty)),
         );
-        self.books.insert(symbol.clone(), book);
+        self.books.insert(pair.clone(), book);
 
-        let book = self.books.get(&symbol).unwrap();
+        let book = self.books.get(&pair).unwrap();
         let mid = book.mid_price();
         let spread_bps = book.spread().map(|s| s.as_bps());
         if let Some(m) = mid {
-            self.prices.insert(symbol.clone(), m);
+            self.prices.insert(pair.clone(), m);
         }
         tracing::info!(
-            symbol,
+            pair = %pair,
             mid = %mid.unwrap_or_default(),
             spread_bps = %spread_bps.unwrap_or_default().round_dp(0),
             bid_levels = book.bid_depth(),
@@ -666,17 +667,17 @@ impl Engine {
             "Book snapshot received"
         );
 
-        self.maybe_quote(&symbol, timestamp, QuoteTrigger::BookUpdate)
+        self.maybe_quote(&pair, timestamp, QuoteTrigger::BookUpdate)
     }
 
     fn on_book_update(
         &mut self,
-        symbol: String,
+        pair: Ticker,
         bid_updates: Vec<LevelUpdate>,
         ask_updates: Vec<LevelUpdate>,
         timestamp: DateTime<Utc>,
     ) -> Vec<EngineCommand> {
-        if let Some(book) = self.books.get_mut(&symbol) {
+        if let Some(book) = self.books.get_mut(&pair) {
             for lu in &bid_updates {
                 book.update_bid(lu.price, lu.qty);
             }
@@ -685,11 +686,11 @@ impl Engine {
             }
         }
 
-        if let Some(mid) = self.books.get(&symbol).and_then(|b| b.mid_price()) {
-            self.prices.insert(symbol.clone(), mid);
+        if let Some(mid) = self.books.get(&pair).and_then(|b| b.mid_price()) {
+            self.prices.insert(pair.clone(), mid);
         }
 
-        self.maybe_quote(&symbol, timestamp, QuoteTrigger::BookUpdate)
+        self.maybe_quote(&pair, timestamp, QuoteTrigger::BookUpdate)
     }
 
     // --- Fill ---
@@ -698,7 +699,7 @@ impl Engine {
         let mut cmds = vec![];
 
         tracing::info!(
-            symbol = fill.symbol,
+            pair = %fill.pair,
             side = %fill.side,
             qty = %fill.qty,
             price = %fill.price,
@@ -710,20 +711,20 @@ impl Engine {
         // Track consecutive buys without sell for buy gating
         match fill.side {
             OrderSide::Buy => {
-                if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+                if let Some(mp) = self.pairs.get_mut(&fill.pair) {
                     mp.buys_without_sell += 1;
                     tracing::debug!(
-                        symbol = fill.symbol,
+                        pair = %fill.pair,
                         buys_without_sell = mp.buys_without_sell,
                         "Buy fill — incrementing consecutive buy counter"
                     );
                 }
             }
             OrderSide::Sell => {
-                if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+                if let Some(mp) = self.pairs.get_mut(&fill.pair) {
                     if mp.buys_without_sell > 0 {
                         tracing::debug!(
-                            symbol = fill.symbol,
+                            pair = %fill.pair,
                             was = mp.buys_without_sell,
                             "Sell fill — resetting consecutive buy counter"
                         );
@@ -736,48 +737,48 @@ impl Engine {
         let mut pnl = Decimal::ZERO;
         match fill.side {
             OrderSide::Buy => {
-                let pos = self.state.positions.entry(fill.symbol.clone()).or_default();
+                let pos = self.state.positions.entry(fill.pair.clone()).or_default();
                 pos.apply_buy(fill.qty, fill.price);
                 self.state.total_fees += fill.fee;
                 self.state.trade_count += 1;
             }
             OrderSide::Sell => {
-                let pos = self.state.positions.entry(fill.symbol.clone()).or_default();
+                let pos = self.state.positions.entry(fill.pair.clone()).or_default();
                 pnl = pos.apply_sell(fill.qty, fill.price) - fill.fee;
                 self.state.realized_pnl += pnl;
                 self.state.total_fees += fill.fee;
                 self.state.trade_count += 1;
                 if pos.is_empty() {
-                    self.state.positions.remove(&fill.symbol);
+                    self.state.positions.remove(&fill.pair);
                     // If pair was Liquidating and position is now empty, transition to Disabled + cooldown
-                    let was_liquidating = self.pair_state(&fill.symbol) == Some(PairState::Liquidating);
+                    let was_liquidating = self.pair_state(&fill.pair) == Some(PairState::Liquidating);
                     if was_liquidating {
-                        if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+                        if let Some(mp) = self.pairs.get_mut(&fill.pair) {
                             mp.liq_retry_count = 0;
                         }
                         let cooldown_secs = self.config.risk.cooldown_after_liquidation_secs;
                         let until = Utc::now() + chrono::Duration::seconds(cooldown_secs as i64);
-                        self.state.cooldown_until.insert(fill.symbol.clone(), until);
-                        self.state.disabled_pairs.insert(fill.symbol.clone());
+                        self.state.cooldown_until.insert(fill.pair.clone(), until);
+                        self.state.disabled_pairs.insert(fill.pair.clone());
                         // Transition pair to Disabled
-                        if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+                        if let Some(mp) = self.pairs.get_mut(&fill.pair) {
                             mp.state = PairState::Disabled;
                         }
                         tracing::info!(
-                            symbol = fill.symbol,
+                            pair = %fill.pair,
                             cooldown_secs,
                             until = %until.format("%H:%M:%S UTC"),
                             "Liquidation complete — pair on cooldown"
                         );
                     }
                     // If pair was WindDown and position is now empty, transition to Disabled
-                    let is_wind_down = self.pair_state(&fill.symbol) == Some(PairState::WindDown);
+                    let is_wind_down = self.pair_state(&fill.pair) == Some(PairState::WindDown);
                     if is_wind_down {
-                        if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+                        if let Some(mp) = self.pairs.get_mut(&fill.pair) {
                             mp.state = PairState::Disabled;
                         }
                         tracing::info!(
-                            symbol = fill.symbol,
+                            pair = %fill.pair,
                             "WindDown complete — pair disabled (position empty)"
                         );
                     }
@@ -789,7 +790,7 @@ impl Engine {
         // Log trade
         cmds.push(EngineCommand::LogTrade(TradeRecord {
             timestamp: fill.timestamp,
-            symbol: fill.symbol.clone(),
+            pair: fill.pair.clone(),
             side: fill.side.to_string(),
             price: fill.price,
             qty: fill.qty,
@@ -802,7 +803,7 @@ impl Engine {
         // Update quoter state
         if fill.is_fully_filled {
             self.state.open_orders.remove(&fill.cl_ord_id);
-            if let Some(mp) = self.pairs.get_mut(&fill.symbol) {
+            if let Some(mp) = self.pairs.get_mut(&fill.pair) {
                 match fill.side {
                     OrderSide::Buy => mp.quoter.mark_bid_filled(),
                     OrderSide::Sell => mp.quoter.mark_ask_filled(),
@@ -823,9 +824,9 @@ impl Engine {
 
         // Immediately re-quote this pair (don't wait for next book update).
         // On low-liquidity pairs, book updates can be minutes apart.
-        let symbol = fill.symbol.clone();
-        tracing::info!(symbol, "Re-quoting after fill");
-        let quote_cmds = self.maybe_quote(&symbol, fill.timestamp, QuoteTrigger::Fill);
+        let pair = fill.pair.clone();
+        tracing::info!(pair = %pair, "Re-quoting after fill");
+        let quote_cmds = self.maybe_quote(&pair, fill.timestamp, QuoteTrigger::Fill);
         cmds.extend(quote_cmds);
 
         cmds
@@ -833,13 +834,13 @@ impl Engine {
 
     // --- Cancellation ---
 
-    fn on_order_cancelled(&mut self, cl_ord_id: &str, symbol: &str) -> Vec<EngineCommand> {
+    fn on_order_cancelled(&mut self, cl_ord_id: &str, pair: &Ticker) -> Vec<EngineCommand> {
         let side_str = self.state.open_orders.get(cl_ord_id)
             .map(|o| o.side.to_string())
             .unwrap_or_else(|| "?".to_string());
-        tracing::info!(cl_ord_id, symbol, side = side_str, "Order cancelled — returning to Idle for this side");
+        tracing::info!(cl_ord_id, pair = %pair, side = side_str, "Order cancelled — returning to Idle for this side");
         self.state.open_orders.remove(cl_ord_id);
-        if let Some(mp) = self.pairs.get_mut(symbol) {
+        if let Some(mp) = self.pairs.get_mut(pair) {
             mp.quoter.mark_cancelled(cl_ord_id);
         }
         vec![]
@@ -850,25 +851,25 @@ impl Engine {
     /// Phase 1: Cancel tracked orders for this specific pair only (NOT CancelAll).
     /// Ghost orders should be cleared by the startup CancelAll in run_live().
     /// The actual sell happens on the next tick (phase 2) after cancels clear.
-    pub fn on_liquidate(&mut self, symbol: &str) -> Vec<EngineCommand> {
+    pub fn on_liquidate(&mut self, pair: &Ticker) -> Vec<EngineCommand> {
         let mut cmds = vec![];
 
         // Skip if already pending liquidation
-        if self.pair_state(symbol) == Some(PairState::Liquidating) {
+        if self.pair_state(pair) == Some(PairState::Liquidating) {
             return cmds;
         }
 
-        let position = self.state.position(symbol);
+        let position = self.state.position(pair);
         if position.is_empty() {
-            tracing::warn!(symbol, "Liquidation requested but no position held");
+            tracing::warn!(pair = %pair, "Liquidation requested but no position held");
             return cmds;
         }
 
-        let pair_info = self.pair_info(symbol);
+        let pair_info = self.pair_info(pair);
         let qty_decimals = pair_info.map_or(8, |pi| pi.qty_decimals);
 
         tracing::error!(
-            symbol,
+            pair = %pair,
             qty = %position.qty,
             avg_cost = %position.avg_cost,
             value_usd = %(position.qty * position.avg_cost).round_dp(2),
@@ -877,15 +878,15 @@ impl Engine {
         );
 
         // Cancel orders for THIS pair only (targeted, not CancelAll)
-        let cancel_cmds = self.cancel_all_pair_orders(symbol);
+        let cancel_cmds = self.cancel_all_pair_orders(pair);
         cmds.extend(cancel_cmds);
 
         // Mark pair as Liquidating
-        if let Some(mp) = self.pairs.get_mut(symbol) {
+        if let Some(mp) = self.pairs.get_mut(pair) {
             mp.state = PairState::Liquidating;
             mp.liq_retry_count = 0;
         }
-        self.state.disabled_pairs.insert(symbol.to_string());
+        self.state.disabled_pairs.insert(pair.clone());
 
         cmds
     }
@@ -894,69 +895,69 @@ impl Engine {
     /// orders for it have been cleared. Now safe to send the market sell.
     /// No CancelAll — ghost orders are cleared at startup; targeted cancels
     /// in Phase 1 handle tracked orders.
-    fn send_liquidation_sell(&mut self, symbol: &str) -> Vec<EngineCommand> {
+    fn send_liquidation_sell(&mut self, pair: &Ticker) -> Vec<EngineCommand> {
         let mut cmds = vec![];
 
         // Check retry limit
-        let retries = self.pairs.get(symbol).map_or(0, |mp| mp.liq_retry_count);
+        let retries = self.pairs.get(pair).map_or(0, |mp| mp.liq_retry_count);
         if retries >= 3 {
             tracing::error!(
-                symbol,
+                pair = %pair,
                 retries,
                 "LIQUIDATION FAILED after {} attempts — giving up. Manual intervention needed. \
                  Position remains but pair is disabled to prevent new orders.",
                 retries
             );
             // Transition from Liquidating to Disabled
-            if let Some(mp) = self.pairs.get_mut(symbol) {
+            if let Some(mp) = self.pairs.get_mut(pair) {
                 mp.state = PairState::Disabled;
             }
             return cmds;
         }
 
-        let position = self.state.position(symbol);
+        let position = self.state.position(pair);
         if position.is_empty() {
-            tracing::info!(symbol, "Liquidation: position already empty — clearing state");
-            if let Some(mp) = self.pairs.get_mut(symbol) {
+            tracing::info!(pair = %pair, "Liquidation: position already empty — clearing state");
+            if let Some(mp) = self.pairs.get_mut(pair) {
                 mp.state = PairState::Disabled;
                 mp.liq_retry_count = 0;
             }
-            self.state.disabled_pairs.remove(symbol);
+            self.state.disabled_pairs.remove(pair);
             return cmds;
         }
 
-        let ref_price = self.books.get(symbol)
+        let ref_price = self.books.get(pair)
             .and_then(|b| b.best_bid())
             .map(|l| l.price)
-            .or_else(|| self.prices.get(symbol).copied())
+            .or_else(|| self.prices.get(pair).copied())
             .unwrap_or_default();
 
         if ref_price.is_zero() {
-            tracing::error!(symbol, "Cannot liquidate — no price available");
+            tracing::error!(pair = %pair, "Cannot liquidate — no price available");
             return cmds;
         }
 
-        let pair_info = self.pair_info(symbol);
+        let pair_info = self.pair_info(pair);
         let min_qty = pair_info.map_or(Decimal::ONE, |pi| pi.min_order_qty);
         let min_cost = pair_info.map_or(dec!(0.5), |pi| pi.min_cost);
         let qty_decimals = pair_info.map_or(8, |pi| pi.qty_decimals);
 
         if position.qty < min_qty || position.qty * ref_price < min_cost {
             tracing::warn!(
-                symbol,
+                pair = %pair,
                 qty = %position.qty,
                 min_qty = %min_qty,
                 min_cost = %min_cost,
                 "Cannot liquidate — below exchange minimums. Removing dust position."
             );
-            if let Some(mp) = self.pairs.get_mut(symbol) {
+            if let Some(mp) = self.pairs.get_mut(pair) {
                 mp.state = PairState::Disabled;
                 mp.liq_retry_count = 0;
             }
-            self.state.disabled_pairs.remove(symbol);
+            self.state.disabled_pairs.remove(pair);
             // Remove dust position so stop-loss doesn't re-trigger every tick
-            tracing::info!(symbol, qty = %position.qty, "Removing dust position from state");
-            self.state.positions.remove(symbol);
+            tracing::info!(pair = %pair, qty = %position.qty, "Removing dust position from state");
+            self.state.positions.remove(pair);
             cmds.push(EngineCommand::PersistState(self.state.clone()));
             return cmds;
         }
@@ -968,7 +969,7 @@ impl Engine {
         let qty = truncate_decimal(raw_qty, qty_decimals);
 
         tracing::error!(
-            symbol,
+            pair = %pair,
             cl_ord_id = cl_id,
             raw_qty = %raw_qty,
             truncated_qty = %qty,
@@ -984,7 +985,7 @@ impl Engine {
             cl_id.clone(),
             TrackedOrder {
                 cl_ord_id: cl_id.clone(),
-                symbol: symbol.to_string(),
+                pair: pair.clone(),
                 side: OrderSide::Sell,
                 price: ref_price,
                 qty,
@@ -995,7 +996,7 @@ impl Engine {
 
         cmds.push(EngineCommand::PlaceOrder(OrderRequest {
             cl_ord_id: cl_id,
-            symbol: symbol.to_string(),
+            pair: pair.clone(),
             side: OrderSide::Sell,
             price: ref_price,
             qty,
@@ -1007,10 +1008,10 @@ impl Engine {
         cmds
     }
 
-    /// Cancel ALL tracked orders for a symbol (not just quoter-tracked ones).
-    fn cancel_all_pair_orders(&mut self, symbol: &str) -> Vec<EngineCommand> {
+    /// Cancel ALL tracked orders for a pair (not just quoter-tracked ones).
+    fn cancel_all_pair_orders(&mut self, pair: &Ticker) -> Vec<EngineCommand> {
         // Cancel quoter state
-        if let Some(mp) = self.pairs.get_mut(symbol) {
+        if let Some(mp) = self.pairs.get_mut(pair) {
             mp.quoter.bid_cl_ord_id = None;
             mp.quoter.ask_cl_ord_id = None;
             mp.quoter.state = QuoteState::Idle;
@@ -1019,7 +1020,7 @@ impl Engine {
 
         // Find ALL orders for this pair in open_orders
         let to_cancel: Vec<String> = self.state.open_orders.iter()
-            .filter(|(_, o)| o.symbol == symbol)
+            .filter(|(_, o)| o.pair == *pair)
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1030,7 +1031,7 @@ impl Engine {
         if to_cancel.is_empty() {
             vec![]
         } else {
-            tracing::info!(symbol, orders = ?to_cancel, "Cancelling all pair orders for liquidation");
+            tracing::info!(pair = %pair, orders = ?to_cancel, "Cancelling all pair orders for liquidation");
             vec![EngineCommand::CancelOrders(to_cancel)]
         }
     }
@@ -1042,19 +1043,19 @@ impl Engine {
 
         // Check for expired cooldowns — remove cooldown but keep pair Disabled.
         // The PnL analyzer or manual state store action can re-enable if appropriate.
-        let expired: Vec<String> = self.state.cooldown_until.iter()
+        let expired: Vec<Ticker> = self.state.cooldown_until.iter()
             .filter(|(_, &until)| timestamp >= until)
-            .map(|(symbol, _)| symbol.clone())
+            .map(|(pair, _)| pair.clone())
             .collect();
-        for symbol in expired {
-            self.state.cooldown_until.remove(&symbol);
+        for pair in expired {
+            self.state.cooldown_until.remove(&pair);
             // Pair stays in disabled_pairs and state remains Disabled.
             // Only reset liq_retry_count so manual re-enable works cleanly.
-            if let Some(mp) = self.pairs.get_mut(&symbol) {
+            if let Some(mp) = self.pairs.get_mut(&pair) {
                 mp.liq_retry_count = 0;
             }
             tracing::info!(
-                symbol,
+                pair = %pair,
                 "Cooldown expired — pair remains disabled (requires manual or analyzer re-enable)"
             );
             cmds.push(EngineCommand::PersistState(self.state.clone()));
@@ -1064,25 +1065,25 @@ impl Engine {
         // - If a liq order is already pending -> wait for fill/rejection
         // - If old (non-liq) orders remain -> re-cancel them
         // - If no orders at all -> send the market sell
-        let liquidating: Vec<String> = self.pairs.iter()
+        let liquidating: Vec<Ticker> = self.pairs.iter()
             .filter(|(_, mp)| mp.state == PairState::Liquidating)
             .map(|(s, _)| s.clone())
             .collect();
-        for symbol in liquidating {
+        for pair in liquidating {
             let has_liq_order = self.state.open_orders.values()
-                .any(|o| o.symbol == symbol && o.cl_ord_id.starts_with("liq"));
+                .any(|o| o.pair == pair && o.cl_ord_id.starts_with("liq"));
             let has_other_orders = self.state.open_orders.values()
-                .any(|o| o.symbol == symbol && !o.cl_ord_id.starts_with("liq"));
+                .any(|o| o.pair == pair && !o.cl_ord_id.starts_with("liq"));
 
             if has_liq_order {
-                tracing::debug!(symbol, "Liquidation sell pending — waiting for fill/rejection");
+                tracing::debug!(pair = %pair, "Liquidation sell pending — waiting for fill/rejection");
             } else if has_other_orders {
                 // Old orders still present — re-cancel them
                 let stale: Vec<String> = self.state.open_orders.iter()
-                    .filter(|(_, o)| o.symbol == symbol && !o.cl_ord_id.starts_with("liq"))
+                    .filter(|(_, o)| o.pair == pair && !o.cl_ord_id.starts_with("liq"))
                     .map(|(id, _)| id.clone())
                     .collect();
-                tracing::warn!(symbol, remaining = ?stale, "Liquidation waiting for order cancels — re-cancelling");
+                tracing::warn!(pair = %pair, remaining = ?stale, "Liquidation waiting for order cancels — re-cancelling");
                 for id in &stale {
                     self.state.open_orders.remove(id);
                 }
@@ -1090,25 +1091,25 @@ impl Engine {
                     cmds.push(EngineCommand::CancelOrders(stale));
                 }
             } else {
-                tracing::info!(symbol, "Liquidation phase 2: all orders cleared, sending market sell");
-                cmds.extend(self.send_liquidation_sell(&symbol));
+                tracing::info!(pair = %pair, "Liquidation phase 2: all orders cleared, sending market sell");
+                cmds.extend(self.send_liquidation_sell(&pair));
             }
         }
 
         // Backfill avg_cost for positions restored from exchange balances.
         // When restored, avg_cost is zero (Kraken balances don't include cost basis).
         // Use the first available mid price as a proxy so stop-loss/take-profit can work.
-        let positions_needing_cost: Vec<String> = self.state.positions.iter()
+        let positions_needing_cost: Vec<Ticker> = self.state.positions.iter()
             .filter(|(_, pos)| !pos.is_empty() && pos.avg_cost.is_zero())
             .map(|(s, _)| s.clone())
             .collect();
-        for symbol in positions_needing_cost {
-            if let Some(mid) = self.prices.get(&symbol) {
+        for pair in positions_needing_cost {
+            if let Some(mid) = self.prices.get(&pair) {
                 if !mid.is_zero() {
-                    let pos = self.state.positions.entry(symbol.clone()).or_default();
+                    let pos = self.state.positions.entry(pair.clone()).or_default();
                     pos.avg_cost = *mid;
                     tracing::info!(
-                        symbol = %symbol,
+                        pair = %pair,
                         avg_cost = %mid,
                         qty = %pos.qty,
                         "Backfilled avg_cost from current mid (was zero from balance restore)"
@@ -1118,30 +1119,30 @@ impl Engine {
         }
 
         // Stop-loss AND take-profit check
-        // Collect (symbol, stop_loss_pct, take_profit_pct, use_winddown_for_stoploss)
-        let symbols_to_check: Vec<(String, Decimal, Decimal, bool)> = self.state.positions.iter()
-            .filter(|(symbol, pos)| {
+        // Collect (pair, stop_loss_pct, take_profit_pct, use_winddown_for_stoploss)
+        let pairs_to_check: Vec<(Ticker, Decimal, Decimal, bool)> = self.state.positions.iter()
+            .filter(|(pair, pos)| {
                 !pos.is_empty() && !pos.avg_cost.is_zero()
-                    && self.pair_state(symbol) != Some(PairState::Liquidating)
-                    && self.pair_state(symbol) != Some(PairState::Disabled)
-                    && self.pair_state(symbol) != Some(PairState::WindDown)
+                    && self.pair_state(pair) != Some(PairState::Liquidating)
+                    && self.pair_state(pair) != Some(PairState::Disabled)
+                    && self.pair_state(pair) != Some(PairState::WindDown)
             })
-            .map(|(symbol, _)| {
-                let resolved = self.resolved_config(symbol);
+            .map(|(pair, _)| {
+                let resolved = self.resolved_config(pair);
                 let stop_loss = resolved.as_ref().map_or(self.config.risk.stop_loss_pct, |r| r.stop_loss_pct);
                 let take_profit = resolved.as_ref().map_or(self.config.risk.take_profit_pct, |r| r.take_profit_pct);
                 let use_winddown = resolved.as_ref().map_or(true, |r| r.use_winddown_for_stoploss);
-                (symbol.clone(), stop_loss, take_profit, use_winddown)
+                (pair.clone(), stop_loss, take_profit, use_winddown)
             })
             .collect();
 
         // Separate stop-loss into WindDown vs Liquidate; take-profit always liquidates
-        let mut symbols_to_liquidate: Vec<String> = Vec::new();
-        let mut symbols_to_winddown: Vec<String> = Vec::new();
+        let mut pairs_to_liquidate: Vec<Ticker> = Vec::new();
+        let mut pairs_to_winddown: Vec<Ticker> = Vec::new();
 
-        for (symbol, stop_loss_pct, take_profit_pct, use_winddown) in &symbols_to_check {
-            let pos = self.state.position(symbol);
-            let mid = match self.prices.get(symbol) {
+        for (pair, stop_loss_pct, take_profit_pct, use_winddown) in &pairs_to_check {
+            let pos = self.state.position(pair);
+            let mid = match self.prices.get(pair) {
                 Some(m) => m,
                 None => continue,
             };
@@ -1149,54 +1150,54 @@ impl Engine {
             if change < -*stop_loss_pct {
                 if *use_winddown {
                     tracing::error!(
-                        symbol,
+                        pair = %pair,
                         mid = %mid,
                         avg_cost = %pos.avg_cost,
                         change_pct = %(change * Decimal::from(100)).round_dp(2),
                         threshold_pct = %(-*stop_loss_pct * Decimal::from(100)),
                         "STOP-LOSS TRIGGERED — entering WindDown (limit sells)"
                     );
-                    symbols_to_winddown.push(symbol.clone());
+                    pairs_to_winddown.push(pair.clone());
                 } else {
                     tracing::error!(
-                        symbol,
+                        pair = %pair,
                         mid = %mid,
                         avg_cost = %pos.avg_cost,
                         change_pct = %(change * Decimal::from(100)).round_dp(2),
                         threshold_pct = %(-*stop_loss_pct * Decimal::from(100)),
                         "STOP-LOSS TRIGGERED — starting liquidation"
                     );
-                    symbols_to_liquidate.push(symbol.clone());
+                    pairs_to_liquidate.push(pair.clone());
                 }
             } else if change > *take_profit_pct {
                 tracing::error!(
-                    symbol,
+                    pair = %pair,
                     mid = %mid,
                     avg_cost = %pos.avg_cost,
                     change_pct = %(change * Decimal::from(100)).round_dp(2),
                     threshold_pct = %(*take_profit_pct * Decimal::from(100)),
                     "TAKE-PROFIT TRIGGERED — starting liquidation"
                 );
-                symbols_to_liquidate.push(symbol.clone());
+                pairs_to_liquidate.push(pair.clone());
             }
         }
 
-        for symbol in symbols_to_liquidate {
-            cmds.extend(self.on_liquidate(&symbol));
+        for pair in pairs_to_liquidate {
+            cmds.extend(self.on_liquidate(&pair));
         }
-        for symbol in symbols_to_winddown {
-            if let Some(mp) = self.pairs.get_mut(&symbol) {
+        for pair in pairs_to_winddown {
+            if let Some(mp) = self.pairs.get_mut(&pair) {
                 mp.state = PairState::WindDown;
                 mp.winddown_since = Some(timestamp);
                 // Cancel buy orders for this pair
             }
-            cmds.extend(self.cancel_pair_quotes(&symbol));
+            cmds.extend(self.cancel_pair_quotes(&pair));
             cmds.push(EngineCommand::PersistState(self.state.clone()));
         }
 
         // WindDown escalation: if a pair has been in stop-loss WindDown too long, escalate to Liquidating
         let escalation_hours = self.config.risk.winddown_escalation_hours as i64;
-        let winddown_to_escalate: Vec<String> = self.pairs.iter()
+        let winddown_to_escalate: Vec<Ticker> = self.pairs.iter()
             .filter(|(_, mp)| {
                 mp.state == PairState::WindDown
                     && mp.winddown_since.is_some()
@@ -1204,17 +1205,17 @@ impl Engine {
             })
             .map(|(s, _)| s.clone())
             .collect();
-        for symbol in winddown_to_escalate {
+        for pair in winddown_to_escalate {
             tracing::error!(
-                symbol,
+                pair = %pair,
                 hours = escalation_hours,
                 "WindDown escalation — position not exited within {} hours, escalating to market liquidation",
                 escalation_hours
             );
-            if let Some(mp) = self.pairs.get_mut(&symbol) {
+            if let Some(mp) = self.pairs.get_mut(&pair) {
                 mp.winddown_since = None;
             }
-            cmds.extend(self.on_liquidate(&symbol));
+            cmds.extend(self.on_liquidate(&pair));
         }
 
         // Periodic status summary
@@ -1252,7 +1253,7 @@ impl Engine {
             tracing::info!(count = stale.len(), ids = ?stale, "Cancelling stale orders");
             for id in &stale {
                 if let Some(order) = self.state.open_orders.remove(id) {
-                    if let Some(mp) = self.pairs.get_mut(&order.symbol) {
+                    if let Some(mp) = self.pairs.get_mut(&order.pair) {
                         mp.quoter.mark_cancelled(id);
                     }
                 }
@@ -1275,12 +1276,12 @@ impl Engine {
         // Periodic requote for all active pairs.
         // This ensures recovery after rate-limit exhaustion leaves quoters idle,
         // and picks up spread changes between book updates.
-        let quotable_symbols: Vec<String> = self.pairs.iter()
+        let quotable_pairs: Vec<Ticker> = self.pairs.iter()
             .filter(|(_, mp)| mp.state == PairState::Active || mp.state == PairState::WindDown)
             .map(|(s, _)| s.clone())
             .collect();
-        for symbol in quotable_symbols {
-            cmds.extend(self.maybe_quote(&symbol, timestamp, QuoteTrigger::Tick));
+        for pair in quotable_pairs {
+            cmds.extend(self.maybe_quote(&pair, timestamp, QuoteTrigger::Tick));
         }
 
         cmds
@@ -1288,9 +1289,9 @@ impl Engine {
 
     // --- Quoting Logic ---
 
-    fn maybe_quote(&mut self, symbol: &str, timestamp: DateTime<Utc>, trigger: QuoteTrigger) -> Vec<EngineCommand> {
+    fn maybe_quote(&mut self, pair: &Ticker, timestamp: DateTime<Utc>, trigger: QuoteTrigger) -> Vec<EngineCommand> {
         // Check pair state
-        let pair_state = match self.pair_state(symbol) {
+        let pair_state = match self.pair_state(pair) {
             Some(s) => s,
             None => return vec![], // Unknown pair
         };
@@ -1300,7 +1301,7 @@ impl Engine {
         }
 
         // WindDown with no position -> nothing to do (avoid noisy logs)
-        if pair_state == PairState::WindDown && self.state.position(symbol).is_empty() {
+        if pair_state == PairState::WindDown && self.state.position(pair).is_empty() {
             return vec![];
         }
 
@@ -1308,7 +1309,7 @@ impl Engine {
         if trigger == QuoteTrigger::BookUpdate {
             let min_interval = self.config.trading.min_quote_interval_secs as i64;
             if min_interval > 0 {
-                if let Some(mp) = self.pairs.get(symbol) {
+                if let Some(mp) = self.pairs.get(pair) {
                     if let Some(last_qt) = mp.quoter.last_quote_time {
                         let elapsed = (timestamp - last_qt).num_seconds();
                         if elapsed < min_interval {
@@ -1320,13 +1321,13 @@ impl Engine {
         }
 
         if self.kill_switch.triggered {
-            tracing::debug!(symbol, "Skipping quote — kill switch triggered");
+            tracing::debug!(pair = %pair, "Skipping quote — kill switch triggered");
             return vec![];
         }
-        let book = match self.books.get(symbol) {
+        let book = match self.books.get(pair) {
             Some(b) if !b.is_empty() => b,
             _ => {
-                tracing::debug!(symbol, "Skipping quote — no book data");
+                tracing::debug!(pair = %pair, "Skipping quote — no book data");
                 return vec![];
             }
         };
@@ -1343,22 +1344,22 @@ impl Engine {
             None => return vec![],
         };
 
-        let pair_info = match self.pair_info(symbol) {
+        let pair_info = match self.pair_info(pair) {
             Some(pi) => pi.clone(),
             None => {
-                tracing::warn!(symbol, "Skipping quote — no pair_info");
+                tracing::warn!(pair = %pair, "Skipping quote — no pair_info");
                 return vec![];
             }
         };
 
-        let resolved = match self.resolved_config(symbol) {
+        let resolved = match self.resolved_config(pair) {
             Some(r) => r,
             None => return vec![],
         };
 
         let skew = inventory_skew(
             &self.state,
-            symbol,
+            pair,
             mid,
             resolved.max_inventory_usd,
         );
@@ -1392,7 +1393,7 @@ impl Engine {
             winddown_escalation_hours: self.config.risk.winddown_escalation_hours,
         };
 
-        let quoter = match self.pairs.get(symbol) {
+        let quoter = match self.pairs.get(pair) {
             Some(mp) => &mp.quoter,
             None => return vec![],
         };
@@ -1409,8 +1410,8 @@ impl Engine {
         match quotes {
             None => {
                 // Spread too narrow to place NEW quotes.
-                let quoter = &self.pairs.get(symbol).unwrap().quoter;
-                let has_position = !self.state.position(symbol).is_empty();
+                let quoter = &self.pairs.get(pair).unwrap().quoter;
+                let has_position = !self.state.position(pair).is_empty();
 
                 // WindDown with position: NEVER cancel sell orders due to spread.
                 // The whole point of WindDown is to exit — keep sells on the book.
@@ -1418,17 +1419,17 @@ impl Engine {
                     if quoter.state == QuoteState::Idle {
                         // Place a sell at best_ask regardless of spread
                         tracing::info!(
-                            symbol,
+                            pair = %pair,
                             spread_bps = %spread_bps_raw,
                             best_ask = %best_ask,
                             "WindDown: placing sell at best ask despite narrow spread"
                         );
                         self.place_fresh_quotes(
-                            symbol, best_bid, best_ask, qty, mid, timestamp, &risk, pair_state,
+                            pair, best_bid, best_ask, qty, mid, timestamp, &risk, pair_state,
                         )
                     } else {
                         tracing::debug!(
-                            symbol,
+                            pair = %pair,
                             spread_bps = %spread_bps_raw,
                             "WindDown: holding existing sell (ignoring narrow spread)"
                         );
@@ -1439,16 +1440,16 @@ impl Engine {
                     let cancel_threshold = resolved.min_spread_bps * dec!(0.7);
                     if spread_bps_raw < cancel_threshold {
                         tracing::info!(
-                            symbol,
+                            pair = %pair,
                             spread_bps = %spread_bps_raw,
                             cancel_threshold = %cancel_threshold,
                             state = ?quoter.state,
                             "Spread well below threshold — cancelling quotes"
                         );
-                        self.cancel_pair_quotes(symbol)
+                        self.cancel_pair_quotes(pair)
                     } else {
                         tracing::debug!(
-                            symbol,
+                            pair = %pair,
                             spread_bps = %spread_bps_raw,
                             min = %resolved.min_spread_bps,
                             "Spread narrowed but holding existing quotes (hysteresis)"
@@ -1460,32 +1461,32 @@ impl Engine {
                 }
             }
             Some((bid_price, ask_price)) => {
-                let quoter = &self.pairs.get(symbol).unwrap().quoter;
+                let quoter = &self.pairs.get(pair).unwrap().quoter;
                 match quoter.state {
                     QuoteState::Idle => {
                         tracing::info!(
-                            symbol,
+                            pair = %pair,
                             mid = %mid,
                             spread_bps = %spread_bps_raw,
                             "Spread wide enough — placing fresh quotes"
                         );
-                        self.place_fresh_quotes(symbol, bid_price, ask_price, qty, mid, timestamp, &risk, pair_state)
+                        self.place_fresh_quotes(pair, bid_price, ask_price, qty, mid, timestamp, &risk, pair_state)
                     }
                     QuoteState::Quoting => {
                         let should = quoter.should_requote(mid, &trading);
                         if should {
-                            self.requote(symbol, bid_price, ask_price, mid, &resolved)
+                            self.requote(pair, bid_price, ask_price, mid, &resolved)
                         } else {
                             vec![]
                         }
                     }
                     QuoteState::BidFilled => {
-                        tracing::debug!(symbol, "Bid filled — managing ask side");
-                        self.manage_one_side(symbol, OrderSide::Sell, ask_price, qty, mid, timestamp, pair_state, &risk, &resolved)
+                        tracing::debug!(pair = %pair, "Bid filled — managing ask side");
+                        self.manage_one_side(pair, OrderSide::Sell, ask_price, qty, mid, timestamp, pair_state, &risk, &resolved)
                     }
                     QuoteState::AskFilled => {
-                        tracing::debug!(symbol, "Ask filled — managing bid side");
-                        self.manage_one_side(symbol, OrderSide::Buy, bid_price, qty, mid, timestamp, pair_state, &risk, &resolved)
+                        tracing::debug!(pair = %pair, "Ask filled — managing bid side");
+                        self.manage_one_side(pair, OrderSide::Buy, bid_price, qty, mid, timestamp, pair_state, &risk, &resolved)
                     }
                 }
             }
@@ -1494,7 +1495,7 @@ impl Engine {
 
     fn place_fresh_quotes(
         &mut self,
-        symbol: &str,
+        pair: &Ticker,
         bid_price: Decimal,
         ask_price: Decimal,
         qty: Decimal,
@@ -1505,8 +1506,8 @@ impl Engine {
     ) -> Vec<EngineCommand> {
         let mut cmds = vec![];
 
-        let position = self.state.position(symbol);
-        let pair_exposure = self.state.pair_exposure_usd(symbol, mid);
+        let position = self.state.position(pair);
+        let pair_exposure = self.state.pair_exposure_usd(pair, mid);
         let total_exposure = self.state.total_exposure_usd(&self.prices);
         let order_value = qty * mid;
 
@@ -1514,7 +1515,7 @@ impl Engine {
             false
         } else if !can_open_buy(
             &self.state,
-            symbol,
+            pair,
             order_value,
             mid,
             &self.prices,
@@ -1523,12 +1524,12 @@ impl Engine {
             false
         } else {
             // Buy gating: block buys after too many consecutive buys without a sell
-            let resolved = self.resolved_config(symbol);
+            let resolved = self.resolved_config(pair);
             let max_buys = resolved.as_ref().map_or(2, |r| r.max_buys_before_sell);
-            let buys_without_sell = self.pairs.get(symbol).map_or(0, |mp| mp.buys_without_sell);
+            let buys_without_sell = self.pairs.get(pair).map_or(0, |mp| mp.buys_without_sell);
             if buys_without_sell >= max_buys {
                 tracing::warn!(
-                    symbol,
+                    pair = %pair,
                     buys_without_sell,
                     limit = max_buys,
                     "Blocking buy — {} buys without sell (limit: {})",
@@ -1542,7 +1543,7 @@ impl Engine {
 
         // Sell what we have, even if less than full order_size_usd.
         // Only need to meet the pair's minimum order requirements.
-        let pair_info = self.pair_info(symbol);
+        let pair_info = self.pair_info(pair);
         let min_qty = pair_info.map_or(Decimal::ONE, |pi| pi.min_order_qty);
         let min_cost = pair_info.map_or(dec!(0.5), |pi| pi.min_cost);
         let can_sell = pair_state.allows_sells() && position.qty >= min_qty && position.qty * mid >= min_cost;
@@ -1557,18 +1558,18 @@ impl Engine {
 
         // Cost-anchored sell: never sell below avg_cost * (1 + min_profit_pct)
         let price_decimals = pair_info.map_or(8, |pi| pi.price_decimals);
-        let resolved = self.resolved_config(symbol);
+        let resolved = self.resolved_config(pair);
         let min_profit_pct = resolved.as_ref().map_or(self.config.trading.min_profit_pct, |r| r.min_profit_pct);
         let (ask_price, can_sell) = if !position.avg_cost.is_zero() && can_sell {
             let cost_floor = (position.avg_cost * (Decimal::ONE + min_profit_pct))
                 .round_dp(price_decimals);
             if cost_floor > ask_price {
                 // Check if cost floor is too far above the book ask (market price protection)
-                let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price);
+                let book_best_ask = self.books.get(pair).and_then(|b| b.best_ask()).map(|l| l.price);
                 let deviation_limit = book_best_ask.unwrap_or(ask_price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
                 if cost_floor > deviation_limit {
                     tracing::warn!(
-                        symbol,
+                        pair = %pair,
                         book_ask = %ask_price,
                         cost_floor = %cost_floor,
                         avg_cost = %position.avg_cost,
@@ -1578,7 +1579,7 @@ impl Engine {
                     (ask_price, false)
                 } else {
                     tracing::info!(
-                        symbol,
+                        pair = %pair,
                         book_ask = %ask_price,
                         cost_floor = %cost_floor,
                         avg_cost = %position.avg_cost,
@@ -1594,7 +1595,7 @@ impl Engine {
         };
 
         tracing::info!(
-            symbol,
+            pair = %pair,
             position_qty = %position.qty,
             position_value_usd = %(position.qty * mid).round_dp(2),
             position_avg_cost = %position.avg_cost,
@@ -1614,7 +1615,7 @@ impl Engine {
 
         if !can_sell && !position.qty.is_zero() {
             tracing::info!(
-                symbol,
+                pair = %pair,
                 held = %position.qty,
                 min_order_qty = %min_qty,
                 min_cost_usd = %min_cost,
@@ -1624,7 +1625,7 @@ impl Engine {
         if !can_buy {
             if !pair_state.allows_buys() {
                 tracing::info!(
-                    symbol,
+                    pair = %pair,
                     pair_state = ?pair_state,
                     "Cannot buy — pair state restricts buys"
                 );
@@ -1635,7 +1636,7 @@ impl Engine {
                     "total exposure limit"
                 };
                 tracing::info!(
-                    symbol,
+                    pair = %pair,
                     reason,
                     pair_exposure_usd = %pair_exposure.round_dp(2),
                     total_exposure_usd = %total_exposure.round_dp(2),
@@ -1655,7 +1656,7 @@ impl Engine {
             let bid_id = self.next_cl_ord_id("bid");
             let req = OrderRequest {
                 cl_ord_id: bid_id.clone(),
-                symbol: symbol.to_string(),
+                pair: pair.clone(),
                 side: OrderSide::Buy,
                 price: bid_price,
                 qty,
@@ -1667,7 +1668,7 @@ impl Engine {
                 bid_id.clone(),
                 TrackedOrder {
                     cl_ord_id: bid_id.clone(),
-                    symbol: symbol.to_string(),
+                    pair: pair.clone(),
                     side: OrderSide::Buy,
                     price: bid_price,
                     qty,
@@ -1684,7 +1685,7 @@ impl Engine {
             let ask_id = self.next_cl_ord_id("ask");
             let ask_req = OrderRequest {
                 cl_ord_id: ask_id.clone(),
-                symbol: symbol.to_string(),
+                pair: pair.clone(),
                 side: OrderSide::Sell,
                 price: ask_price,
                 qty: sell_qty,
@@ -1696,7 +1697,7 @@ impl Engine {
                 ask_id.clone(),
                 TrackedOrder {
                     cl_ord_id: ask_id.clone(),
-                    symbol: symbol.to_string(),
+                    pair: pair.clone(),
                     side: OrderSide::Sell,
                     price: ask_price,
                     qty: sell_qty,
@@ -1712,7 +1713,7 @@ impl Engine {
             return cmds;
         }
 
-        if let Some(mp) = self.pairs.get_mut(symbol) {
+        if let Some(mp) = self.pairs.get_mut(pair) {
             mp.quoter.state = crate::engine::quoter::QuoteState::Quoting;
             mp.quoter.last_mid = Some(mid);
             mp.quoter.last_quote_time = Some(timestamp);
@@ -1726,7 +1727,7 @@ impl Engine {
 
         if let Some(ref bid_id) = bid_id_placed {
             tracing::info!(
-                symbol,
+                pair = %pair,
                 side = "BUY",
                 cl_ord_id = bid_id.as_str(),
                 price = %bid_price,
@@ -1736,7 +1737,7 @@ impl Engine {
         }
         if let Some(ref ask_id) = ask_id_placed {
             tracing::info!(
-                symbol,
+                pair = %pair,
                 side = "SELL",
                 cl_ord_id = ask_id.as_str(),
                 price = %ask_price,
@@ -1750,7 +1751,7 @@ impl Engine {
 
     fn requote(
         &mut self,
-        symbol: &str,
+        pair: &Ticker,
         bid_price: Decimal,
         ask_price: Decimal,
         mid: Decimal,
@@ -1760,18 +1761,18 @@ impl Engine {
 
         // Apply cost floor to ask price, but skip if it would trigger market price protection
         let (ask_price, skip_ask) = {
-            let position = self.state.position(symbol);
+            let position = self.state.position(pair);
             if !position.avg_cost.is_zero() {
-                let price_decimals = self.pair_info(symbol).map_or(8, |pi| pi.price_decimals);
+                let price_decimals = self.pair_info(pair).map_or(8, |pi| pi.price_decimals);
                 let cost_floor = (position.avg_cost * (Decimal::ONE + resolved.min_profit_pct))
                     .round_dp(price_decimals);
                 let adjusted = ask_price.max(cost_floor);
                 if cost_floor > ask_price {
-                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price);
+                    let book_best_ask = self.books.get(pair).and_then(|b| b.best_ask()).map(|l| l.price);
                     let deviation_limit = book_best_ask.unwrap_or(ask_price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
                     if cost_floor > deviation_limit {
                         tracing::warn!(
-                            symbol,
+                            pair = %pair,
                             book_ask = %ask_price,
                             cost_floor = %cost_floor,
                             avg_cost = %position.avg_cost,
@@ -1789,7 +1790,7 @@ impl Engine {
             }
         };
 
-        let quoter = match self.pairs.get_mut(symbol) {
+        let quoter = match self.pairs.get_mut(pair) {
             Some(mp) => &mut mp.quoter,
             None => return cmds,
         };
@@ -1797,9 +1798,9 @@ impl Engine {
         if let Some(ref bid_id) = quoter.bid_cl_ord_id {
             if let Some(order) = self.state.open_orders.get(bid_id) {
                 if !order.acked {
-                    tracing::debug!(symbol, cl_ord_id = bid_id.as_str(), "Skipping bid amend — not yet acked");
+                    tracing::debug!(pair = %pair, cl_ord_id = bid_id.as_str(), "Skipping bid amend — not yet acked");
                 } else if order.price == bid_price {
-                    tracing::debug!(symbol, cl_ord_id = bid_id.as_str(), "Skipping bid amend — price unchanged");
+                    tracing::debug!(pair = %pair, cl_ord_id = bid_id.as_str(), "Skipping bid amend — price unchanged");
                 } else {
                     cmds.push(EngineCommand::AmendOrder {
                         cl_ord_id: bid_id.clone(),
@@ -1828,9 +1829,9 @@ impl Engine {
         if let Some(ref ask_id) = quoter.ask_cl_ord_id {
             if let Some(order) = self.state.open_orders.get(ask_id) {
                 if !order.acked {
-                    tracing::debug!(symbol, cl_ord_id = ask_id.as_str(), "Skipping ask amend — not yet acked");
+                    tracing::debug!(pair = %pair, cl_ord_id = ask_id.as_str(), "Skipping ask amend — not yet acked");
                 } else if order.price == ask_price {
-                    tracing::debug!(symbol, cl_ord_id = ask_id.as_str(), "Skipping ask amend — price unchanged");
+                    tracing::debug!(pair = %pair, cl_ord_id = ask_id.as_str(), "Skipping ask amend — price unchanged");
                 } else {
                     cmds.push(EngineCommand::AmendOrder {
                         cl_ord_id: ask_id.clone(),
@@ -1848,7 +1849,7 @@ impl Engine {
 
         if !cmds.is_empty() {
             let spread_bps = (ask_price - bid_price) / mid * dec!(10000);
-            tracing::info!(symbol, bid = %bid_price, ask = %ask_price, spread_bps = %spread_bps.round_dp(0), "Requoting — mid moved");
+            tracing::info!(pair = %pair, bid = %bid_price, ask = %ask_price, spread_bps = %spread_bps.round_dp(0), "Requoting — mid moved");
         }
 
         cmds
@@ -1856,7 +1857,7 @@ impl Engine {
 
     fn manage_one_side(
         &mut self,
-        symbol: &str,
+        pair: &Ticker,
         side: OrderSide,
         price: Decimal,
         qty: Decimal,
@@ -1868,17 +1869,17 @@ impl Engine {
     ) -> Vec<EngineCommand> {
         // Apply cost floor for sells, but skip if it would trigger market price protection
         let price = if side == OrderSide::Sell {
-            let position = self.state.position(symbol);
+            let position = self.state.position(pair);
             if !position.avg_cost.is_zero() {
-                let price_decimals = self.pair_info(symbol).map_or(8, |pi| pi.price_decimals);
+                let price_decimals = self.pair_info(pair).map_or(8, |pi| pi.price_decimals);
                 let cost_floor = (position.avg_cost * (Decimal::ONE + resolved.min_profit_pct))
                     .round_dp(price_decimals);
                 if cost_floor > price {
-                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price);
+                    let book_best_ask = self.books.get(pair).and_then(|b| b.best_ask()).map(|l| l.price);
                     let deviation_limit = book_best_ask.unwrap_or(price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
                     if cost_floor > deviation_limit {
                         tracing::warn!(
-                            symbol,
+                            pair = %pair,
                             book_ask = %price,
                             cost_floor = %cost_floor,
                             avg_cost = %position.avg_cost,
@@ -1895,7 +1896,7 @@ impl Engine {
             price
         };
 
-        let quoter = match self.pairs.get(symbol) {
+        let quoter = match self.pairs.get(pair) {
             Some(mp) => &mp.quoter,
             None => return vec![],
         };
@@ -1909,7 +1910,7 @@ impl Engine {
             // Amend if price moved enough AND order is acked
             if let Some(order) = self.state.open_orders.get(id) {
                 if !order.acked {
-                    tracing::debug!(symbol, cl_ord_id = id.as_str(), "Skipping amend — not yet acked");
+                    tracing::debug!(pair = %pair, cl_ord_id = id.as_str(), "Skipping amend — not yet acked");
                     return vec![];
                 }
                 if order.price.is_zero()
@@ -1931,12 +1932,12 @@ impl Engine {
         } else {
             // Compute actual order qty (for sells, cap to position)
             let actual_qty = if side == OrderSide::Sell {
-                let position = self.state.position(symbol);
-                let pair_info = self.pair_info(symbol);
+                let position = self.state.position(pair);
+                let pair_info = self.pair_info(pair);
                 let min_qty = pair_info.map_or(Decimal::ONE, |pi| pi.min_order_qty);
                 let min_cost = pair_info.map_or(dec!(0.5), |pi| pi.min_cost);
                 if position.qty < min_qty || position.qty * mid < min_cost {
-                    tracing::debug!(symbol, held = %position.qty, "Cannot sell — below exchange minimums");
+                    tracing::debug!(pair = %pair, held = %position.qty, "Cannot sell — below exchange minimums");
                     return vec![];
                 }
                 let qty_dp = pair_info.map_or(8, |pi| pi.qty_decimals);
@@ -1952,7 +1953,7 @@ impl Engine {
                 }
                 if !can_open_buy(
                     &self.state,
-                    symbol,
+                    pair,
                     actual_qty * mid,
                     mid,
                     &self.prices,
@@ -1962,10 +1963,10 @@ impl Engine {
                 }
                 // Buy gating: block buys after too many consecutive buys without a sell
                 let max_buys = resolved.max_buys_before_sell;
-                let buys_without_sell = self.pairs.get(symbol).map_or(0, |mp| mp.buys_without_sell);
+                let buys_without_sell = self.pairs.get(pair).map_or(0, |mp| mp.buys_without_sell);
                 if buys_without_sell >= max_buys {
                     tracing::warn!(
-                        symbol,
+                        pair = %pair,
                         buys_without_sell,
                         limit = max_buys,
                         "Blocking buy — {} buys without sell (limit: {})",
@@ -1980,7 +1981,7 @@ impl Engine {
                 cl_id.clone(),
                 TrackedOrder {
                     cl_ord_id: cl_id.clone(),
-                    symbol: symbol.to_string(),
+                    pair: pair.clone(),
                     side,
                     price,
                     qty: actual_qty,
@@ -1989,7 +1990,7 @@ impl Engine {
                 },
             );
 
-            let quoter = &mut self.pairs.get_mut(symbol).unwrap().quoter;
+            let quoter = &mut self.pairs.get_mut(pair).unwrap().quoter;
             match side {
                 OrderSide::Buy => quoter.bid_cl_ord_id = Some(cl_id.clone()),
                 OrderSide::Sell => quoter.ask_cl_ord_id = Some(cl_id.clone()),
@@ -1997,7 +1998,7 @@ impl Engine {
 
             vec![EngineCommand::PlaceOrder(OrderRequest {
                 cl_ord_id: cl_id,
-                symbol: symbol.to_string(),
+                pair: pair.clone(),
                 side,
                 price,
                 qty: actual_qty,
@@ -2008,8 +2009,8 @@ impl Engine {
         }
     }
 
-    fn cancel_pair_quotes(&mut self, symbol: &str) -> Vec<EngineCommand> {
-        let quoter = match self.pairs.get_mut(symbol) {
+    fn cancel_pair_quotes(&mut self, pair: &Ticker) -> Vec<EngineCommand> {
+        let quoter = match self.pairs.get_mut(pair) {
             Some(mp) => &mut mp.quoter,
             None => return vec![],
         };
@@ -2049,19 +2050,19 @@ mod tests {
         cfg
     }
 
-    fn test_pair_info() -> HashMap<String, PairInfo> {
+    fn test_pair_info() -> HashMap<Ticker, PairInfo> {
         let mut m = HashMap::new();
         m.insert(
-            "TEST/USD".into(),
+            Ticker::from("TEST/USD"),
             PairInfo {
-                symbol: "TEST/USD".into(),
+                pair: Ticker::from("TEST/USD"),
                 rest_key: "TESTUSD".into(),
                 min_order_qty: dec!(1),
                 min_cost: dec!(0.5),
                 price_decimals: 5,
                 qty_decimals: 4,
                 maker_fee_pct: dec!(0.0023),
-                base_asset: "TEST".into(),
+                exchange_base_asset: "TEST".into(),
             },
         );
         m
@@ -2071,7 +2072,7 @@ mod tests {
     fn test_book_snapshot_triggers_quotes() {
         let mut engine = Engine::new(test_config(), test_pair_info(), BotState::default());
         let cmds = engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
             asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
             timestamp: Utc::now(),
@@ -2092,7 +2093,7 @@ mod tests {
     fn test_narrow_spread_no_quote() {
         let mut engine = Engine::new(test_config(), test_pair_info(), BotState::default());
         let cmds = engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(1.000), qty: dec!(100) }],
             asks: vec![LevelUpdate { price: dec!(1.001), qty: dec!(100) }],
             timestamp: Utc::now(),
@@ -2114,7 +2115,7 @@ mod tests {
         engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "o1".into(),
             cl_ord_id: "bid-1".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Buy,
             price: dec!(0.10),
             qty: dec!(100),
@@ -2124,13 +2125,13 @@ mod tests {
             timestamp: Utc::now(),
         }));
 
-        assert_eq!(engine.state.position("TEST/USD").qty, dec!(100));
+        assert_eq!(engine.state.position(&Ticker::from("TEST/USD")).qty, dec!(100));
 
         // Sell at profit
         let cmds = engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "o2".into(),
             cl_ord_id: "ask-1".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Sell,
             price: dec!(0.12),
             qty: dec!(100),
@@ -2140,7 +2141,7 @@ mod tests {
             timestamp: Utc::now(),
         }));
 
-        assert!(engine.state.position("TEST/USD").is_empty());
+        assert!(engine.state.position(&Ticker::from("TEST/USD")).is_empty());
         // pnl = 100 * (0.12 - 0.10) - 0.028 = 2.0 - 0.028 = 1.972
         assert_eq!(engine.state.realized_pnl, dec!(1.972));
 
@@ -2160,7 +2161,7 @@ mod tests {
         engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "o1".into(),
             cl_ord_id: "bid-1".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Buy,
             price: dec!(0.10),
             qty: dec!(100),
@@ -2174,7 +2175,7 @@ mod tests {
         let cmds = engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "o2".into(),
             cl_ord_id: "ask-1".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Sell,
             price: dec!(0.05),
             qty: dec!(100),
@@ -2195,7 +2196,7 @@ mod tests {
 
         let mut state = BotState::default();
         // Position bought at 0.10 avg_cost
-        state.positions.insert("TEST/USD".into(), Position {
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
             qty: dec!(100),
             avg_cost: dec!(0.10),
         });
@@ -2209,7 +2210,7 @@ mod tests {
 
         // Feed book snapshot with mid at 0.096 (4% drop, > 3% threshold)
         engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.095), qty: dec!(1000) }],
             asks: vec![LevelUpdate { price: dec!(0.097), qty: dec!(1000) }],
             timestamp: Utc::now(),
@@ -2232,7 +2233,7 @@ mod tests {
         assert!(sell_orders1.is_empty(), "Phase 1 should NOT place sell — only cancel");
 
         // Pair should be in Liquidating state
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Liquidating);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Liquidating);
 
         // PHASE 2: Second tick — orders cleared, now send the market sell
         let cmds2 = engine.handle_event(EngineEvent::Tick {
@@ -2275,7 +2276,7 @@ mod tests {
         cfg.risk.cooldown_after_liquidation_secs = 60; // 60s cooldown
 
         let mut state = BotState::default();
-        state.positions.insert("TEST/USD".into(), Position {
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
             qty: dec!(100),
             avg_cost: dec!(0.10),
         });
@@ -2289,7 +2290,7 @@ mod tests {
 
         // Set up book
         engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.095), qty: dec!(1000) }],
             asks: vec![LevelUpdate { price: dec!(0.097), qty: dec!(1000) }],
             timestamp: Utc::now(),
@@ -2303,7 +2304,7 @@ mod tests {
         engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "liq-fill".into(),
             cl_ord_id: "liq-1".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Sell,
             price: dec!(0.095),
             qty: dec!(100),
@@ -2314,24 +2315,24 @@ mod tests {
         }));
 
         // Pair should be Disabled and on cooldown
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Disabled,
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Disabled,
             "Pair should be Disabled after liquidation");
-        assert!(engine.state.disabled_pairs.contains("TEST/USD"), "Persisted state should show disabled");
-        assert!(engine.state.cooldown_until.contains_key("TEST/USD"), "Persisted state should show cooldown");
+        assert!(engine.state.disabled_pairs.contains(&Ticker::from("TEST/USD")), "Persisted state should show disabled");
+        assert!(engine.state.cooldown_until.contains_key(&Ticker::from("TEST/USD")), "Persisted state should show cooldown");
 
         // Tick before cooldown expires — should stay disabled
         let before_expiry = Utc::now() + chrono::Duration::seconds(30);
         engine.handle_event(EngineEvent::Tick { timestamp: before_expiry });
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Disabled,
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Disabled,
             "Pair should still be Disabled before cooldown expires");
 
         // Tick after cooldown expires — pair stays Disabled (no auto re-enable)
         let after_expiry = Utc::now() + chrono::Duration::seconds(120);
         engine.handle_event(EngineEvent::Tick { timestamp: after_expiry });
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Disabled,
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Disabled,
             "Pair should remain Disabled after cooldown (no auto re-enable)");
-        assert!(!engine.state.cooldown_until.contains_key("TEST/USD"), "Cooldown entry should be removed");
-        assert!(engine.state.disabled_pairs.contains("TEST/USD"), "Pair should still be in disabled set");
+        assert!(!engine.state.cooldown_until.contains_key(&Ticker::from("TEST/USD")), "Cooldown entry should be removed");
+        assert!(engine.state.disabled_pairs.contains(&Ticker::from("TEST/USD")), "Pair should still be in disabled set");
     }
 
     #[test]
@@ -2341,18 +2342,18 @@ mod tests {
 
         // Disable a pair via API
         let cmds = engine.handle_event(EngineEvent::ApiCommand(
-            crate::types::event::ApiAction::DisablePair { symbol: "TEST/USD".into() }
+            crate::types::event::ApiAction::DisablePair { pair: Ticker::from("TEST/USD") }
         ));
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Disabled);
-        assert!(engine.state.disabled_pairs.contains("TEST/USD"));
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Disabled);
+        assert!(engine.state.disabled_pairs.contains(&Ticker::from("TEST/USD")));
         assert!(cmds.iter().any(|c| matches!(c, EngineCommand::PersistState(_))));
 
         // Re-enable via API
         let cmds = engine.handle_event(EngineEvent::ApiCommand(
-            crate::types::event::ApiAction::EnablePair { symbol: "TEST/USD".into() }
+            crate::types::event::ApiAction::EnablePair { pair: Ticker::from("TEST/USD") }
         ));
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Active);
-        assert!(!engine.state.disabled_pairs.contains("TEST/USD"));
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Active);
+        assert!(!engine.state.disabled_pairs.contains(&Ticker::from("TEST/USD")));
         assert!(cmds.iter().any(|c| matches!(c, EngineCommand::PersistState(_))));
     }
 
@@ -2364,20 +2365,20 @@ mod tests {
 
         // Simulate a cooldown being active
         let until = Utc::now() + chrono::Duration::seconds(3600);
-        engine.state.cooldown_until.insert("TEST/USD".into(), until);
-        engine.state.disabled_pairs.insert("TEST/USD".into());
-        if let Some(mp) = engine.pairs.get_mut("TEST/USD") {
+        engine.state.cooldown_until.insert(Ticker::from("TEST/USD"), until);
+        engine.state.disabled_pairs.insert(Ticker::from("TEST/USD"));
+        if let Some(mp) = engine.pairs.get_mut(&Ticker::from("TEST/USD")) {
             mp.state = PairState::Disabled;
         }
 
         // Manual enable should clear cooldown
         engine.handle_event(EngineEvent::ApiCommand(
-            crate::types::event::ApiAction::EnablePair { symbol: "TEST/USD".into() }
+            crate::types::event::ApiAction::EnablePair { pair: Ticker::from("TEST/USD") }
         ));
 
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Active);
-        assert!(!engine.state.cooldown_until.contains_key("TEST/USD"));
-        assert!(!engine.state.disabled_pairs.contains("TEST/USD"));
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Active);
+        assert!(!engine.state.cooldown_until.contains_key(&Ticker::from("TEST/USD")));
+        assert!(!engine.state.disabled_pairs.contains(&Ticker::from("TEST/USD")));
     }
 
     #[test]
@@ -2385,14 +2386,14 @@ mod tests {
         let cfg = test_config();
         let mut state = BotState::default();
         let until = Utc::now() + chrono::Duration::seconds(3600);
-        state.disabled_pairs.insert("TEST/USD".into());
-        state.cooldown_until.insert("TEST/USD".into(), until);
+        state.disabled_pairs.insert(Ticker::from("TEST/USD"));
+        state.cooldown_until.insert(Ticker::from("TEST/USD"), until);
 
         let engine = Engine::new(cfg, test_pair_info(), state);
 
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Disabled,
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Disabled,
             "Should restore disabled pairs from state");
-        assert!(engine.state.cooldown_until.contains_key("TEST/USD"), "Should restore cooldowns from state");
+        assert!(engine.state.cooldown_until.contains_key(&Ticker::from("TEST/USD")), "Should restore cooldowns from state");
     }
 
     #[test]
@@ -2401,19 +2402,19 @@ mod tests {
         let mut engine = Engine::new(cfg, test_pair_info(), BotState::default());
 
         // Start as Active
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Active);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Active);
 
         // Set to WindDown (sell-only)
         let mut wind_down = std::collections::HashSet::new();
-        wind_down.insert("TEST/USD".to_string());
+        wind_down.insert(Ticker::from("TEST/USD"));
         engine.set_sell_only(wind_down);
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::WindDown);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::WindDown);
 
         // Resume should go back to Active
         engine.handle_event(EngineEvent::ApiCommand(
             crate::types::event::ApiAction::Resume
         ));
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::Active);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::Active);
     }
 
     #[test]
@@ -2422,13 +2423,13 @@ mod tests {
         let mut engine = Engine::new(cfg, test_pair_info(), BotState::default());
 
         // Set per-pair override
-        engine.update_pair("TEST/USD", PairState::Active, PairConfig {
+        engine.update_pair(&Ticker::from("TEST/USD"), PairState::Active, PairConfig {
             order_size_usd: Some(dec!(75)),
             max_inventory_usd: Some(dec!(500)),
             ..Default::default()
         });
 
-        let resolved = engine.resolved_config("TEST/USD").unwrap();
+        let resolved = engine.resolved_config(&Ticker::from("TEST/USD")).unwrap();
         assert_eq!(resolved.order_size_usd, dec!(75));
         assert_eq!(resolved.max_inventory_usd, dec!(500));
         // Unset fields should use global defaults
@@ -2442,7 +2443,7 @@ mod tests {
 
         // Feed book snapshot so engine has price data
         engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
             asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
             timestamp: Utc::now(),
@@ -2452,7 +2453,7 @@ mod tests {
         engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "o1".into(),
             cl_ord_id: "bid-1".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Buy,
             price: dec!(0.10),
             qty: dec!(50),
@@ -2461,13 +2462,13 @@ mod tests {
             is_fully_filled: true,
             timestamp: Utc::now(),
         }));
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().buys_without_sell, 1);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().buys_without_sell, 1);
 
         // Second buy fill
         engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "o2".into(),
             cl_ord_id: "bid-2".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Buy,
             price: dec!(0.10),
             qty: dec!(50),
@@ -2476,11 +2477,11 @@ mod tests {
             is_fully_filled: true,
             timestamp: Utc::now(),
         }));
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().buys_without_sell, 2);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().buys_without_sell, 2);
 
         // Now try to quote — buy should be blocked (2 >= max_buys_before_sell=2)
         let cmds = engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
             asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
             timestamp: Utc::now(),
@@ -2499,7 +2500,7 @@ mod tests {
         engine.handle_event(EngineEvent::Fill(Fill {
             order_id: "o3".into(),
             cl_ord_id: "ask-1".into(),
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             side: OrderSide::Sell,
             price: dec!(0.12),
             qty: dec!(50),
@@ -2508,7 +2509,7 @@ mod tests {
             is_fully_filled: true,
             timestamp: Utc::now(),
         }));
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().buys_without_sell, 0);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().buys_without_sell, 0);
 
         // Cancel all pair quotes to reset quoter to Idle for fresh placement
         engine.handle_event(EngineEvent::ApiCommand(
@@ -2517,7 +2518,7 @@ mod tests {
 
         // Now buy should be allowed again (use timestamp far enough ahead to bypass throttle)
         let cmds = engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
             asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
             timestamp: Utc::now() + chrono::Duration::seconds(30),
@@ -2543,7 +2544,7 @@ mod tests {
 
         // First book snapshot — should produce quotes
         let cmds1 = engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
             asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
             timestamp: t0,
@@ -2556,7 +2557,7 @@ mod tests {
         // Book update 2 seconds later — should be throttled
         let t1 = t0 + chrono::Duration::seconds(2);
         let cmds2 = engine.handle_event(EngineEvent::BookUpdate {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bid_updates: vec![LevelUpdate { price: dec!(0.10), qty: dec!(110) }],
             ask_updates: vec![LevelUpdate { price: dec!(0.12), qty: dec!(110) }],
             timestamp: t1,
@@ -2580,7 +2581,7 @@ mod tests {
         cfg.risk.stop_loss_pct = dec!(0.03);
 
         let mut state = BotState::default();
-        state.positions.insert("TEST/USD".into(), Position {
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
             qty: dec!(100),
             avg_cost: dec!(0.10),
         });
@@ -2589,7 +2590,7 @@ mod tests {
         // Default: use_winddown_for_stoploss = true
 
         engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.095), qty: dec!(1000) }],
             asks: vec![LevelUpdate { price: dec!(0.097), qty: dec!(1000) }],
             timestamp: Utc::now(),
@@ -2599,12 +2600,12 @@ mod tests {
         engine.handle_event(EngineEvent::Tick { timestamp: Utc::now() });
 
         assert_eq!(
-            engine.pairs().get("TEST/USD").unwrap().state,
+            engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state,
             PairState::WindDown,
             "Stop-loss with use_winddown_for_stoploss=true should enter WindDown"
         );
         assert!(
-            engine.pairs().get("TEST/USD").unwrap().winddown_since.is_some(),
+            engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().winddown_since.is_some(),
             "winddown_since should be set for escalation tracking"
         );
     }
@@ -2616,7 +2617,7 @@ mod tests {
         cfg.risk.winddown_escalation_hours = 1; // 1 hour for test
 
         let mut state = BotState::default();
-        state.positions.insert("TEST/USD".into(), Position {
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
             qty: dec!(100),
             avg_cost: dec!(0.10),
         });
@@ -2624,27 +2625,27 @@ mod tests {
         let mut engine = Engine::new(cfg, test_pair_info(), state);
 
         engine.handle_event(EngineEvent::BookSnapshot {
-            symbol: "TEST/USD".into(),
+            pair: Ticker::from("TEST/USD"),
             bids: vec![LevelUpdate { price: dec!(0.095), qty: dec!(1000) }],
             asks: vec![LevelUpdate { price: dec!(0.097), qty: dec!(1000) }],
             timestamp: Utc::now(),
         });
 
-        // Trigger stop-loss → WindDown
+        // Trigger stop-loss -> WindDown
         let t0 = Utc::now();
         engine.handle_event(EngineEvent::Tick { timestamp: t0 });
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::WindDown);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::WindDown);
 
         // Tick 30 min later — should still be WindDown
         let t1 = t0 + chrono::Duration::minutes(30);
         engine.handle_event(EngineEvent::Tick { timestamp: t1 });
-        assert_eq!(engine.pairs().get("TEST/USD").unwrap().state, PairState::WindDown);
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state, PairState::WindDown);
 
         // Tick 2 hours later — should escalate to Liquidating
         let t2 = t0 + chrono::Duration::hours(2);
         engine.handle_event(EngineEvent::Tick { timestamp: t2 });
         assert_eq!(
-            engine.pairs().get("TEST/USD").unwrap().state,
+            engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().state,
             PairState::Liquidating,
             "Should escalate to Liquidating after winddown_escalation_hours"
         );
