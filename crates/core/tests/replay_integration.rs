@@ -182,8 +182,8 @@ async fn replay_async_through_channels() {
     // Verify book state
     for symbol in &["CAMP/USD", "SUP/USD", "MIM/USD"] {
         let book = engine.books().get(*symbol).expect("Book should exist");
-        let (bid, _) = book.best_bid().expect("Should have bids");
-        let (ask, _) = book.best_ask().expect("Should have asks");
+        let bid = book.best_bid().expect("Should have bids").price;
+        let ask = book.best_ask().expect("Should have asks").price;
         assert!(bid < ask, "{symbol} bid {bid} >= ask {ask}");
     }
 }
@@ -244,13 +244,13 @@ fn cold_start_only_buys_with_valid_prices() {
 
         // Bid should be below best ask (post-only safe)
         if let Some(book) = engine.books().get(&order.symbol) {
-            if let Some((best_ask, _)) = book.best_ask() {
+            if let Some(level) = book.best_ask() {
                 assert!(
-                    order.price < best_ask,
+                    order.price < level.price,
                     "{} bid {} would cross best ask {}",
                     order.symbol,
                     order.price,
-                    best_ask
+                    level.price
                 );
             }
         }

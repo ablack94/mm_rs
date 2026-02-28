@@ -653,7 +653,7 @@ impl Engine {
 
         let book = self.books.get(&symbol).unwrap();
         let mid = book.mid_price();
-        let spread_bps = book.spread_bps();
+        let spread_bps = book.spread().map(|s| s.as_bps());
         if let Some(m) = mid {
             self.prices.insert(symbol.clone(), m);
         }
@@ -927,7 +927,7 @@ impl Engine {
 
         let ref_price = self.books.get(symbol)
             .and_then(|b| b.best_bid())
-            .map(|(p, _)| p)
+            .map(|l| l.price)
             .or_else(|| self.prices.get(symbol).copied())
             .unwrap_or_default();
 
@@ -1330,12 +1330,12 @@ impl Engine {
                 return vec![];
             }
         };
-        let (best_bid, _) = match book.best_bid() {
-            Some(b) => b,
+        let best_bid = match book.best_bid() {
+            Some(b) => b.price,
             None => return vec![],
         };
-        let (best_ask, _) = match book.best_ask() {
-            Some(a) => a,
+        let best_ask = match book.best_ask() {
+            Some(a) => a.price,
             None => return vec![],
         };
         let mid = match book.mid_price() {
@@ -1564,7 +1564,7 @@ impl Engine {
                 .round_dp(price_decimals);
             if cost_floor > ask_price {
                 // Check if cost floor is too far above the book ask (market price protection)
-                let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|(p, _)| p);
+                let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price);
                 let deviation_limit = book_best_ask.unwrap_or(ask_price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
                 if cost_floor > deviation_limit {
                     tracing::warn!(
@@ -1767,7 +1767,7 @@ impl Engine {
                     .round_dp(price_decimals);
                 let adjusted = ask_price.max(cost_floor);
                 if cost_floor > ask_price {
-                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|(p, _)| p);
+                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price);
                     let deviation_limit = book_best_ask.unwrap_or(ask_price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
                     if cost_floor > deviation_limit {
                         tracing::warn!(
@@ -1874,7 +1874,7 @@ impl Engine {
                 let cost_floor = (position.avg_cost * (Decimal::ONE + resolved.min_profit_pct))
                     .round_dp(price_decimals);
                 if cost_floor > price {
-                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|(p, _)| p);
+                    let book_best_ask = self.books.get(symbol).and_then(|b| b.best_ask()).map(|l| l.price);
                     let deviation_limit = book_best_ask.unwrap_or(price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
                     if cost_floor > deviation_limit {
                         tracing::warn!(

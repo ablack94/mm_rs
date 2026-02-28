@@ -10,7 +10,7 @@ pub mod traits;
 
 // Re-export all public types at crate root for convenience.
 pub use order::{OrderSide, OrderRequest};
-pub use book::{OrderBook, LevelUpdate};
+pub use book::{OrderBook, LevelUpdate, BookLevel, Spread};
 pub use pair::PairInfo;
 pub use fill::{Fill, TradeRecord};
 pub use position::Position;
