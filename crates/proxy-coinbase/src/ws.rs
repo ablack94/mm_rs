@@ -122,7 +122,7 @@ async fn run_private_ws_proxy(
     let (coinbase_ws, _) = connect_async(COINBASE_USER_WS).await?;
     tracing::info!("Coinbase private WS proxy: user WS connected");
 
-    let (mut coinbase_write, mut coinbase_read) = coinbase_ws.split();
+    let (mut coinbase_write, coinbase_read) = coinbase_ws.split();
     let (bot_write, mut bot_read) = bot_ws.split();
     let bot_write = Arc::new(Mutex::new(bot_write));
 
@@ -151,6 +151,15 @@ async fn run_private_ws_proxy(
     let order_id_map_for_orders = order_id_map.clone();
     let coinbase_write = Arc::new(Mutex::new(coinbase_write));
     let coinbase_write_for_sub = coinbase_write.clone();
+
+    // Track subscribed products for reconnect
+    let subscribed_products: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscribed_products_for_orders = subscribed_products.clone();
+
+    // Clones for the reconnect loop in coinbase_to_bot
+    let state_for_reconnect = state.clone();
+    let coinbase_write_for_reconnect = coinbase_write.clone();
+    let subscribed_products_for_reconnect = subscribed_products.clone();
 
     let bot_to_coinbase = tokio::spawn(async move {
         while let Some(Ok(msg)) = bot_read.next().await {
@@ -198,6 +207,8 @@ async fn run_private_ws_proxy(
                                     let mut writer = coinbase_write_for_sub.lock().await;
                                     let _ = writer.send(Message::Text(sub_msg.into())).await;
                                     *sub = true;
+                                    // Store products for reconnect
+                                    *subscribed_products_for_orders.lock().await = product_ids;
                                 }
 
                                 // Send confirmation back to bot
@@ -261,49 +272,94 @@ async fn run_private_ws_proxy(
     let order_id_map_for_cleanup = order_id_map.clone();
     let coinbase_to_bot = tokio::spawn(async move {
         let mut fill_tracker = translate::FillTracker::new();
+        let mut coinbase_read = coinbase_read;
+        let mut backoff_secs = 1u64;
 
-        while let Some(Ok(msg)) = coinbase_read.next().await {
-            match msg {
-                Message::Text(text) => {
-                    let text_str = text.to_string();
-                    let parsed: serde_json::Value = match serde_json::from_str(&text_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+        loop {
+            while let Some(Ok(msg)) = coinbase_read.next().await {
+                backoff_secs = 1;
+                match msg {
+                    Message::Text(text) => {
+                        let text_str = text.to_string();
+                        let parsed: serde_json::Value = match serde_json::from_str(&text_str) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
 
-                    let channel = parsed.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+                        let channel = parsed.get("channel").and_then(|c| c.as_str()).unwrap_or("");
 
-                    match channel {
-                        "user" => {
-                            // Clean up order_id_map for terminal order states
-                            cleanup_terminal_orders(&parsed, &order_id_map_for_cleanup).await;
+                        match channel {
+                            "user" => {
+                                cleanup_terminal_orders(&parsed, &order_id_map_for_cleanup).await;
 
-                            let kraken_msgs =
-                                translate::coinbase_user_to_kraken(&parsed, &mut fill_tracker);
-                            let mut writer = bot_write_for_upstream.lock().await;
-                            for msg in kraken_msgs {
-                                if writer.send(ws::Message::Text(msg.into())).await.is_err() {
-                                    return;
+                                let kraken_msgs =
+                                    translate::coinbase_user_to_kraken(&parsed, &mut fill_tracker);
+                                let mut writer = bot_write_for_upstream.lock().await;
+                                for msg in kraken_msgs {
+                                    if writer.send(ws::Message::Text(msg.into())).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
-                        }
-                        "heartbeats" => {
-                            // Forward as Kraken-style heartbeat
-                            let hb = translate::heartbeat();
-                            let mut writer = bot_write_for_upstream.lock().await;
-                            let _ = writer.send(ws::Message::Text(hb.into())).await;
-                        }
-                        _ => {
-                            tracing::debug!(channel, "Ignoring Coinbase user WS channel");
+                            "heartbeats" => {
+                                let hb = translate::heartbeat();
+                                let mut writer = bot_write_for_upstream.lock().await;
+                                let _ = writer.send(ws::Message::Text(hb.into())).await;
+                            }
+                            _ => {
+                                tracing::debug!(channel, "Ignoring Coinbase user WS channel");
+                            }
                         }
                     }
+                    Message::Ping(data) => {
+                        let mut writer = bot_write_for_upstream.lock().await;
+                        let _ = writer.send(ws::Message::Ping(data.into())).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
-                Message::Ping(data) => {
-                    let mut writer = bot_write_for_upstream.lock().await;
-                    let _ = writer.send(ws::Message::Ping(data.into())).await;
+            }
+
+            // Coinbase user WS disconnected — reconnect with backoff
+            tracing::warn!(backoff_secs, "Coinbase user WS disconnected, reconnecting...");
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(30);
+
+            let (new_ws, _) = match connect_async(COINBASE_USER_WS).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to reconnect to Coinbase user WS");
+                    continue;
                 }
-                Message::Close(_) => break,
-                _ => {}
+            };
+            tracing::info!("Coinbase private WS: reconnected to user WS");
+
+            let (new_write, new_read) = new_ws.split();
+            coinbase_read = new_read;
+
+            // Swap shared write half so bot_to_coinbase uses the new connection
+            *coinbase_write_for_reconnect.lock().await = new_write;
+
+            // Re-subscribe heartbeats
+            {
+                let heartbeat_sub = serde_json::json!({
+                    "type": "subscribe",
+                    "channel": "heartbeats",
+                    "product_ids": []
+                })
+                .to_string();
+                let mut w = coinbase_write_for_reconnect.lock().await;
+                let _ = w.send(Message::Text(heartbeat_sub.into())).await;
+            }
+
+            // Re-subscribe user channel if previously subscribed
+            {
+                let products = subscribed_products_for_reconnect.lock().await.clone();
+                if !products.is_empty() {
+                    let sub_msg = state_for_reconnect.ws_subscribe_msg("user", &products);
+                    let mut w = coinbase_write_for_reconnect.lock().await;
+                    let _ = w.send(Message::Text(sub_msg.into())).await;
+                }
             }
         }
     });
@@ -322,15 +378,10 @@ async fn run_private_ws_proxy(
         }
     });
 
-    tokio::select! {
-        _ = bot_to_coinbase => {
-            tracing::info!("Coinbase private WS proxy: bot disconnected");
-        }
-        _ = coinbase_to_bot => {
-            tracing::info!("Coinbase private WS proxy: Coinbase user WS disconnected");
-        }
-    }
-
+    // Only exit when the bot disconnects; coinbase_to_bot handles reconnection internally
+    let _ = bot_to_coinbase.await;
+    tracing::info!("Coinbase private WS proxy: bot disconnected");
+    coinbase_to_bot.abort();
     heartbeat_handle.abort();
     Ok(())
 }
@@ -720,7 +771,7 @@ async fn run_public_ws_proxy(
     let (coinbase_ws, _) = connect_async(COINBASE_MARKET_WS).await?;
     tracing::info!("Coinbase public WS proxy: connected");
 
-    let (coinbase_write, mut coinbase_read) = coinbase_ws.split();
+    let (coinbase_write, coinbase_read) = coinbase_ws.split();
     let (bot_write, mut bot_read) = bot_ws.split();
 
     let bot_write = Arc::new(Mutex::new(bot_write));
@@ -733,11 +784,22 @@ async fn run_public_ws_proxy(
     let product_id_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
+    // Track channel subscriptions for reconnect: Vec<(channel, product_ids)>
+    let subscribed_channels: Arc<Mutex<Vec<(String, Vec<String>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
     // Bot -> Coinbase: translate subscribe messages
     let state_for_sub = state.clone();
     let coinbase_write_for_sub = coinbase_write.clone();
     let bot_write_for_sub = bot_write.clone();
     let product_id_map_for_sub = product_id_map.clone();
+    let subscribed_channels_for_sub = subscribed_channels.clone();
+
+    // Clones for the reconnect loop in coinbase_to_bot
+    let state_for_reconnect = state.clone();
+    let coinbase_write_for_reconnect = coinbase_write.clone();
+    let subscribed_channels_for_reconnect = subscribed_channels.clone();
+
     let bot_to_coinbase = tokio::spawn(async move {
         while let Some(Ok(msg)) = bot_read.next().await {
             match msg {
@@ -784,6 +846,11 @@ async fn run_public_ws_proxy(
                             let sub_msg = state_for_sub.ws_subscribe_msg(channel, &product_ids);
                             let mut writer = coinbase_write_for_sub.lock().await;
                             let _ = writer.send(Message::Text(sub_msg.into())).await;
+                            drop(writer);
+
+                            // Store subscription for reconnect
+                            subscribed_channels_for_sub.lock().await
+                                .push((channel.to_string(), product_ids.clone()));
 
                             // Send confirmation back to bot
                             let kraken_channel = parsed
@@ -811,62 +878,95 @@ async fn run_public_ws_proxy(
     // Coinbase -> Bot: translate book data to Kraken format
     let bot_write_for_upstream = bot_write.clone();
     let coinbase_to_bot = tokio::spawn(async move {
-        while let Some(Ok(msg)) = coinbase_read.next().await {
-            match msg {
-                Message::Text(text) => {
-                    let text_str = text.to_string();
-                    let parsed: serde_json::Value = match serde_json::from_str(&text_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+        let mut coinbase_read = coinbase_read;
+        let mut backoff_secs = 1u64;
 
-                    let channel = parsed.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+        loop {
+            while let Some(Ok(msg)) = coinbase_read.next().await {
+                backoff_secs = 1;
+                match msg {
+                    Message::Text(text) => {
+                        let text_str = text.to_string();
+                        let parsed: serde_json::Value = match serde_json::from_str(&text_str) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
 
-                    match channel {
-                        "l2_data" => {
-                            let map = product_id_map.lock().await;
-                            if let Some(kraken_msg) = translate::coinbase_book_to_kraken_mapped(&parsed, &map) {
-                                let mut writer = bot_write_for_upstream.lock().await;
-                                if writer
-                                    .send(ws::Message::Text(kraken_msg.into()))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
+                        let channel = parsed.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+
+                        match channel {
+                            "l2_data" => {
+                                let map = product_id_map.lock().await;
+                                if let Some(kraken_msg) = translate::coinbase_book_to_kraken_mapped(&parsed, &map) {
+                                    drop(map);
+                                    let mut writer = bot_write_for_upstream.lock().await;
+                                    if writer
+                                        .send(ws::Message::Text(kraken_msg.into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
-                        }
-                        "heartbeats" => {
-                            let hb = translate::heartbeat();
-                            let mut writer = bot_write_for_upstream.lock().await;
-                            let _ = writer.send(ws::Message::Text(hb.into())).await;
-                        }
-                        "subscriptions" => {
-                            tracing::debug!("Coinbase subscription confirmed");
-                        }
-                        _ => {
-                            tracing::debug!(channel, "Ignoring Coinbase market WS channel");
+                            "heartbeats" => {
+                                let hb = translate::heartbeat();
+                                let mut writer = bot_write_for_upstream.lock().await;
+                                let _ = writer.send(ws::Message::Text(hb.into())).await;
+                            }
+                            "subscriptions" => {
+                                tracing::debug!("Coinbase subscription confirmed");
+                            }
+                            _ => {
+                                tracing::debug!(channel, "Ignoring Coinbase market WS channel");
+                            }
                         }
                     }
+                    Message::Ping(data) => {
+                        let mut writer = bot_write_for_upstream.lock().await;
+                        let _ = writer.send(ws::Message::Ping(data.into())).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
-                Message::Ping(data) => {
-                    let mut writer = bot_write_for_upstream.lock().await;
-                    let _ = writer.send(ws::Message::Ping(data.into())).await;
+            }
+
+            // Coinbase market WS disconnected — reconnect with backoff
+            tracing::warn!(backoff_secs, "Coinbase market WS disconnected, reconnecting...");
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(30);
+
+            let (new_ws, _) = match connect_async(COINBASE_MARKET_WS).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to reconnect to Coinbase market WS");
+                    continue;
                 }
-                Message::Close(_) => break,
-                _ => {}
+            };
+            tracing::info!("Coinbase public WS: reconnected to market WS");
+
+            let (new_write, new_read) = new_ws.split();
+            coinbase_read = new_read;
+
+            // Swap shared write half
+            *coinbase_write_for_reconnect.lock().await = new_write;
+
+            // Re-subscribe all tracked channels with fresh JWTs
+            {
+                let subs = subscribed_channels_for_reconnect.lock().await.clone();
+                for (channel, product_ids) in &subs {
+                    let sub_msg = state_for_reconnect.ws_subscribe_msg(channel, product_ids);
+                    let mut w = coinbase_write_for_reconnect.lock().await;
+                    let _ = w.send(Message::Text(sub_msg.into())).await;
+                }
             }
         }
     });
 
-    tokio::select! {
-        _ = bot_to_coinbase => {
-            tracing::info!("Coinbase public WS proxy: bot disconnected");
-        }
-        _ = coinbase_to_bot => {
-            tracing::info!("Coinbase public WS proxy: Coinbase WS disconnected");
-        }
-    }
+    // Only exit when the bot disconnects; coinbase_to_bot handles reconnection internally
+    let _ = bot_to_coinbase.await;
+    tracing::info!("Coinbase public WS proxy: bot disconnected");
+    coinbase_to_bot.abort();
 
     Ok(())
 }
