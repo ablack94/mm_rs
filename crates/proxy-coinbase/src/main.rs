@@ -55,13 +55,27 @@ async fn main() -> Result<()> {
         "Starting Coinbase proxy"
     );
 
+    // Fee configuration (Coinbase volume-tier dependent)
+    let maker_fee_pct: f64 = std::env::var("COINBASE_MAKER_FEE")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.006);
+    let taker_fee_pct: f64 = std::env::var("COINBASE_TAKER_FEE")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(0.012);
+
+    tracing::info!(maker_fee_pct, taker_fee_pct, "Fee config");
+
     // REST proxy state
+    let rest_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("Failed to build HTTP client");
     let rest_state = Arc::new(CoinbaseRestState {
         api_key: api_key.clone(),
         api_secret: api_secret.clone(),
         proxy_token: proxy_token.clone(),
         coinbase_base_url: coinbase_base_url.clone(),
-        client: reqwest::Client::new(),
+        client: rest_client,
+        maker_fee_pct,
+        taker_fee_pct,
     });
 
     // Rate limit config

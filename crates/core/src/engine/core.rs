@@ -105,7 +105,13 @@ impl Engine {
             state,
             kill_switch: KillSwitch::default(),
             prices: HashMap::new(),
-            cl_ord_counter: 0,
+            // Start from timestamp to ensure uniqueness across sessions.
+            // Coinbase deduplicates by client_order_id; reusing "bid-1" across restarts
+            // returns the old order instead of creating a new one.
+            cl_ord_counter: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             last_dms_refresh: None,
         }
     }
@@ -1365,7 +1371,7 @@ impl Engine {
             min_spread_bps: resolved.min_spread_bps,
             spread_capture_pct: resolved.spread_capture_pct,
             requote_threshold_pct: self.config.trading.requote_threshold_pct,
-            maker_fee_pct: self.config.trading.maker_fee_pct,
+            maker_fee_pct: pair_info.maker_fee_pct,
             min_profit_pct: resolved.min_profit_pct,
             dry_run: self.config.trading.dry_run,
             downtrend_threshold_pct: self.config.trading.downtrend_threshold_pct,

@@ -10,13 +10,30 @@ use serde_json::Value;
 use trading_primitives::protocol;
 
 /// Translate a Coinbase level2 (l2_data) message to proxy protocol book format.
+#[cfg(test)]
 pub fn coinbase_book_to_kraken(coinbase_msg: &Value) -> Option<String> {
+    coinbase_book_to_kraken_mapped(coinbase_msg, &std::collections::HashMap::new())
+}
+
+/// Translate a Coinbase level2 (l2_data) message to proxy protocol book format,
+/// using a product_id → internal symbol mapping.
+///
+/// Coinbase merges USD/USDC order books and always returns the base-USD product_id
+/// in level2 data. The mapping allows relabeling (e.g., "DOGE-USD" → "DOGE/USDC").
+pub fn coinbase_book_to_kraken_mapped(
+    coinbase_msg: &Value,
+    product_id_map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
     let events = coinbase_msg.get("events")?.as_array()?;
 
     for event in events {
         let event_type = event.get("type")?.as_str()?;
         let product_id = event.get("product_id")?.as_str()?;
-        let symbol = pairs::to_internal(product_id);
+        // Use mapped symbol if available, otherwise fall back to simple conversion
+        let symbol = product_id_map
+            .get(product_id)
+            .cloned()
+            .unwrap_or_else(|| pairs::to_internal(product_id));
         let updates = event.get("updates")?.as_array()?;
 
         let mut bids = Vec::new();
@@ -194,6 +211,47 @@ pub fn pong_response(req_id: u64) -> String {
     protocol::build_pong(req_id)
 }
 
+/// Build a synthetic "new" execution report for when an order is accepted via REST.
+///
+/// Coinbase's user WS may deliver an OPEN event later, but the bot needs an immediate
+/// ack to track the order. Duplicate acks are harmless.
+pub fn synthetic_exec_new(order_id: &str, cl_ord_id: &str, symbol: &str, side: &str) -> String {
+    let report = protocol::build_exec_report(
+        "new",
+        order_id,
+        cl_ord_id,
+        symbol,
+        side,
+        0.0,  // no fill yet
+        0.0,  // no price yet
+        0.0,  // no fees yet
+        "open",
+        "m",
+        "1970-01-01T00:00:00Z",
+        None,
+    );
+    protocol::build_execution_update(report)
+}
+
+/// Build a synthetic "canceled" execution report for when a cancel succeeds via REST.
+pub fn synthetic_exec_canceled(cl_ord_id: &str, symbol: &str, side: &str) -> String {
+    let report = protocol::build_exec_report(
+        "canceled",
+        cl_ord_id,  // use cl_ord_id as order_id too
+        cl_ord_id,
+        symbol,
+        side,
+        0.0,
+        0.0,
+        0.0,
+        "canceled",
+        "m",
+        "1970-01-01T00:00:00Z",
+        Some("USER_CANCEL"),
+    );
+    protocol::build_execution_update(report)
+}
+
 /// Build a protocol heartbeat message.
 pub fn heartbeat() -> String {
     protocol::build_heartbeat()
@@ -225,7 +283,7 @@ mod tests {
         // Verify it parses correctly through the protocol parser
         match parse_ws_message(&result) {
             WsMessage::BookSnapshot { symbol, bids, asks } => {
-                assert_eq!(symbol, "BTC/USD");
+                assert_eq!(symbol, "BTC/USDC");
                 assert_eq!(bids.len(), 2);
                 assert_eq!(asks.len(), 1);
             }
@@ -250,7 +308,7 @@ mod tests {
         let result = coinbase_book_to_kraken(&coinbase).unwrap();
         match parse_ws_message(&result) {
             WsMessage::BookUpdate { symbol, .. } => {
-                assert_eq!(symbol, "ETH/USD");
+                assert_eq!(symbol, "ETH/USDC");
             }
             other => panic!("Expected BookUpdate, got {:?}", other),
         }
@@ -283,7 +341,7 @@ mod tests {
         match parse_ws_message(&results[0]) {
             WsMessage::Execution(report) => {
                 assert_eq!(report.exec_type, "trade");
-                assert_eq!(report.symbol, "BTC/USD");
+                assert_eq!(report.symbol, "BTC/USDC");
                 assert_eq!(report.side, "buy");
             }
             other => panic!("Expected Execution, got {:?}", other),
@@ -353,6 +411,35 @@ mod tests {
                 assert_eq!(cl_ord_id, Some("mm_buy_001".to_string()));
             }
             other => panic!("Expected OrderResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_synthetic_exec_new() {
+        let result = synthetic_exec_new("cb-order-789", "mm_buy_doge_001", "DOGE/USDC", "buy");
+        match parse_ws_message(&result) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "new");
+                assert_eq!(report.order_id, "cb-order-789");
+                assert_eq!(report.cl_ord_id, "mm_buy_doge_001");
+                assert_eq!(report.symbol, "DOGE/USDC");
+                assert_eq!(report.side, "buy");
+            }
+            other => panic!("Expected Execution, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_synthetic_exec_canceled() {
+        let result = synthetic_exec_canceled("mm_sell_xrp_002", "XRP/USDC", "sell");
+        match parse_ws_message(&result) {
+            WsMessage::Execution(report) => {
+                assert_eq!(report.exec_type, "canceled");
+                assert_eq!(report.cl_ord_id, "mm_sell_xrp_002");
+                assert_eq!(report.symbol, "XRP/USDC");
+                assert_eq!(report.cancel_reason, Some("USER_CANCEL".to_string()));
+            }
+            other => panic!("Expected Execution, got {:?}", other),
         }
     }
 

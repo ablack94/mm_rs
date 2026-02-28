@@ -9,7 +9,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::auth::{sign_request, timestamp_secs};
+use crate::auth::build_jwt;
 use proxy_common::auth::check_auth;
 
 /// Shared state for the Coinbase REST proxy.
@@ -19,6 +19,10 @@ pub struct CoinbaseRestState {
     pub proxy_token: String,
     pub coinbase_base_url: String,
     pub client: reqwest::Client,
+    /// Maker fee percentage (e.g., 0.006 = 0.6%). Configurable via COINBASE_MAKER_FEE env.
+    pub maker_fee_pct: f64,
+    /// Taker fee percentage. Configurable via COINBASE_TAKER_FEE env.
+    pub taker_fee_pct: f64,
 }
 
 pub fn build_coinbase_rest_router(state: Arc<CoinbaseRestState>) -> Router {
@@ -44,35 +48,65 @@ async fn health() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({"status": "ok"})))
 }
 
+/// Extract the host from the base URL for JWT URI claim.
+fn api_host(base_url: &str) -> &str {
+    base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))
+        .unwrap_or(base_url)
+        .trim_end_matches('/')
+}
+
 /// Helper to make authenticated GET requests to Coinbase.
 async fn coinbase_get(
     state: &CoinbaseRestState,
     path: &str,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
-    let timestamp = timestamp_secs();
-    let signature = sign_request(&timestamp, "GET", path, "", &state.api_secret);
+    let host = api_host(&state.coinbase_base_url);
+    let jwt = build_jwt(&state.api_key, &state.api_secret, "GET", host, path)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to build JWT");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))
+        })?;
 
     let url = format!("{}{}", state.coinbase_base_url, path);
     let resp = state
         .client
         .get(&url)
-        .header("CB-ACCESS-KEY", &state.api_key)
-        .header("CB-ACCESS-SIGN", &signature)
-        .header("CB-ACCESS-TIMESTAMP", &timestamp)
+        .header("Authorization", format!("Bearer {}", jwt))
         .header("Content-Type", "application/json")
         .send()
         .await
         .map_err(|e| {
+            tracing::error!(path, error = %e, "Coinbase request failed");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": e.to_string()})),
             )
         })?;
 
-    resp.json::<Value>().await.map_err(|e| {
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| {
+        tracing::error!(path, error = %e, "Failed to read Coinbase response body");
         (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": e.to_string()})),
+            Json(json!({"error": format!("read body: {}", e)})),
+        )
+    })?;
+
+    if !status.is_success() {
+        tracing::error!(path, %status, body = &body[..body.len().min(500)], "Coinbase API error");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Coinbase {} {}: {}", status, path, &body[..body.len().min(200)])})),
+        ));
+    }
+
+    serde_json::from_str(&body).map_err(|e| {
+        tracing::error!(path, error = %e, body = &body[..body.len().min(200)], "Failed to parse Coinbase JSON");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("parse json: {}", e)})),
         )
     })
 }
@@ -85,31 +119,52 @@ async fn coinbase_post(
     body: &Value,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let body_str = serde_json::to_string(body).unwrap_or_default();
-    let timestamp = timestamp_secs();
-    let signature = sign_request(&timestamp, "POST", path, &body_str, &state.api_secret);
+    let host = api_host(&state.coinbase_base_url);
+    let jwt = build_jwt(&state.api_key, &state.api_secret, "POST", host, path)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to build JWT");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))
+        })?;
 
     let url = format!("{}{}", state.coinbase_base_url, path);
     let resp = state
         .client
         .post(&url)
-        .header("CB-ACCESS-KEY", &state.api_key)
-        .header("CB-ACCESS-SIGN", &signature)
-        .header("CB-ACCESS-TIMESTAMP", &timestamp)
+        .header("Authorization", format!("Bearer {}", jwt))
         .header("Content-Type", "application/json")
         .body(body_str)
         .send()
         .await
         .map_err(|e| {
+            tracing::error!(path, error = %e, "Coinbase POST request failed");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": e.to_string()})),
             )
         })?;
 
-    resp.json::<Value>().await.map_err(|e| {
+    let status = resp.status();
+    let resp_body = resp.text().await.map_err(|e| {
+        tracing::error!(path, error = %e, "Failed to read Coinbase POST response body");
         (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": e.to_string()})),
+            Json(json!({"error": format!("read body: {}", e)})),
+        )
+    })?;
+
+    if !status.is_success() {
+        tracing::error!(path, %status, body = &resp_body[..resp_body.len().min(500)], "Coinbase POST API error");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("Coinbase {} {}: {}", status, path, &resp_body[..resp_body.len().min(200)])})),
+        ));
+    }
+
+    serde_json::from_str(&resp_body).map_err(|e| {
+        tracing::error!(path, error = %e, body = &resp_body[..resp_body.len().min(200)], "Failed to parse Coinbase POST JSON");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("parse json: {}", e)})),
         )
     })
 }
@@ -205,12 +260,12 @@ async fn handle_asset_pairs(
                         continue;
                     }
 
-                    // Skip non-USD pairs and disabled products
+                    // Skip pairs not quoted in USD or USDC, and disabled products
                     let quote = product
                         .get("quote_currency_id")
                         .and_then(|q| q.as_str())
                         .unwrap_or("");
-                    if quote != "USD" && !requested_pairs.contains(&product_id) {
+                    if quote != "USD" && quote != "USDC" && !requested_pairs.contains(&product_id) {
                         continue;
                     }
 
@@ -227,8 +282,9 @@ async fn handle_asset_pairs(
                         .and_then(|b| b.as_str())
                         .unwrap_or("");
 
-                    // Internal format: BASE/QUOTE
-                    let wsname = format!("{}/{}", base, quote);
+                    // Internal format: BASE/QUOTE — normalize USD to USDC
+                    let norm_quote = if quote == "USD" { "USDC" } else { quote };
+                    let wsname = format!("{}/{}", base, norm_quote);
 
                     // Calculate decimal places from increment strings
                     let quote_increment = product
@@ -248,6 +304,12 @@ async fn handle_asset_pairs(
                     let lot_decimals = decimal_places(base_increment);
 
                     // Use product_id as the REST key (Coinbase doesn't have separate REST/WS names)
+                    // Coinbase uses quote_min_size as minimum order cost
+                    let quote_min = product
+                        .get("quote_min_size")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("1");
+
                     result.insert(
                         product_id.to_string(),
                         json!({
@@ -255,8 +317,9 @@ async fn handle_asset_pairs(
                             "pair_decimals": pair_decimals,
                             "lot_decimals": lot_decimals,
                             "ordermin": base_min,
-                            "fees_maker": [[0, 0.006]],
-                            "fees": [[0, 0.012]],
+                            "costmin": quote_min,
+                            "fees_maker": [[0, state.maker_fee_pct * 100.0]],
+                            "fees": [[0, state.taker_fee_pct * 100.0]],
                             "base": base,
                             "quote": quote
                         }),
@@ -332,7 +395,9 @@ async fn handle_ticker(
                         json!({
                             "a": [best_ask, "0", "0"],
                             "b": [best_bid, "0", "0"],
-                            "c": [mid.to_string(), "0"]
+                            "c": [mid.to_string(), "0"],
+                            "o": mid.to_string(),
+                            "v": ["0", "0"]
                         }),
                     );
                 }

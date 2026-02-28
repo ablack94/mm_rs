@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::auth::{sign_request, timestamp_secs};
+use crate::auth::{build_jwt, build_ws_jwt};
 use crate::pairs;
 use crate::translate;
 
@@ -38,53 +38,63 @@ impl CoinbaseWsState {
             api_secret,
             coinbase_base_url,
             rate_limiter: Mutex::new(TokenBucket::new(rate_limit_config)),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 
-    /// Build Coinbase HMAC auth headers for a request.
-    fn auth_headers(&self, method: &str, path: &str, body: &str) -> Vec<(String, String)> {
-        let timestamp = timestamp_secs();
-        let signature = sign_request(&timestamp, method, path, body, &self.api_secret);
-        vec![
-            ("CB-ACCESS-KEY".to_string(), self.api_key.clone()),
-            ("CB-ACCESS-SIGN".to_string(), signature),
-            ("CB-ACCESS-TIMESTAMP".to_string(), timestamp),
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ]
+    /// Extract host from base URL.
+    fn api_host(&self) -> &str {
+        self.coinbase_base_url
+            .strip_prefix("https://")
+            .or_else(|| self.coinbase_base_url.strip_prefix("http://"))
+            .unwrap_or(&self.coinbase_base_url)
+            .trim_end_matches('/')
     }
 
     /// Make an authenticated POST request to Coinbase REST API.
     async fn rest_post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let body_str = serde_json::to_string(body)?;
-        let headers = self.auth_headers("POST", path, &body_str);
-        let url = format!("{}{}", self.coinbase_base_url, path);
+        let host = self.api_host();
+        let jwt = build_jwt(&self.api_key, &self.api_secret, "POST", host, path)
+            .map_err(|e| anyhow::anyhow!("JWT build error: {}", e))?;
 
-        let mut req = self.client.post(&url).body(body_str);
-        for (key, value) in headers {
-            req = req.header(&key, &value);
+        let url = format!("{}{}", self.coinbase_base_url, path);
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", jwt))
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let resp_body = resp.text().await?;
+
+        if !status.is_success() {
+            tracing::error!(path, %status, body = &resp_body[..resp_body.len().min(300)], "Coinbase REST error");
+            anyhow::bail!("Coinbase {} {}: {}", status, path, &resp_body[..resp_body.len().min(200)]);
         }
 
-        let resp = req.send().await?;
-        let data: serde_json::Value = resp.json().await?;
+        let data: serde_json::Value = serde_json::from_str(&resp_body)?;
         Ok(data)
     }
 
-    /// Build Coinbase WS subscribe message with HMAC auth.
-    /// WS auth uses message = timestamp + channel + comma_separated_product_ids
+    /// Build Coinbase WS subscribe message with JWT auth.
     fn ws_subscribe_msg(&self, channel: &str, product_ids: &[String]) -> String {
-        let timestamp = timestamp_secs();
-        let products_str = product_ids.join(",");
-        let message = format!("{}{}{}", timestamp, channel, products_str);
-        let signature = crate::auth::hmac_sha256_hex(&message, &self.api_secret);
+        let jwt = build_ws_jwt(&self.api_key, &self.api_secret)
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Failed to build WS JWT");
+                String::new()
+            });
 
         serde_json::json!({
             "type": "subscribe",
             "product_ids": product_ids,
             "channel": channel,
-            "api_key": self.api_key,
-            "timestamp": timestamp,
-            "signature": signature
+            "jwt": jwt
         })
         .to_string()
     }
@@ -129,10 +139,16 @@ async fn run_private_ws_proxy(
     .to_string();
     coinbase_write.send(Message::Text(heartbeat_sub.into())).await?;
 
+    // Track cl_ord_id → Coinbase order_id mapping for amend/cancel operations.
+    // Coinbase REST returns exchange order_ids, but the bot sends cl_ord_ids.
+    let order_id_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     // Bot -> Coinbase: intercept order commands, translate to REST
     let state_for_orders = state.clone();
     let bot_write_for_orders = bot_write.clone();
     let subscribed_for_orders = subscribed.clone();
+    let order_id_map_for_orders = order_id_map.clone();
     let coinbase_write = Arc::new(Mutex::new(coinbase_write));
     let coinbase_write_for_sub = coinbase_write.clone();
 
@@ -160,11 +176,24 @@ async fn run_private_ws_proxy(
                             if channel == "executions" {
                                 let mut sub = subscribed_for_orders.lock().await;
                                 if !*sub {
-                                    // Subscribe to user channel on Coinbase
-                                    // Use a placeholder product - Coinbase requires at least one
+                                    // Subscribe to user channel on Coinbase.
+                                    // Coinbase delivers ALL order events regardless of product_ids,
+                                    // but still requires at least one product_id in the subscribe.
+                                    // Extract the bot's symbols from the subscribe params and convert.
+                                    let product_ids: Vec<String> = parsed
+                                        .get("params")
+                                        .and_then(|p| p.get("symbol"))
+                                        .and_then(|s| s.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|v| v.as_str())
+                                                .map(|s| pairs::to_coinbase(s))
+                                                .collect()
+                                        })
+                                        .unwrap_or_else(|| vec!["BTC-USD".to_string()]);
                                     let sub_msg = state_for_orders.ws_subscribe_msg(
                                         "user",
-                                        &["BTC-USD".to_string()],
+                                        &product_ids,
                                     );
                                     let mut writer = coinbase_write_for_sub.lock().await;
                                     let _ = writer.send(Message::Text(sub_msg.into())).await;
@@ -193,16 +222,16 @@ async fn run_private_ws_proxy(
                             let _ = writer.send(ws::Message::Text(pong.into())).await;
                         }
                         "add_order" => {
-                            handle_add_order(&parsed, &state_for_orders, &bot_write_for_orders).await;
+                            handle_add_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
                         }
                         "amend_order" => {
-                            handle_amend_order(&parsed, &state_for_orders, &bot_write_for_orders).await;
+                            handle_amend_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
                         }
                         "cancel_order" => {
-                            handle_cancel_order(&parsed, &state_for_orders, &bot_write_for_orders).await;
+                            handle_cancel_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
                         }
                         "cancel_all" => {
-                            handle_cancel_all(&parsed, &state_for_orders, &bot_write_for_orders).await;
+                            handle_cancel_all(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
                         }
                         "cancel_all_orders_after" => {
                             // DMS: Coinbase doesn't support this. Send success acknowledgment.
@@ -229,6 +258,7 @@ async fn run_private_ws_proxy(
 
     // Coinbase user WS -> Bot: translate events to Kraken execution format
     let bot_write_for_upstream = bot_write.clone();
+    let order_id_map_for_cleanup = order_id_map.clone();
     let coinbase_to_bot = tokio::spawn(async move {
         while let Some(Ok(msg)) = coinbase_read.next().await {
             match msg {
@@ -243,6 +273,9 @@ async fn run_private_ws_proxy(
 
                     match channel {
                         "user" => {
+                            // Clean up order_id_map for terminal order states
+                            cleanup_terminal_orders(&parsed, &order_id_map_for_cleanup).await;
+
                             let kraken_msgs = translate::coinbase_user_to_kraken(&parsed);
                             let mut writer = bot_write_for_upstream.lock().await;
                             for msg in kraken_msgs {
@@ -304,6 +337,7 @@ async fn handle_add_order(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
+    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
     let params = match parsed.get("params") {
@@ -347,6 +381,7 @@ async fn handle_add_order(
 
     match state.rest_post("/api/v3/brokerage/orders", &body).await {
         Ok(resp) => {
+            tracing::debug!(symbol, cl_ord_id, response = %resp, "Coinbase order response");
             let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
             if success {
                 let order_id = resp
@@ -355,9 +390,19 @@ async fn handle_add_order(
                     .and_then(|id| id.as_str())
                     .unwrap_or("");
 
+                // Store cl_ord_id → exchange order_id mapping for amend/cancel
+                if !order_id.is_empty() {
+                    order_id_map.lock().await.insert(cl_ord_id.to_string(), order_id.to_string());
+                }
+
                 let response = translate::order_response_success("add_order", req_id, order_id, cl_ord_id);
                 let mut writer = bot_write.lock().await;
                 let _ = writer.send(ws::Message::Text(response.into())).await;
+
+                // Send synthetic execution report so bot gets OrderAcknowledged immediately.
+                // The user WS may also send an OPEN event later; duplicate acks are harmless.
+                let exec_msg = translate::synthetic_exec_new(order_id, cl_ord_id, symbol, side);
+                let _ = writer.send(ws::Message::Text(exec_msg.into())).await;
             } else {
                 let error = resp
                     .get("error_response")
@@ -378,6 +423,7 @@ async fn handle_amend_order(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
+    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
     let params = match parsed.get("params") {
@@ -390,12 +436,16 @@ async fn handle_amend_order(
 
     let cl_ord_id = params.get("cl_ord_id").and_then(|c| c.as_str()).unwrap_or("");
 
-    // Coinbase edit needs the exchange order_id, not cl_ord_id.
-    // We need to look up the order. For now, use cl_ord_id as order_id
-    // (the bot tracks the mapping via OrderResponse).
-    // Actually, Coinbase edit requires the order_id from their system.
-    // The bot doesn't send this in amend_order. We need to look it up.
-    // For now, we'll cancel + replace instead.
+    // Look up the Coinbase exchange order_id from our mapping
+    let exchange_order_id = order_id_map.lock().await.get(cl_ord_id).cloned();
+    let exchange_order_id = match exchange_order_id {
+        Some(id) => id,
+        None => {
+            tracing::warn!(cl_ord_id, "No exchange order_id found for amend — rejecting");
+            send_error(bot_write, "amend_order", req_id, "Unknown order (no order_id mapping)").await;
+            return;
+        }
+    };
 
     let limit_price = params.get("limit_price").and_then(|p| p.as_f64());
     let order_qty = params.get("order_qty").and_then(|q| q.as_f64());
@@ -409,9 +459,8 @@ async fn handle_amend_order(
         }
     }
 
-    // Try to edit using cl_ord_id — Coinbase may support this
     let mut body = serde_json::json!({
-        "order_id": cl_ord_id
+        "order_id": exchange_order_id
     });
 
     if let Some(price) = limit_price {
@@ -425,7 +474,7 @@ async fn handle_amend_order(
         Ok(resp) => {
             let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
             if success {
-                let response = translate::order_response_success("amend_order", req_id, cl_ord_id, cl_ord_id);
+                let response = translate::order_response_success("amend_order", req_id, &exchange_order_id, cl_ord_id);
                 let mut writer = bot_write.lock().await;
                 let _ = writer.send(ws::Message::Text(response.into())).await;
             } else {
@@ -449,6 +498,7 @@ async fn handle_cancel_order(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
+    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
     let params = match parsed.get("params") {
@@ -483,12 +533,34 @@ async fn handle_cancel_order(
         }
     }
 
+    // Translate cl_ord_ids to Coinbase exchange order_ids
+    let map = order_id_map.lock().await;
+    let mut exchange_ids: Vec<String> = Vec::new();
+    for cl_id in &cl_ord_ids {
+        match map.get(cl_id) {
+            Some(exchange_id) => exchange_ids.push(exchange_id.clone()),
+            None => tracing::warn!(cl_ord_id = cl_id.as_str(), "No exchange order_id for cancel — skipping"),
+        }
+    }
+    drop(map);
+
+    if exchange_ids.is_empty() {
+        send_error(bot_write, "cancel_order", req_id, "No exchange order_ids found for given cl_ord_ids").await;
+        return;
+    }
+
     let body = serde_json::json!({
-        "order_ids": cl_ord_ids
+        "order_ids": exchange_ids
     });
 
     match state.rest_post("/api/v3/brokerage/orders/batch_cancel", &body).await {
         Ok(_resp) => {
+            // Remove cancelled orders from the mapping
+            let mut map = order_id_map.lock().await;
+            for cl_id in &cl_ord_ids {
+                map.remove(cl_id);
+            }
+
             // Send success for the cancel
             let response = translate::order_response_success("cancel_order", req_id, "", "");
             let mut writer = bot_write.lock().await;
@@ -505,21 +577,26 @@ async fn handle_cancel_all(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
+    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
 
     // First get all open orders, then cancel them
-    let timestamp = timestamp_secs();
     let path = "/api/v3/brokerage/orders/historical/batch?order_status=OPEN&limit=250";
-    let signature = sign_request(&timestamp, "GET", path, "", &state.api_secret);
+    let host = state.api_host();
+    let jwt = match build_jwt(&state.api_key, &state.api_secret, "GET", host, path) {
+        Ok(j) => j,
+        Err(e) => {
+            send_error(bot_write, "cancel_all", req_id, &format!("JWT error: {}", e)).await;
+            return;
+        }
+    };
 
     let url = format!("{}{}", state.coinbase_base_url, path);
     let resp = match state
         .client
         .get(&url)
-        .header("CB-ACCESS-KEY", &state.api_key)
-        .header("CB-ACCESS-SIGN", &signature)
-        .header("CB-ACCESS-TIMESTAMP", &timestamp)
+        .header("Authorization", format!("Bearer {}", jwt))
         .header("Content-Type", "application/json")
         .send()
         .await
@@ -549,14 +626,63 @@ async fn handle_cancel_all(
         })
         .unwrap_or_default();
 
+    tracing::info!(count = order_ids.len(), "cancel_all: found open orders to cancel");
+
     if !order_ids.is_empty() {
         let body = serde_json::json!({"order_ids": order_ids});
-        let _ = state.rest_post("/api/v3/brokerage/orders/batch_cancel", &body).await;
+        match state.rest_post("/api/v3/brokerage/orders/batch_cancel", &body).await {
+            Ok(_) => tracing::info!("cancel_all: batch cancel succeeded"),
+            Err(e) => tracing::error!(error = %e, "cancel_all: batch cancel failed"),
+        }
+    }
+
+    // Clear the order_id_map since all orders are cancelled
+    {
+        let mut map = order_id_map.lock().await;
+        let count = map.len();
+        map.clear();
+        if count > 0 {
+            tracing::debug!(cleared = count, "cancel_all: cleared order_id_map");
+        }
     }
 
     let response = translate::order_response_success("cancel_all", req_id, "", "");
     let mut writer = bot_write.lock().await;
     let _ = writer.send(ws::Message::Text(response.into())).await;
+}
+
+/// Remove entries from order_id_map when orders reach terminal states (filled, cancelled, expired, failed).
+async fn cleanup_terminal_orders(
+    coinbase_msg: &serde_json::Value,
+    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+) {
+    let events = match coinbase_msg.get("events").and_then(|e| e.as_array()) {
+        Some(e) => e,
+        None => return,
+    };
+
+    let mut to_remove = Vec::new();
+    for event in events {
+        let orders = match event.get("orders").and_then(|o| o.as_array()) {
+            Some(o) => o,
+            None => continue,
+        };
+        for order in orders {
+            let status = order.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let cl_ord_id = order.get("client_order_id").and_then(|c| c.as_str()).unwrap_or("");
+            if matches!(status, "FILLED" | "CANCELLED" | "EXPIRED" | "FAILED") && !cl_ord_id.is_empty() {
+                to_remove.push(cl_ord_id.to_string());
+            }
+        }
+    }
+
+    if !to_remove.is_empty() {
+        let mut map = order_id_map.lock().await;
+        for cl_id in &to_remove {
+            map.remove(cl_id);
+        }
+        tracing::debug!(count = to_remove.len(), remaining = map.len(), "Cleaned terminal orders from order_id_map");
+    }
 }
 
 /// Send error response back to bot.
@@ -597,10 +723,18 @@ async fn run_public_ws_proxy(
     let bot_write = Arc::new(Mutex::new(bot_write));
     let coinbase_write = Arc::new(Mutex::new(coinbase_write));
 
+    // Coinbase merges order books for USD/USDC pairs and always returns the
+    // base-USD product_id in level2 data, even when subscribed via base-USDC.
+    // Track the mapping so we can relabel book data with the correct symbol.
+    // Key: Coinbase base product (e.g., "DOGE-USD"), Value: internal symbol the bot expects (e.g., "DOGE/USDC").
+    let product_id_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     // Bot -> Coinbase: translate subscribe messages
     let state_for_sub = state.clone();
     let coinbase_write_for_sub = coinbase_write.clone();
     let bot_write_for_sub = bot_write.clone();
+    let product_id_map_for_sub = product_id_map.clone();
     let bot_to_coinbase = tokio::spawn(async move {
         while let Some(Ok(msg)) = bot_read.next().await {
             match msg {
@@ -614,6 +748,14 @@ async fn run_public_ws_proxy(
                     let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
                     if method == "subscribe" {
+                        // Extract the original symbols the bot requested (e.g., ["DOGE/USDC"])
+                        let bot_symbols: Vec<String> = parsed
+                            .get("params")
+                            .and_then(|p| p.get("symbol"))
+                            .and_then(|s| s.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+
                         if let Some(coinbase_sub) = translate::kraken_subscribe_to_coinbase(&parsed) {
                             // Add HMAC auth to subscription
                             let channel = coinbase_sub.get("channel").and_then(|c| c.as_str()).unwrap_or("");
@@ -622,6 +764,19 @@ async fn run_public_ws_proxy(
                                 .and_then(|p| p.as_array())
                                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                                 .unwrap_or_default();
+
+                            // Build mapping: Coinbase returns USD product_ids for USDC subscriptions.
+                            // E.g., subscribe DOGE-USDC → Coinbase returns DOGE-USD in book data.
+                            {
+                                let mut map = product_id_map_for_sub.lock().await;
+                                for (pid, sym) in product_ids.iter().zip(bot_symbols.iter()) {
+                                    // The base USD product_id that Coinbase will return
+                                    let base_pid = pid.replace("-USDC", "-USD");
+                                    map.insert(base_pid, sym.clone());
+                                    // Also map the exact product_id in case Coinbase uses it
+                                    map.insert(pid.clone(), sym.clone());
+                                }
+                            }
 
                             let sub_msg = state_for_sub.ws_subscribe_msg(channel, &product_ids);
                             let mut writer = coinbase_write_for_sub.lock().await;
@@ -666,7 +821,8 @@ async fn run_public_ws_proxy(
 
                     match channel {
                         "l2_data" => {
-                            if let Some(kraken_msg) = translate::coinbase_book_to_kraken(&parsed) {
+                            let map = product_id_map.lock().await;
+                            if let Some(kraken_msg) = translate::coinbase_book_to_kraken_mapped(&parsed, &map) {
                                 let mut writer = bot_write_for_upstream.lock().await;
                                 if writer
                                     .send(ws::Message::Text(kraken_msg.into()))
