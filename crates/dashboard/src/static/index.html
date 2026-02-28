@@ -1,0 +1,1603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0e17">
+<title>MM Dashboard</title>
+<style>
+/* ==================== CSS Reset & Variables ==================== */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root {
+  --bg-primary: #0a0e17;
+  --bg-secondary: #111827;
+  --bg-card: #1a1f2e;
+  --bg-card-hover: #222838;
+  --bg-input: #0f1420;
+  --border: #2a3042;
+  --border-focus: #3b82f6;
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --green: #22c55e;
+  --green-dim: #16a34a;
+  --green-bg: rgba(34,197,94,0.1);
+  --red: #ef4444;
+  --red-dim: #dc2626;
+  --red-bg: rgba(239,68,68,0.1);
+  --blue: #3b82f6;
+  --blue-dim: #2563eb;
+  --blue-bg: rgba(59,130,246,0.1);
+  --yellow: #f59e0b;
+  --yellow-bg: rgba(245,158,11,0.1);
+  --purple: #a855f7;
+  --purple-bg: rgba(168,85,247,0.1);
+  --orange: #f97316;
+  --orange-bg: rgba(249,115,22,0.1);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-xs: 6px;
+  --shadow: 0 4px 24px rgba(0,0,0,0.3);
+  --shadow-sm: 0 2px 8px rgba(0,0,0,0.2);
+  --font: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --transition: 0.2s ease;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+html { font-size: 14px; }
+body {
+  font-family: var(--font);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+  padding-top: var(--safe-top);
+  padding-bottom: calc(60px + var(--safe-bottom));
+  overflow-x: hidden;
+}
+a { color: var(--blue); text-decoration: none; }
+input, select, textarea, button { font-family: inherit; font-size: inherit; }
+
+/* ==================== Scrollbar ==================== */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ==================== Header ==================== */
+.header {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(10,14,23,0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.header-title {
+  font-size: 1.15rem; font-weight: 700;
+  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.conn-status {
+  width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block; margin-left: 8px;
+  transition: background var(--transition);
+}
+.conn-status.connected { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.conn-status.disconnected { background: var(--red); box-shadow: 0 0 8px var(--red); }
+.header-right { display: flex; align-items: center; gap: 8px; }
+.refresh-btn {
+  background: none; border: none; color: var(--text-secondary);
+  cursor: pointer; padding: 4px; border-radius: 6px; line-height: 0;
+  transition: all var(--transition);
+}
+.refresh-btn:active { transform: scale(0.9); color: var(--blue); }
+.refresh-btn svg { width: 18px; height: 18px; }
+
+/* ==================== Bottom Nav ==================== */
+.bottom-nav {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: rgba(17,24,39,0.95);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-top: 1px solid var(--border);
+  display: flex;
+  padding-bottom: var(--safe-bottom);
+  z-index: 100;
+}
+.nav-item {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  padding: 8px 4px 6px; gap: 2px;
+  color: var(--text-muted); cursor: pointer;
+  transition: color var(--transition);
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+.nav-item.active { color: var(--blue); }
+.nav-item svg { width: 22px; height: 22px; }
+.nav-label { font-size: 0.65rem; font-weight: 600; letter-spacing: 0.02em; }
+
+/* ==================== Page Container ==================== */
+.page { display: none; padding: 12px; animation: fadeIn 0.2s ease; }
+.page.active { display: block; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ==================== Cards ==================== */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 12px;
+  transition: all var(--transition);
+}
+.card:active { background: var(--bg-card-hover); }
+.card-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 12px;
+}
+.card-title { font-size: 0.8rem; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.06em; }
+
+/* ==================== Stat Grids ==================== */
+.stat-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(2, 1fr);
+}
+.stat-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.stat-box {
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+}
+.stat-label {
+  font-size: 0.7rem; color: var(--text-muted); font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.stat-value {
+  font-size: 1.25rem; font-weight: 700;
+  font-family: var(--font-mono);
+}
+.stat-value.positive { color: var(--green); }
+.stat-value.negative { color: var(--red); }
+.stat-value.neutral { color: var(--text-primary); }
+.stat-sub { font-size: 0.7rem; color: var(--text-muted); margin-top: 2px; font-family: var(--font-mono); }
+
+/* ==================== Badges & Pills ==================== */
+.badge {
+  display: inline-flex; align-items: center;
+  padding: 3px 8px; border-radius: 20px;
+  font-size: 0.7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.badge-active { background: var(--green-bg); color: var(--green); }
+.badge-disabled { background: rgba(100,116,139,0.15); color: var(--text-muted); }
+.badge-wind-down { background: var(--yellow-bg); color: var(--yellow); }
+.badge-liquidating { background: var(--red-bg); color: var(--red); }
+
+/* ==================== Pair List ==================== */
+.pair-list { display: flex; flex-direction: column; gap: 8px; }
+.pair-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  cursor: pointer;
+  transition: all var(--transition);
+  -webkit-tap-highlight-color: transparent;
+}
+.pair-card:active { background: var(--bg-card-hover); transform: scale(0.99); }
+.pair-card-top {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px;
+}
+.pair-symbol { font-weight: 700; font-size: 1rem; }
+.pair-card-stats {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+}
+.pair-stat-label { font-size: 0.65rem; color: var(--text-muted); text-transform: uppercase; }
+.pair-stat-value { font-size: 0.85rem; font-weight: 600; font-family: var(--font-mono); }
+
+/* ==================== Filter Tabs ==================== */
+.filter-bar {
+  display: flex; gap: 6px; padding: 4px 0 12px;
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+}
+.filter-bar::-webkit-scrollbar { display: none; }
+.filter-chip {
+  padding: 6px 14px; border-radius: 20px;
+  font-size: 0.75rem; font-weight: 600;
+  white-space: nowrap; cursor: pointer;
+  background: var(--bg-secondary); color: var(--text-secondary);
+  border: 1px solid var(--border);
+  transition: all var(--transition);
+  -webkit-tap-highlight-color: transparent;
+}
+.filter-chip.active {
+  background: var(--blue-bg); color: var(--blue);
+  border-color: var(--blue);
+}
+
+/* ==================== Trade List ==================== */
+.trade-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(42,48,66,0.5);
+}
+.trade-row:last-child { border-bottom: none; }
+.trade-left { display: flex; flex-direction: column; gap: 2px; }
+.trade-symbol { font-weight: 600; font-size: 0.9rem; }
+.trade-side { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }
+.trade-side.buy { color: var(--green); }
+.trade-side.sell { color: var(--red); }
+.trade-time { font-size: 0.65rem; color: var(--text-muted); font-family: var(--font-mono); }
+.trade-right { text-align: right; display: flex; flex-direction: column; gap: 2px; }
+.trade-value { font-size: 0.85rem; font-weight: 600; font-family: var(--font-mono); }
+.trade-pnl { font-size: 0.75rem; font-weight: 600; font-family: var(--font-mono); }
+
+/* ==================== Modal / Drawer ==================== */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+  display: none; align-items: flex-end; justify-content: center;
+  animation: fadeOverlay 0.2s ease;
+}
+.modal-overlay.active { display: flex; }
+@keyframes fadeOverlay { from { opacity: 0; } to { opacity: 1; } }
+.modal {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  width: 100%; max-width: 500px;
+  max-height: 85vh; overflow-y: auto;
+  padding: 20px 16px calc(20px + var(--safe-bottom));
+  animation: slideUp 0.25s ease;
+}
+@keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+.modal-handle {
+  width: 36px; height: 4px;
+  background: var(--border);
+  border-radius: 4px;
+  margin: 0 auto 16px;
+}
+.modal-title {
+  font-size: 1.1rem; font-weight: 700; margin-bottom: 16px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-close {
+  background: var(--bg-secondary); border: none; color: var(--text-secondary);
+  width: 28px; height: 28px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 1rem;
+}
+
+/* ==================== Form Elements ==================== */
+.form-group { margin-bottom: 14px; }
+.form-label {
+  display: block; font-size: 0.75rem; font-weight: 600;
+  color: var(--text-secondary); margin-bottom: 6px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.form-input {
+  width: 100%; padding: 10px 12px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius-xs); color: var(--text-primary);
+  font-family: var(--font-mono); font-size: 0.9rem;
+  transition: border-color var(--transition);
+  outline: none;
+}
+.form-input:focus { border-color: var(--border-focus); }
+.form-input::placeholder { color: var(--text-muted); }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.form-hint { font-size: 0.65rem; color: var(--text-muted); margin-top: 3px; }
+
+/* ==================== Buttons ==================== */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 10px 20px; border-radius: var(--radius-sm);
+  font-weight: 600; font-size: 0.85rem;
+  cursor: pointer; border: none;
+  transition: all var(--transition);
+  -webkit-tap-highlight-color: transparent;
+}
+.btn:active { transform: scale(0.97); }
+.btn-primary { background: var(--blue); color: white; }
+.btn-primary:hover { background: var(--blue-dim); }
+.btn-danger { background: var(--red); color: white; }
+.btn-danger:hover { background: var(--red-dim); }
+.btn-success { background: var(--green); color: white; }
+.btn-success:hover { background: var(--green-dim); }
+.btn-ghost {
+  background: transparent; color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+.btn-full { width: 100%; }
+.btn-group { display: flex; gap: 8px; margin-top: 16px; }
+
+/* ==================== Action Buttons (Pair Detail) ==================== */
+.action-grid {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;
+  margin-top: 12px;
+}
+.action-btn {
+  padding: 10px; border-radius: var(--radius-sm);
+  font-weight: 600; font-size: 0.8rem;
+  text-align: center; cursor: pointer; border: none;
+  transition: all var(--transition);
+}
+.action-btn:active { transform: scale(0.95); }
+.action-activate { background: var(--green-bg); color: var(--green); border: 1px solid rgba(34,197,94,0.2); }
+.action-winddown { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(245,158,11,0.2); }
+.action-liquidate { background: var(--red-bg); color: var(--red); border: 1px solid rgba(239,68,68,0.2); }
+.action-disable { background: rgba(100,116,139,0.1); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.2); }
+
+/* ==================== Config Display ==================== */
+.config-list { display: flex; flex-direction: column; gap: 2px; }
+.config-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(42,48,66,0.3);
+}
+.config-row:last-child { border-bottom: none; }
+.config-key { font-size: 0.8rem; color: var(--text-secondary); }
+.config-val { font-size: 0.85rem; font-weight: 600; font-family: var(--font-mono); }
+.config-val.default { color: var(--text-muted); font-style: italic; }
+
+/* ==================== Toast ==================== */
+.toast-container {
+  position: fixed; top: 70px; left: 50%; transform: translateX(-50%);
+  z-index: 300; display: flex; flex-direction: column; gap: 8px;
+  width: calc(100% - 32px); max-width: 400px;
+}
+.toast {
+  padding: 12px 16px; border-radius: var(--radius-sm);
+  font-size: 0.8rem; font-weight: 500;
+  animation: toastIn 0.25s ease, toastOut 0.25s ease 2.5s forwards;
+  box-shadow: var(--shadow);
+}
+.toast-success { background: var(--green-bg); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+.toast-error { background: var(--red-bg); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }
+.toast-info { background: var(--blue-bg); color: var(--blue); border: 1px solid rgba(59,130,246,0.3); }
+@keyframes toastIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toastOut { from { opacity: 1; } to { opacity: 0; } }
+
+/* ==================== Loading ==================== */
+.spinner {
+  width: 24px; height: 24px;
+  border: 3px solid var(--border);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  margin: 20px auto;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.skeleton {
+  background: linear-gradient(90deg, var(--bg-secondary) 25%, var(--bg-card) 50%, var(--bg-secondary) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease infinite;
+  border-radius: var(--radius-xs);
+  height: 20px;
+}
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+/* ==================== Empty state ==================== */
+.empty-state {
+  text-align: center; padding: 40px 20px; color: var(--text-muted);
+}
+.empty-state svg { width: 48px; height: 48px; margin-bottom: 12px; opacity: 0.4; }
+.empty-state p { font-size: 0.85rem; }
+
+/* ==================== Select styled ==================== */
+select.form-input {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+}
+
+/* ==================== Responsive ==================== */
+@media (min-width: 768px) {
+  html { font-size: 15px; }
+  .page { padding: 16px 24px; max-width: 800px; margin: 0 auto; }
+  .stat-grid { grid-template-columns: repeat(4, 1fr); }
+  .pair-card-stats { grid-template-columns: repeat(4, 1fr); }
+}
+
+/* ==================== Pull to refresh indicator ==================== */
+.pull-indicator {
+  text-align: center;
+  padding: 8px;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  display: none;
+}
+
+/* ==================== Edge bar (mini chart) ==================== */
+.edge-bar-container {
+  height: 4px; border-radius: 2px; background: var(--bg-secondary);
+  overflow: hidden; margin-top: 4px;
+}
+.edge-bar {
+  height: 100%; border-radius: 2px;
+  transition: width 0.3s ease;
+}
+.edge-bar.positive { background: var(--green); }
+.edge-bar.negative { background: var(--red); }
+.edge-bar.neutral { background: var(--yellow); }
+
+/* ==================== Add pair button ==================== */
+.fab {
+  position: fixed; bottom: calc(70px + var(--safe-bottom)); right: 16px;
+  width: 48px; height: 48px;
+  background: var(--blue); color: white;
+  border: none; border-radius: 50%;
+  font-size: 1.5rem; cursor: pointer;
+  box-shadow: 0 4px 16px rgba(59,130,246,0.4);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 90;
+  transition: all var(--transition);
+}
+.fab:active { transform: scale(0.9); }
+
+/* ==================== Section header ==================== */
+.section-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 8px;
+}
+.section-title { font-size: 0.8rem; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.06em; }
+.section-count { font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono); }
+
+/* ==================== Confirm dialog ==================== */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(0,0,0,0.7);
+  display: none; align-items: center; justify-content: center;
+}
+.confirm-overlay.active { display: flex; }
+.confirm-dialog {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px;
+  width: calc(100% - 32px); max-width: 360px;
+  text-align: center;
+}
+.confirm-dialog h3 { margin-bottom: 8px; }
+.confirm-dialog p { color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div style="display:flex;align-items:center;">
+    <span class="header-title">MM Dashboard</span>
+    <span class="conn-status disconnected" id="connStatus" title="WebSocket"></span>
+  </div>
+  <div class="header-right">
+    <span style="font-size:0.7rem;color:var(--text-muted);font-family:var(--font-mono)" id="lastUpdate"></span>
+    <button class="refresh-btn" onclick="refreshAll()" title="Refresh">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+        <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+      </svg>
+    </button>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toasts"></div>
+
+<!-- ==================== DASHBOARD PAGE ==================== -->
+<div class="page active" id="page-dashboard">
+  <!-- PnL Summary -->
+  <div class="card" id="pnl-card">
+    <div class="card-header">
+      <span class="card-title">Profit & Loss</span>
+      <span class="card-title" id="pnl-uptime"></span>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-box">
+        <div class="stat-label">Net PnL</div>
+        <div class="stat-value neutral" id="pnl-net">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Realized</div>
+        <div class="stat-value neutral" id="pnl-realized">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Unrealized</div>
+        <div class="stat-value neutral" id="pnl-unrealized">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Fees</div>
+        <div class="stat-value neutral" id="pnl-fees">--</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edge & Volume -->
+  <div class="card" id="edge-card">
+    <div class="card-header">
+      <span class="card-title">Edge & Volume</span>
+      <span class="card-title" id="edge-window"></span>
+    </div>
+    <div class="stat-grid cols-3">
+      <div class="stat-box">
+        <div class="stat-label">Edge</div>
+        <div class="stat-value neutral" id="edge-overall">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Volume</div>
+        <div class="stat-value neutral" id="edge-volume">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Trades</div>
+        <div class="stat-value neutral" id="edge-trades">--</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- System Health -->
+  <div class="card" id="health-card">
+    <div class="card-header">
+      <span class="card-title">System Health</span>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-box">
+        <div class="stat-label">Bot</div>
+        <div class="stat-value" id="health-bot">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Pairs</div>
+        <div class="stat-value" id="health-pairs">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-value" id="health-uptime">--</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Last Fill</div>
+        <div class="stat-value" id="health-lastfill" style="font-size:0.85rem">--</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top Pairs by Edge -->
+  <div class="card" id="top-pairs-card">
+    <div class="card-header">
+      <span class="card-title">Top Pairs (24h Edge)</span>
+    </div>
+    <div id="top-pairs-list"></div>
+  </div>
+
+  <!-- Recent Trades -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Recent Trades</span>
+      <span class="card-title" style="cursor:pointer;color:var(--blue)" onclick="switchPage('trades')">View All</span>
+    </div>
+    <div id="dash-trades"></div>
+  </div>
+</div>
+
+<!-- ==================== PAIRS PAGE ==================== -->
+<div class="page" id="page-pairs">
+  <div class="filter-bar" id="pair-filters">
+    <div class="filter-chip active" data-filter="all" onclick="filterPairs('all',this)">All</div>
+    <div class="filter-chip" data-filter="active" onclick="filterPairs('active',this)">Active</div>
+    <div class="filter-chip" data-filter="wind_down" onclick="filterPairs('wind_down',this)">Wind Down</div>
+    <div class="filter-chip" data-filter="liquidating" onclick="filterPairs('liquidating',this)">Liquidating</div>
+    <div class="filter-chip" data-filter="disabled" onclick="filterPairs('disabled',this)">Disabled</div>
+  </div>
+  <div class="section-header">
+    <span class="section-title">Managed Pairs</span>
+    <span class="section-count" id="pairs-count">0 pairs</span>
+  </div>
+  <div class="pair-list" id="pairs-list"></div>
+  <button class="fab" onclick="openAddPairModal()" title="Add pair">+</button>
+</div>
+
+<!-- ==================== TRADES PAGE ==================== -->
+<div class="page" id="page-trades">
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Trade History</span>
+      <span class="card-title" style="font-family:var(--font-mono)" id="trades-count"></span>
+    </div>
+    <div id="trades-list"></div>
+  </div>
+</div>
+
+<!-- ==================== CONFIG PAGE ==================== -->
+<div class="page" id="page-config">
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Global Defaults</span>
+      <button class="btn btn-ghost" style="font-size:0.75rem;padding:6px 12px" onclick="openEditDefaultsModal()">Edit</button>
+    </div>
+    <div class="config-list" id="defaults-list"></div>
+  </div>
+</div>
+
+<!-- ==================== Bottom Navigation ==================== -->
+<div class="bottom-nav">
+  <div class="nav-item active" onclick="switchPage('dashboard')" data-page="dashboard">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+      <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+    </svg>
+    <span class="nav-label">Dashboard</span>
+  </div>
+  <div class="nav-item" onclick="switchPage('pairs')" data-page="pairs">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+      <line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>
+      <line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+    </svg>
+    <span class="nav-label">Pairs</span>
+  </div>
+  <div class="nav-item" onclick="switchPage('trades')" data-page="trades">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+    </svg>
+    <span class="nav-label">Trades</span>
+  </div>
+  <div class="nav-item" onclick="switchPage('config')" data-page="config">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.32 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+    </svg>
+    <span class="nav-label">Config</span>
+  </div>
+</div>
+
+<!-- ==================== PAIR DETAIL MODAL ==================== -->
+<div class="modal-overlay" id="pair-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">
+      <span id="modal-pair-symbol">--</span>
+      <button class="modal-close" onclick="closeModal('pair-modal')">&times;</button>
+    </div>
+    <div id="modal-pair-badge" style="margin-bottom:12px"></div>
+
+    <!-- PnL info from analyzer -->
+    <div id="modal-pair-pnl" style="margin-bottom:12px"></div>
+
+    <!-- Config -->
+    <div class="card" style="margin-bottom:12px">
+      <div class="card-header">
+        <span class="card-title">Config</span>
+        <button class="btn btn-ghost" style="font-size:0.7rem;padding:4px 10px" onclick="openEditPairConfigModal()">Edit</button>
+      </div>
+      <div class="config-list" id="modal-pair-config"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="card-title" style="margin-bottom:8px">Actions</div>
+    <div class="action-grid" id="modal-pair-actions"></div>
+
+    <!-- Danger Zone -->
+    <div style="margin-top:16px">
+      <button class="btn btn-danger btn-full" id="modal-delete-btn" onclick="confirmDeletePair()">Delete Pair</button>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== EDIT PAIR CONFIG MODAL ==================== -->
+<div class="modal-overlay" id="edit-pair-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">
+      <span>Edit Pair Config</span>
+      <button class="modal-close" onclick="closeModal('edit-pair-modal')">&times;</button>
+    </div>
+    <div id="edit-pair-symbol" style="font-weight:700;margin-bottom:12px;font-size:1.1rem"></div>
+    <form id="edit-pair-form" onsubmit="savePairConfig(event)">
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Order Size ($)</label>
+          <input type="number" step="any" class="form-input" name="order_size_usd" placeholder="default">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Max Inventory ($)</label>
+          <input type="number" step="any" class="form-input" name="max_inventory_usd" placeholder="default">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Min Spread (bps)</label>
+          <input type="number" step="any" class="form-input" name="min_spread_bps" placeholder="default">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Spread Capture %</label>
+          <input type="number" step="any" class="form-input" name="spread_capture_pct" placeholder="default">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Min Profit %</label>
+          <input type="number" step="any" class="form-input" name="min_profit_pct" placeholder="default">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Stop Loss %</label>
+          <input type="number" step="any" class="form-input" name="stop_loss_pct" placeholder="default">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Take Profit %</label>
+          <input type="number" step="any" class="form-input" name="take_profit_pct" placeholder="default">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Max Buys Before Sell</label>
+          <input type="number" step="1" class="form-input" name="max_buys_before_sell" placeholder="default">
+        </div>
+      </div>
+      <div class="form-hint" style="margin-bottom:12px">Leave blank to use global default. Enter a value to override.</div>
+      <div class="btn-group">
+        <button type="button" class="btn btn-ghost" style="flex:1" onclick="closeModal('edit-pair-modal')">Cancel</button>
+        <button type="submit" class="btn btn-primary" style="flex:1">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ==================== ADD PAIR MODAL ==================== -->
+<div class="modal-overlay" id="add-pair-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">
+      <span>Add Pair</span>
+      <button class="modal-close" onclick="closeModal('add-pair-modal')">&times;</button>
+    </div>
+    <form id="add-pair-form" onsubmit="addPair(event)">
+      <div class="form-group">
+        <label class="form-label">Symbol</label>
+        <input type="text" class="form-input" name="symbol" placeholder="e.g. BTC/USD" required>
+        <div class="form-hint">Use exchange format: BASE/QUOTE (e.g. ETH/USD, OMG/USD)</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Initial State</label>
+        <select class="form-input" name="state">
+          <option value="active">Active</option>
+          <option value="disabled" selected>Disabled</option>
+        </select>
+      </div>
+      <div class="form-hint" style="margin-bottom:12px">Config will use global defaults. Edit after creation to override.</div>
+      <div class="btn-group">
+        <button type="button" class="btn btn-ghost" style="flex:1" onclick="closeModal('add-pair-modal')">Cancel</button>
+        <button type="submit" class="btn btn-primary" style="flex:1">Add</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ==================== EDIT DEFAULTS MODAL ==================== -->
+<div class="modal-overlay" id="edit-defaults-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">
+      <span>Edit Global Defaults</span>
+      <button class="modal-close" onclick="closeModal('edit-defaults-modal')">&times;</button>
+    </div>
+    <form id="edit-defaults-form" onsubmit="saveDefaults(event)">
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Order Size ($)</label>
+          <input type="number" step="any" class="form-input" name="order_size_usd" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Max Inventory ($)</label>
+          <input type="number" step="any" class="form-input" name="max_inventory_usd" required>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Min Spread (bps)</label>
+          <input type="number" step="any" class="form-input" name="min_spread_bps" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Spread Capture %</label>
+          <input type="number" step="any" class="form-input" name="spread_capture_pct" required>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Min Profit %</label>
+          <input type="number" step="any" class="form-input" name="min_profit_pct" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Stop Loss %</label>
+          <input type="number" step="any" class="form-input" name="stop_loss_pct" required>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Take Profit %</label>
+          <input type="number" step="any" class="form-input" name="take_profit_pct" required>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Max Buys Before Sell</label>
+          <input type="number" step="1" class="form-input" name="max_buys_before_sell" required>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Use Wind Down for Stop Loss</label>
+        <select class="form-input" name="use_winddown_for_stoploss">
+          <option value="true">Yes</option>
+          <option value="false">No</option>
+        </select>
+      </div>
+      <div class="btn-group">
+        <button type="button" class="btn btn-ghost" style="flex:1" onclick="closeModal('edit-defaults-modal')">Cancel</button>
+        <button type="submit" class="btn btn-primary" style="flex:1">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ==================== CONFIRM DIALOG ==================== -->
+<div class="confirm-overlay" id="confirm-dialog">
+  <div class="confirm-dialog">
+    <h3 id="confirm-title">Confirm</h3>
+    <p id="confirm-msg">Are you sure?</p>
+    <div class="btn-group" style="justify-content:center">
+      <button class="btn btn-ghost" onclick="closeConfirm()">Cancel</button>
+      <button class="btn btn-danger" id="confirm-btn" onclick="confirmAction()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==================== STATE ====================
+let currentPage = 'dashboard';
+let pairsData = [];
+let defaultsData = {};
+let pnlPairsData = [];
+let currentFilter = 'all';
+let selectedPair = null;
+let confirmCallback = null;
+let ws = null;
+let wsRetryTimeout = null;
+
+// ==================== NAVIGATION ====================
+function switchPage(page) {
+  currentPage = page;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + page).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelector(`.nav-item[data-page="${page}"]`).classList.add('active');
+  // Load data for the page
+  if (page === 'pairs') loadPairs();
+  else if (page === 'trades') loadTrades();
+  else if (page === 'config') loadDefaults();
+  else if (page === 'dashboard') loadDashboard();
+}
+
+// ==================== API ====================
+const API = '';
+
+async function api(path, opts = {}) {
+  try {
+    const resp = await fetch(API + path, {
+      headers: { 'Content-Type': 'application/json', ...opts.headers },
+      ...opts,
+    });
+    if (resp.status === 204) return null;
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+    return data;
+  } catch (e) {
+    if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
+      throw new Error('Service unreachable');
+    }
+    throw e;
+  }
+}
+
+// ==================== FORMATTING ====================
+function fmt$(v, decimals = 2) {
+  if (v == null || v === '--') return '--';
+  const n = parseFloat(v);
+  if (isNaN(n)) return '--';
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+function fmtPct(v) {
+  if (v == null) return '--';
+  const n = parseFloat(v);
+  if (isNaN(n)) return '--';
+  return (n * 100).toFixed(2) + '%';
+}
+
+function fmtBps(v) {
+  if (v == null) return '--';
+  return parseFloat(v).toFixed(0) + ' bps';
+}
+
+function fmtEdge(v) {
+  if (v == null) return '--';
+  const n = parseFloat(v);
+  if (isNaN(n)) return '--';
+  return (n * 100).toFixed(3) + '%';
+}
+
+function fmtNum(v, d = 2) {
+  if (v == null) return '--';
+  const n = parseFloat(v);
+  if (isNaN(n)) return '--';
+  return n.toLocaleString('en-US', { maximumFractionDigits: d });
+}
+
+function fmtTime(ts) {
+  if (!ts) return '--';
+  const d = new Date(ts);
+  const now = new Date();
+  const diff = (now - d) / 1000;
+  if (diff < 60) return Math.floor(diff) + 's ago';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+  return d.toLocaleDateString();
+}
+
+function fmtDuration(secs) {
+  if (!secs) return '--';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h > 24) return Math.floor(h/24) + 'd ' + (h%24) + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function pnlClass(v) {
+  const n = parseFloat(v);
+  if (isNaN(n) || n === 0) return 'neutral';
+  return n > 0 ? 'positive' : 'negative';
+}
+
+function stateBadge(state) {
+  const cls = {
+    active: 'badge-active',
+    disabled: 'badge-disabled',
+    wind_down: 'badge-wind-down',
+    liquidating: 'badge-liquidating',
+  };
+  const label = {
+    active: 'Active',
+    disabled: 'Disabled',
+    wind_down: 'Wind Down',
+    liquidating: 'Liquidating',
+  };
+  return `<span class="badge ${cls[state] || 'badge-disabled'}">${label[state] || state}</span>`;
+}
+
+function symbolToPath(sym) {
+  return sym.replace('/', '-');
+}
+
+// ==================== TOAST ====================
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = 'toast toast-' + type;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+// ==================== DASHBOARD ====================
+async function loadDashboard() {
+  try {
+    const [pnl, health] = await Promise.all([
+      api('/api/pnl').catch(() => null),
+      api('/api/health').catch(() => null),
+    ]);
+
+    if (pnl) {
+      const p = pnl.pnl || {};
+      const e = pnl.edge || {};
+      setValue('pnl-net', fmt$(p.net_pnl), pnlClass(p.net_pnl));
+      setValue('pnl-realized', fmt$(p.realized_pnl), pnlClass(p.realized_pnl));
+      setValue('pnl-unrealized', fmt$(p.unrealized_pnl), pnlClass(p.unrealized_pnl));
+      setValue('pnl-fees', fmt$(p.total_fees), 'negative');
+      document.getElementById('pnl-uptime').textContent = pnl.uptime_secs ? fmtDuration(pnl.uptime_secs) : '';
+
+      setValue('edge-overall', fmtEdge(e.overall_edge), pnlClass(e.overall_edge));
+      setValue('edge-volume', fmt$(e.total_volume, 0), 'neutral');
+      setValue('edge-trades', e.total_trade_count || '--', 'neutral');
+      document.getElementById('edge-window').textContent = e.window_hours ? e.window_hours + 'h window' : '';
+
+      document.getElementById('health-lastfill').textContent = fmtTime(pnl.last_fill_time);
+    }
+
+    if (health) {
+      const botEl = document.getElementById('health-bot');
+      botEl.textContent = health.bot_connected ? 'Connected' : 'Offline';
+      botEl.className = 'stat-value ' + (health.bot_connected ? 'positive' : 'negative');
+      setValue('health-pairs', health.pairs_count ?? '--', 'neutral');
+      document.getElementById('health-uptime').textContent = fmtDuration(health.uptime_secs);
+    }
+
+    // Load top pairs by edge
+    loadTopPairs();
+    loadRecentTrades();
+  } catch (e) {
+    console.error('Dashboard load error:', e);
+  }
+}
+
+async function loadTopPairs() {
+  try {
+    const data = await api('/api/pnl/pairs');
+    pnlPairsData = data?.pairs || [];
+    const sorted = [...pnlPairsData].sort((a, b) => {
+      const ea = a.windows?.['24h']?.edge ?? -999;
+      const eb = b.windows?.['24h']?.edge ?? -999;
+      return eb - ea;
+    }).slice(0, 5);
+
+    const container = document.getElementById('top-pairs-list');
+    if (sorted.length === 0) {
+      container.innerHTML = '<div class="empty-state"><p>No pair data yet</p></div>';
+      return;
+    }
+
+    container.innerHTML = sorted.map(p => {
+      const w = p.windows?.['24h'] || {};
+      const edge = w.edge;
+      const edgeStr = fmtEdge(edge);
+      const edgePct = Math.min(Math.abs((edge || 0) * 100) * 10, 100); // scale for bar
+      const barClass = (edge || 0) > 0 ? 'positive' : (edge || 0) < 0 ? 'negative' : 'neutral';
+      return `
+        <div class="trade-row" style="cursor:pointer" onclick="switchPage('pairs')">
+          <div class="trade-left">
+            <span class="trade-symbol">${p.symbol}</span>
+            <span style="font-size:0.7rem;color:var(--text-muted)">${w.trade_count || 0} trades | ${fmt$(w.total_volume, 0)} vol</span>
+          </div>
+          <div class="trade-right" style="min-width:80px">
+            <span class="trade-value ${pnlClass(edge)}">${edgeStr}</span>
+            <div class="edge-bar-container">
+              <div class="edge-bar ${barClass}" style="width:${edgePct}%"></div>
+            </div>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    console.error('Top pairs error:', e);
+  }
+}
+
+async function loadRecentTrades() {
+  try {
+    const trades = await api('/api/pnl/trades?limit=5');
+    const container = document.getElementById('dash-trades');
+    if (!trades || trades.length === 0) {
+      container.innerHTML = '<div class="empty-state"><p>No trades yet</p></div>';
+      return;
+    }
+    container.innerHTML = renderTradesList(trades);
+  } catch (e) {
+    document.getElementById('dash-trades').innerHTML = '<div class="empty-state"><p>PnL analyzer unavailable</p></div>';
+  }
+}
+
+function setValue(id, val, cls) {
+  const el = document.getElementById(id);
+  el.textContent = val;
+  if (cls) el.className = 'stat-value ' + cls;
+}
+
+// ==================== PAIRS ====================
+async function loadPairs() {
+  try {
+    const data = await api('/api/pairs');
+    pairsData = data?.pairs || [];
+    renderPairs();
+  } catch (e) {
+    toast('Failed to load pairs: ' + e.message, 'error');
+  }
+}
+
+function renderPairs() {
+  let filtered = pairsData;
+  if (currentFilter !== 'all') {
+    filtered = pairsData.filter(p => p.state === currentFilter);
+  }
+
+  // Sort: active first, then wind_down, liquidating, disabled
+  const stateOrder = { active: 0, wind_down: 1, liquidating: 2, disabled: 3 };
+  filtered.sort((a, b) => (stateOrder[a.state] ?? 9) - (stateOrder[b.state] ?? 9) || a.symbol.localeCompare(b.symbol));
+
+  document.getElementById('pairs-count').textContent = filtered.length + ' pair' + (filtered.length !== 1 ? 's' : '');
+
+  const container = document.getElementById('pairs-list');
+  if (filtered.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p>No pairs found</p></div>';
+    return;
+  }
+
+  // Try to find PnL data for each pair
+  container.innerHTML = filtered.map(p => {
+    const pnlInfo = pnlPairsData.find(pp => pp.symbol === p.symbol);
+    const w = pnlInfo?.windows?.['24h'] || {};
+    const edge = w.edge;
+    const pnl = w.realized_pnl;
+    const trades = w.trade_count || 0;
+
+    return `
+      <div class="pair-card" onclick="openPairDetail('${p.symbol}')">
+        <div class="pair-card-top">
+          <span class="pair-symbol">${p.symbol}</span>
+          ${stateBadge(p.state)}
+        </div>
+        <div class="pair-card-stats">
+          <div>
+            <div class="pair-stat-label">Edge (24h)</div>
+            <div class="pair-stat-value ${pnlClass(edge)}">${fmtEdge(edge)}</div>
+          </div>
+          <div>
+            <div class="pair-stat-label">PnL (24h)</div>
+            <div class="pair-stat-value ${pnlClass(pnl)}">${fmt$(pnl)}</div>
+          </div>
+          <div>
+            <div class="pair-stat-label">Trades</div>
+            <div class="pair-stat-value">${trades}</div>
+          </div>
+        </div>
+        ${p.disabled_reason ? `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:6px">Reason: ${p.disabled_reason}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+function filterPairs(filter, el) {
+  currentFilter = filter;
+  document.querySelectorAll('#pair-filters .filter-chip').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  renderPairs();
+}
+
+// ==================== PAIR DETAIL ====================
+async function openPairDetail(symbol) {
+  selectedPair = pairsData.find(p => p.symbol === symbol);
+  if (!selectedPair) return;
+
+  document.getElementById('modal-pair-symbol').textContent = symbol;
+  document.getElementById('modal-pair-badge').innerHTML = stateBadge(selectedPair.state);
+
+  // Load PnL info
+  try {
+    const pnlInfo = await api('/api/pnl/pairs/' + symbolToPath(symbol));
+    const pos = pnlInfo?.position;
+    let html = '';
+    if (pos && parseFloat(pos.qty) > 0) {
+      html += `<div class="stat-grid" style="margin-bottom:8px">
+        <div class="stat-box"><div class="stat-label">Position</div><div class="stat-value" style="font-size:1rem">${fmtNum(pos.qty, 6)}</div></div>
+        <div class="stat-box"><div class="stat-label">Avg Cost</div><div class="stat-value" style="font-size:1rem">${fmt$(pos.avg_cost, 6)}</div></div>
+        <div class="stat-box"><div class="stat-label">Value</div><div class="stat-value" style="font-size:1rem">${fmt$(pos.current_value)}</div></div>
+        <div class="stat-box"><div class="stat-label">Unrealized</div><div class="stat-value ${pnlClass(pos.unrealized_pnl)}" style="font-size:1rem">${fmt$(pos.unrealized_pnl)}</div></div>
+      </div>`;
+    }
+    const windows = pnlInfo?.windows || [];
+    if (windows.length > 0) {
+      html += '<div class="card" style="padding:10px"><div class="card-title" style="margin-bottom:8px">Edge Windows</div>';
+      html += '<div class="stat-grid cols-3">';
+      for (const w of windows) {
+        html += `<div class="stat-box" style="padding:8px">
+          <div class="stat-label">${w.window_hours}h</div>
+          <div class="stat-value ${pnlClass(w.edge)}" style="font-size:0.95rem">${fmtEdge(w.edge)}</div>
+          <div class="stat-sub">${w.trade_count} trades</div>
+        </div>`;
+      }
+      html += '</div></div>';
+    }
+    document.getElementById('modal-pair-pnl').innerHTML = html;
+  } catch (e) {
+    document.getElementById('modal-pair-pnl').innerHTML = '';
+  }
+
+  // Config
+  renderPairConfig(selectedPair.config || {});
+
+  // Actions
+  renderPairActions(selectedPair.state);
+
+  openModal('pair-modal');
+}
+
+function renderPairConfig(config) {
+  const fields = [
+    ['order_size_usd', 'Order Size', v => fmt$(v)],
+    ['max_inventory_usd', 'Max Inventory', v => fmt$(v)],
+    ['min_spread_bps', 'Min Spread', v => fmtBps(v)],
+    ['spread_capture_pct', 'Spread Capture', v => fmtPct(v)],
+    ['min_profit_pct', 'Min Profit', v => fmtPct(v)],
+    ['stop_loss_pct', 'Stop Loss', v => fmtPct(v)],
+    ['take_profit_pct', 'Take Profit', v => fmtPct(v)],
+    ['max_buys_before_sell', 'Max Buys Before Sell', v => v],
+    ['use_winddown_for_stoploss', 'Wind Down Stop Loss', v => v ? 'Yes' : 'No'],
+  ];
+
+  document.getElementById('modal-pair-config').innerHTML = fields.map(([key, label, fmt]) => {
+    const val = config[key];
+    const isDefault = val == null;
+    const displayVal = isDefault ? 'default' : fmt(val);
+    return `<div class="config-row">
+      <span class="config-key">${label}</span>
+      <span class="config-val ${isDefault ? 'default' : ''}">${displayVal}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderPairActions(state) {
+  let html = '';
+  if (state !== 'active') {
+    html += `<button class="action-btn action-activate" onclick="setPairState('active')">Activate</button>`;
+  }
+  if (state !== 'wind_down') {
+    html += `<button class="action-btn action-winddown" onclick="setPairState('wind_down')">Wind Down</button>`;
+  }
+  if (state !== 'liquidating') {
+    html += `<button class="action-btn action-liquidate" onclick="setPairState('liquidating')">Liquidate</button>`;
+  }
+  if (state !== 'disabled') {
+    html += `<button class="action-btn action-disable" onclick="setPairState('disabled')">Disable</button>`;
+  }
+  document.getElementById('modal-pair-actions').innerHTML = html;
+}
+
+async function setPairState(newState) {
+  if (!selectedPair) return;
+  const labels = { active: 'activate', wind_down: 'wind down', liquidating: 'liquidate', disabled: 'disable' };
+  showConfirm(
+    `${labels[newState]?.charAt(0).toUpperCase() + labels[newState]?.slice(1)} ${selectedPair.symbol}?`,
+    `This will set the pair to ${newState.replace('_', ' ')} state.`,
+    async () => {
+      try {
+        await api('/api/pairs/' + symbolToPath(selectedPair.symbol), {
+          method: 'PATCH',
+          body: JSON.stringify({ state: newState }),
+        });
+        toast(`${selectedPair.symbol} set to ${newState.replace('_', ' ')}`, 'success');
+        closeModal('pair-modal');
+        loadPairs();
+      } catch (e) {
+        toast('Error: ' + e.message, 'error');
+      }
+    }
+  );
+}
+
+async function confirmDeletePair() {
+  if (!selectedPair) return;
+  showConfirm(
+    `Delete ${selectedPair.symbol}?`,
+    'This will permanently remove the pair from the state store.',
+    async () => {
+      try {
+        await api('/api/pairs/' + symbolToPath(selectedPair.symbol), { method: 'DELETE' });
+        toast(`${selectedPair.symbol} deleted`, 'success');
+        closeModal('pair-modal');
+        loadPairs();
+      } catch (e) {
+        toast('Error: ' + e.message, 'error');
+      }
+    }
+  );
+}
+
+// ==================== EDIT PAIR CONFIG ====================
+function openEditPairConfigModal() {
+  if (!selectedPair) return;
+  document.getElementById('edit-pair-symbol').textContent = selectedPair.symbol;
+  const form = document.getElementById('edit-pair-form');
+  const config = selectedPair.config || {};
+  const fields = ['order_size_usd', 'max_inventory_usd', 'min_spread_bps', 'spread_capture_pct',
+    'min_profit_pct', 'stop_loss_pct', 'take_profit_pct', 'max_buys_before_sell'];
+  fields.forEach(f => {
+    const input = form.elements[f];
+    if (input) input.value = config[f] != null ? config[f] : '';
+  });
+  openModal('edit-pair-modal');
+}
+
+async function savePairConfig(e) {
+  e.preventDefault();
+  if (!selectedPair) return;
+  const form = document.getElementById('edit-pair-form');
+  const config = {};
+  const fields = ['order_size_usd', 'max_inventory_usd', 'min_spread_bps', 'spread_capture_pct',
+    'min_profit_pct', 'stop_loss_pct', 'take_profit_pct', 'max_buys_before_sell'];
+  fields.forEach(f => {
+    const val = form.elements[f].value.trim();
+    config[f] = val === '' ? null : parseFloat(val);
+  });
+  try {
+    await api('/api/pairs/' + symbolToPath(selectedPair.symbol), {
+      method: 'PATCH',
+      body: JSON.stringify({ config }),
+    });
+    toast('Config saved', 'success');
+    closeModal('edit-pair-modal');
+    closeModal('pair-modal');
+    loadPairs();
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+// ==================== ADD PAIR ====================
+function openAddPairModal() {
+  document.getElementById('add-pair-form').reset();
+  openModal('add-pair-modal');
+}
+
+async function addPair(e) {
+  e.preventDefault();
+  const form = document.getElementById('add-pair-form');
+  const symbol = form.elements.symbol.value.trim().toUpperCase();
+  const state = form.elements.state.value;
+  if (!symbol) return;
+  try {
+    await api('/api/pairs/' + symbolToPath(symbol), {
+      method: 'PUT',
+      body: JSON.stringify({ state, config: {} }),
+    });
+    toast(`${symbol} added`, 'success');
+    closeModal('add-pair-modal');
+    loadPairs();
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+// ==================== TRADES ====================
+async function loadTrades() {
+  try {
+    const trades = await api('/api/pnl/trades?limit=100');
+    document.getElementById('trades-count').textContent = trades ? trades.length + ' trades' : '';
+    const container = document.getElementById('trades-list');
+    if (!trades || trades.length === 0) {
+      container.innerHTML = '<div class="empty-state"><p>No trades yet</p></div>';
+      return;
+    }
+    container.innerHTML = renderTradesList(trades);
+  } catch (e) {
+    document.getElementById('trades-list').innerHTML = '<div class="empty-state"><p>PnL analyzer unavailable</p></div>';
+  }
+}
+
+function renderTradesList(trades) {
+  return trades.map(t => {
+    const pnl = parseFloat(t.pnl || 0);
+    return `
+      <div class="trade-row">
+        <div class="trade-left">
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="trade-symbol">${t.symbol}</span>
+            <span class="trade-side ${t.side}">${t.side}</span>
+          </div>
+          <span class="trade-time">${fmtTime(t.timestamp)}</span>
+        </div>
+        <div class="trade-right">
+          <span class="trade-value">${fmt$(t.value || (parseFloat(t.price) * parseFloat(t.qty)))}</span>
+          ${t.side === 'sell' ? `<span class="trade-pnl ${pnlClass(pnl)}">${pnl >= 0 ? '+' : ''}${fmt$(pnl)}</span>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// ==================== CONFIG ====================
+async function loadDefaults() {
+  try {
+    const data = await api('/api/defaults');
+    defaultsData = data || {};
+    renderDefaults();
+  } catch (e) {
+    toast('Failed to load defaults: ' + e.message, 'error');
+  }
+}
+
+function renderDefaults() {
+  const fields = [
+    ['order_size_usd', 'Order Size', v => fmt$(v)],
+    ['max_inventory_usd', 'Max Inventory', v => fmt$(v)],
+    ['min_spread_bps', 'Min Spread', v => fmtBps(v)],
+    ['spread_capture_pct', 'Spread Capture', v => fmtPct(v)],
+    ['min_profit_pct', 'Min Profit', v => fmtPct(v)],
+    ['stop_loss_pct', 'Stop Loss', v => fmtPct(v)],
+    ['take_profit_pct', 'Take Profit', v => fmtPct(v)],
+    ['max_buys_before_sell', 'Max Buys Before Sell', v => v],
+    ['use_winddown_for_stoploss', 'Wind Down for Stop Loss', v => v ? 'Yes' : 'No'],
+  ];
+
+  document.getElementById('defaults-list').innerHTML = fields.map(([key, label, fmt]) => {
+    const val = defaultsData[key];
+    return `<div class="config-row">
+      <span class="config-key">${label}</span>
+      <span class="config-val">${val != null ? fmt(val) : '--'}</span>
+    </div>`;
+  }).join('');
+}
+
+function openEditDefaultsModal() {
+  const form = document.getElementById('edit-defaults-form');
+  const d = defaultsData;
+  form.elements.order_size_usd.value = d.order_size_usd ?? '';
+  form.elements.max_inventory_usd.value = d.max_inventory_usd ?? '';
+  form.elements.min_spread_bps.value = d.min_spread_bps ?? '';
+  form.elements.spread_capture_pct.value = d.spread_capture_pct ?? '';
+  form.elements.min_profit_pct.value = d.min_profit_pct ?? '';
+  form.elements.stop_loss_pct.value = d.stop_loss_pct ?? '';
+  form.elements.take_profit_pct.value = d.take_profit_pct ?? '';
+  form.elements.max_buys_before_sell.value = d.max_buys_before_sell ?? '';
+  form.elements.use_winddown_for_stoploss.value = d.use_winddown_for_stoploss ? 'true' : 'false';
+  openModal('edit-defaults-modal');
+}
+
+async function saveDefaults(e) {
+  e.preventDefault();
+  const form = document.getElementById('edit-defaults-form');
+  const body = {
+    order_size_usd: parseFloat(form.elements.order_size_usd.value),
+    max_inventory_usd: parseFloat(form.elements.max_inventory_usd.value),
+    min_spread_bps: parseFloat(form.elements.min_spread_bps.value),
+    spread_capture_pct: parseFloat(form.elements.spread_capture_pct.value),
+    min_profit_pct: parseFloat(form.elements.min_profit_pct.value),
+    stop_loss_pct: parseFloat(form.elements.stop_loss_pct.value),
+    take_profit_pct: parseFloat(form.elements.take_profit_pct.value),
+    max_buys_before_sell: parseInt(form.elements.max_buys_before_sell.value),
+    use_winddown_for_stoploss: form.elements.use_winddown_for_stoploss.value === 'true',
+  };
+  try {
+    await api('/api/defaults', { method: 'PATCH', body: JSON.stringify(body) });
+    toast('Defaults saved', 'success');
+    closeModal('edit-defaults-modal');
+    loadDefaults();
+  } catch (e) {
+    toast('Error: ' + e.message, 'error');
+  }
+}
+
+// ==================== MODALS ====================
+function openModal(id) {
+  document.getElementById(id).classList.add('active');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove('active');
+  // Check if any modal is still open
+  if (!document.querySelector('.modal-overlay.active')) {
+    document.body.style.overflow = '';
+  }
+}
+
+// Close modals on overlay tap
+document.querySelectorAll('.modal-overlay').forEach(overlay => {
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) {
+      overlay.classList.remove('active');
+      document.body.style.overflow = '';
+    }
+  });
+});
+
+// ==================== CONFIRM DIALOG ====================
+function showConfirm(title, msg, callback) {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-msg').textContent = msg;
+  confirmCallback = callback;
+  document.getElementById('confirm-dialog').classList.add('active');
+}
+
+function closeConfirm() {
+  document.getElementById('confirm-dialog').classList.remove('active');
+  confirmCallback = null;
+}
+
+async function confirmAction() {
+  if (confirmCallback) {
+    await confirmCallback();
+  }
+  closeConfirm();
+}
+
+// ==================== WEBSOCKET ====================
+function connectWS() {
+  if (ws) { try { ws.close(); } catch(e) {} }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${proto}://${location.host}/ws`;
+
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    document.getElementById('connStatus').className = 'conn-status connected';
+    if (wsRetryTimeout) { clearTimeout(wsRetryTimeout); wsRetryTimeout = null; }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('connStatus').className = 'conn-status disconnected';
+    wsRetryTimeout = setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = () => {
+    document.getElementById('connStatus').className = 'conn-status disconnected';
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      handleWSMessage(msg);
+    } catch (e) {
+      console.error('WS parse error:', e);
+    }
+  };
+}
+
+function handleWSMessage(msg) {
+  const type = msg.type;
+  if (type === 'snapshot') {
+    pairsData = msg.pairs || [];
+    defaultsData = msg.defaults || {};
+    if (currentPage === 'pairs') renderPairs();
+    if (currentPage === 'config') renderDefaults();
+  } else if (type === 'pair_updated') {
+    const idx = pairsData.findIndex(p => p.symbol === msg.pair.symbol);
+    if (idx >= 0) pairsData[idx] = msg.pair;
+    else pairsData.push(msg.pair);
+    if (currentPage === 'pairs') renderPairs();
+    toast(`${msg.pair.symbol} updated`, 'info');
+  } else if (type === 'pair_removed') {
+    pairsData = pairsData.filter(p => p.symbol !== msg.symbol);
+    if (currentPage === 'pairs') renderPairs();
+    toast(`${msg.symbol} removed`, 'info');
+  } else if (type === 'defaults_updated') {
+    defaultsData = msg.defaults || {};
+    if (currentPage === 'config') renderDefaults();
+    toast('Defaults updated', 'info');
+  }
+}
+
+// ==================== REFRESH ====================
+function refreshAll() {
+  document.getElementById('lastUpdate').textContent = 'refreshing...';
+  const page = currentPage;
+  const promises = [];
+  if (page === 'dashboard') promises.push(loadDashboard());
+  if (page === 'pairs') promises.push(loadPairs());
+  if (page === 'trades') promises.push(loadTrades());
+  if (page === 'config') promises.push(loadDefaults());
+  Promise.all(promises).finally(() => {
+    const now = new Date();
+    document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
+  });
+}
+
+// ==================== AUTO-REFRESH ====================
+setInterval(() => {
+  if (currentPage === 'dashboard') loadDashboard();
+}, 15000); // every 15s
+
+setInterval(() => {
+  if (currentPage === 'pairs') {
+    // Silently refresh PnL data
+    api('/api/pnl/pairs').then(data => { pnlPairsData = data?.pairs || []; }).catch(() => {});
+  }
+}, 30000);
+
+// ==================== INIT ====================
+document.addEventListener('DOMContentLoaded', () => {
+  loadDashboard();
+  connectWS();
+  // Pre-fetch PnL pairs data
+  api('/api/pnl/pairs').then(data => { pnlPairsData = data?.pairs || []; }).catch(() => {});
+});
+</script>
+</body>
+</html>
