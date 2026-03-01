@@ -272,7 +272,8 @@ async fn run_dry(
     ss_snapshot_tx: mpsc::Sender<EngineSnapshot>,
 ) -> Result<()> {
     use kraken_core::exchange::ws::*;
-    use kraken_core::exchange::messages::*;
+    use exchange_api::{ProxyCommand, ProxyEvent, parse_proxy_event};
+    use trading_primitives::book::LevelUpdate;
     use chrono::Utc;
 
     // Connect public WS through proxy
@@ -289,13 +290,10 @@ async fn run_dry(
     // Subscribe to initial pairs
     let pair_strings: Vec<String> = pairs.iter().map(|t| t.to_string()).collect();
     if !pairs.is_empty() {
-        let sub_msg = serde_json::to_string(&SubscribeBookMsg {
-            method: "subscribe",
-            params: SubscribeBookParams {
-                channel: "book",
-                symbol: pair_strings.clone(),
-                depth,
-            },
+        let sub_msg = serde_json::to_string(&ProxyCommand::Subscribe {
+            channel: "book".to_string(),
+            symbols: pair_strings.clone(),
+            depth: Some(depth),
         })?;
         pub_writer.send_raw(&sub_msg).await?;
     }
@@ -311,21 +309,36 @@ async fn run_dry(
                 raw = pub_reader.recv() => {
                     match raw {
                         Some(text) => {
-                            let msg = parse_ws_message(&text);
-                            let event = match msg {
-                                WsMessage::BookSnapshot { pair, bids, asks } => {
-                                    Some(EngineEvent::BookSnapshot { pair, bids, asks, timestamp: Utc::now() })
+                            let event = match parse_proxy_event(&text) {
+                                Ok(e) => e,
+                                Err(_) => continue,
+                            };
+                            let engine_event = match event {
+                                ProxyEvent::BookSnapshot { symbol, bids, asks } => {
+                                    let pair = trading_primitives::Ticker::from(symbol.as_str());
+                                    Some(EngineEvent::BookSnapshot {
+                                        pair,
+                                        bids: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                                        asks: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                                        timestamp: Utc::now(),
+                                    })
                                 }
-                                WsMessage::BookUpdate { pair, bid_updates, ask_updates } => {
-                                    Some(EngineEvent::BookUpdate { pair, bid_updates, ask_updates, timestamp: Utc::now() })
+                                ProxyEvent::BookUpdate { symbol, bids, asks } => {
+                                    let pair = trading_primitives::Ticker::from(symbol.as_str());
+                                    Some(EngineEvent::BookUpdate {
+                                        pair,
+                                        bid_updates: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                                        ask_updates: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                                        timestamp: Utc::now(),
+                                    })
                                 }
-                                WsMessage::SubscribeConfirmed { channel } => {
+                                ProxyEvent::Subscribed { channel } => {
                                     tracing::info!(channel, "Subscription confirmed");
                                     None
                                 }
                                 _ => None,
                             };
-                            if let Some(e) = event {
+                            if let Some(e) = engine_event {
                                 if tx.send(e).await.is_err() { return; }
                             }
                         }
@@ -335,14 +348,11 @@ async fn run_dry(
                 new_pairs = book_sub_rx.recv() => {
                     if let Some(new_pairs) = new_pairs {
                         if !new_pairs.is_empty() {
-                            tracing::info!(?new_pairs, "Subscribing to new pairs (dry-run)");
-                            let sub_msg = serde_json::to_string(&SubscribeBookMsg {
-                                method: "subscribe",
-                                params: SubscribeBookParams {
-                                    channel: "book",
-                                    symbol: new_pairs,
-                                    depth,
-                                },
+                            tracing::info!(?new_pairs, "Subscribing to new pairs");
+                            let sub_msg = serde_json::to_string(&ProxyCommand::Subscribe {
+                                channel: "book".to_string(),
+                                symbols: new_pairs,
+                                depth: Some(depth),
                             }).unwrap();
                             if let Err(e) = pub_writer.send_raw(&sub_msg).await {
                                 tracing::error!(error = %e, "Failed to subscribe to new pairs");

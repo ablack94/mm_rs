@@ -21,11 +21,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-use kraken_core::exchange::messages::*;
-use kraken_core::exchange::proxy_client::ProxyClient;
+use exchange_api::{ProxyCommand, ProxyEvent, parse_proxy_event};
 use kraken_core::exchange::ws::WsConnection;
 use kraken_core::pnl::tracker::{PnlTrade, PnlTracker};
-use kraken_core::traits::ExchangeClient;
 use kraken_core::types::fill::Fill;
 use kraken_core::types::order::OrderSide;
 use trading_primitives::Ticker;
@@ -143,7 +141,6 @@ async fn main() -> Result<()> {
             .replacen("https://", "wss://", 1);
         format!("{}/ws/private", ws_base)
     };
-    let proxy_url = args.proxy_url.clone();
     let proxy_token = args.proxy_token.clone();
 
     // Spawn the REST API
@@ -163,7 +160,7 @@ async fn main() -> Result<()> {
     // Spawn the fill processing loop with reconnection
     let feed_shared = shared.clone();
     let feed_handle = tokio::spawn(async move {
-        run_feed_with_reconnect(feed_shared, &ws_url, &proxy_url, &proxy_token).await;
+        run_feed_with_reconnect(feed_shared, &ws_url, &proxy_token).await;
     });
 
     // Spawn the evaluation loop
@@ -202,7 +199,6 @@ async fn main() -> Result<()> {
 async fn run_feed_with_reconnect(
     shared: Arc<AppState>,
     ws_url: &str,
-    proxy_url: &str,
     proxy_token: &str,
 ) {
     let mut backoff_secs = 1u64;
@@ -214,17 +210,10 @@ async fn run_feed_with_reconnect(
         let result: Result<()> = async {
             let mut ws = WsConnection::connect_with_token(ws_url, proxy_token).await?;
 
-            let proxy_client = ProxyClient::new(proxy_url.to_string(), proxy_token.to_string());
-            let token = proxy_client.get_ws_token().await?;
-            ws.send_json(&SubscribeExecMsg {
-                method: "subscribe",
-                params: SubscribeExecParams {
-                    channel: "executions",
-                    snap_orders: false,
-                    snap_trades: true,
-                    ratecounter: false,
-                    token,
-                },
+            ws.send_json(&ProxyCommand::Subscribe {
+                channel: "executions".to_string(),
+                symbols: vec![],
+                depth: None,
             })
             .await?;
 
@@ -249,43 +238,30 @@ async fn run_feed_with_reconnect(
 
 async fn process_fill_feed(ws: &mut WsConnection, shared: &Arc<AppState>) {
     while let Some(raw) = ws.recv().await {
-        let msg = parse_ws_message(&raw);
-        match msg {
-            WsMessage::ExecutionSnapshot(reports) => {
-                let trade_reports: Vec<_> = reports.into_iter()
-                    .filter(|r| r.exec_type == "trade")
-                    .collect();
-                let total = trade_reports.len();
-
-                // Process snapshot fills that we haven't seen before.
-                // This recovers fills missed during disconnection.
-                // Deduplication via seen_order_ids prevents double-counting.
-                let mut processed = 0u32;
-                let mut skipped = 0u32;
-                for report in trade_reports {
-                    let dedup_key = format!("{}:{}", report.order_id, report.last_qty);
-                    let is_new = {
-                        let seen = shared.seen_order_ids.read().await;
-                        !seen.contains(&dedup_key)
-                    };
-                    if is_new {
-                        apply_exec_report(report, shared).await;
-                        processed += 1;
-                    } else {
-                        skipped += 1;
-                    }
-                }
-                tracing::info!(
-                    total,
-                    processed,
-                    skipped,
-                    "Execution snapshot — processed new fills, skipped already-seen"
-                );
+        let event = match parse_proxy_event(&raw) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        match event {
+            ProxyEvent::Fill {
+                order_id,
+                cl_ord_id,
+                symbol,
+                side,
+                qty,
+                price,
+                fee,
+                is_maker,
+                timestamp,
+                is_fully_filled,
+            } => {
+                apply_fill(
+                    order_id, cl_ord_id, symbol, side, qty, price, fee,
+                    is_maker, timestamp, is_fully_filled, shared,
+                )
+                .await;
             }
-            WsMessage::Execution(report) if report.exec_type == "trade" => {
-                apply_exec_report(report, shared).await;
-            }
-            WsMessage::SubscribeConfirmed { channel } => {
+            ProxyEvent::Subscribed { channel } => {
                 tracing::info!(channel, "Subscription confirmed");
             }
             _ => {}
@@ -293,15 +269,27 @@ async fn process_fill_feed(ws: &mut WsConnection, shared: &Arc<AppState>) {
     }
 }
 
-async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
-    // Dedup by order_id — prevents double-counting on reconnect snapshots
-    let dedup_key = format!("{}:{}", report.order_id, report.last_qty);
+async fn apply_fill(
+    order_id: String,
+    cl_ord_id: String,
+    symbol: String,
+    side_str: String,
+    qty: Decimal,
+    price: Decimal,
+    fee: Decimal,
+    is_maker: bool,
+    timestamp_str: String,
+    is_fully_filled: bool,
+    shared: &Arc<AppState>,
+) {
+    // Dedup by order_id:qty — prevents double-counting on reconnect snapshots
+    let dedup_key = format!("{}:{}", order_id, qty);
     {
         let mut seen = shared.seen_order_ids.write().await;
         if !seen.insert(dedup_key) {
             tracing::debug!(
-                order_id = report.order_id,
-                pair = %report.pair,
+                order_id,
+                symbol,
                 "Skipping duplicate fill"
             );
             return;
@@ -312,23 +300,28 @@ async fn apply_exec_report(report: ExecReport, shared: &Arc<AppState>) {
         }
     }
 
-    let side = if report.side == "buy" {
+    let side = if side_str == "buy" {
         OrderSide::Buy
     } else {
         OrderSide::Sell
     };
 
+    let pair = Ticker::from(symbol.as_str());
+    let timestamp = timestamp_str
+        .parse()
+        .unwrap_or_else(|_| Utc::now());
+
     let fill = Fill {
-        order_id: report.order_id,
-        cl_ord_id: report.cl_ord_id,
-        pair: report.pair.clone(),
+        order_id,
+        cl_ord_id,
+        pair: pair.clone(),
         side,
-        price: report.last_price,
-        qty: report.last_qty,
-        fee: report.fee,
-        is_maker: report.is_maker,
-        is_fully_filled: report.order_status == "filled",
-        timestamp: report.timestamp,
+        price,
+        qty,
+        fee,
+        is_maker,
+        is_fully_filled,
+        timestamp,
     };
 
     tracing::info!(

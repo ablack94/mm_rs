@@ -222,10 +222,10 @@ async fn do_book_tick(
                     fee,
                 );
 
-                // Send trade execution report
-                let trade =
-                    messages::exec_report("trade", &order_clone, fill_qty, fill_price, fee, true);
-                let msg = serde_json::to_string(&trade).unwrap();
+                // Send fill event
+                let fill =
+                    messages::fill_event(&order_clone, fill_qty, fill_price, fee, true);
+                let msg = serde_json::to_string(&fill).unwrap();
                 let _ = exec_tx.send(msg);
 
                 tracing::info!(

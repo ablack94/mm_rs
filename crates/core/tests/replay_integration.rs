@@ -11,12 +11,13 @@ use tokio::sync::mpsc;
 
 use kraken_core::config::Config;
 use kraken_core::engine::core::Engine;
-use kraken_core::exchange::messages::{parse_ws_message, WsMessage};
+use exchange_api::{parse_proxy_event, ProxyEvent};
 use kraken_core::exchange::replay::ReplaySource;
 use kraken_core::state::bot_state::BotState;
 use kraken_core::traits::EventSource;
 use kraken_core::types::*;
 use trading_primitives::Ticker;
+use trading_primitives::book::LevelUpdate;
 
 const DATA_PATH: &str = "../../test_data/recorded.jsonl";
 
@@ -94,26 +95,29 @@ fn run_sync_replay(
             Err(_) => continue,
         };
 
-        let msg = parse_ws_message(&recorded.raw);
-        let event = match msg {
-            WsMessage::BookSnapshot { pair, bids, asks } => {
+        let proxy_event = match parse_proxy_event(&recorded.raw) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let event = match proxy_event {
+            ProxyEvent::BookSnapshot { symbol, bids, asks } => {
+                let pair = Ticker::from(symbol.as_str());
                 Some(EngineEvent::BookSnapshot {
                     pair,
-                    bids,
-                    asks,
+                    bids: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                    asks: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
                     timestamp: recorded.timestamp,
                 })
             }
-            WsMessage::BookUpdate {
-                pair,
-                bid_updates,
-                ask_updates,
-            } => Some(EngineEvent::BookUpdate {
-                pair,
-                bid_updates,
-                ask_updates,
-                timestamp: recorded.timestamp,
-            }),
+            ProxyEvent::BookUpdate { symbol, bids, asks } => {
+                let pair = Ticker::from(symbol.as_str());
+                Some(EngineEvent::BookUpdate {
+                    pair,
+                    bid_updates: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                    ask_updates: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                    timestamp: recorded.timestamp,
+                })
+            }
             _ => None,
         };
 

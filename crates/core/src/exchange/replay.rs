@@ -6,9 +6,11 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-use crate::exchange::messages::{parse_ws_message, WsMessage};
+use crate::exchange::messages::parse_proxy_event;
 use crate::traits::EventSource;
 use crate::types::*;
+use exchange_api::ProxyEvent;
+use trading_primitives::book::LevelUpdate;
 
 /// Recorded WS message with timestamp.
 #[derive(Debug, serde::Deserialize)]
@@ -64,49 +66,76 @@ impl EventSource for ReplaySource {
             }
             last_ts = Some(recorded.timestamp);
 
-            let msg = parse_ws_message(&recorded.raw);
-            let event = match msg {
-                WsMessage::BookSnapshot {
-                    pair,
-                    bids,
-                    asks,
-                } => Some(EngineEvent::BookSnapshot {
-                    pair,
-                    bids,
-                    asks,
-                    timestamp: recorded.timestamp,
-                }),
-                WsMessage::BookUpdate {
-                    pair,
-                    bid_updates,
-                    ask_updates,
-                } => Some(EngineEvent::BookUpdate {
-                    pair,
-                    bid_updates,
-                    ask_updates,
-                    timestamp: recorded.timestamp,
-                }),
-                WsMessage::Execution(report) => {
-                    let side = if report.side == "buy" {
+            let proxy_event = match parse_proxy_event(&recorded.raw) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let event = match proxy_event {
+                ProxyEvent::BookSnapshot { symbol, bids, asks } => {
+                    let pair = trading_primitives::Ticker::from(symbol.as_str());
+                    Some(EngineEvent::BookSnapshot {
+                        pair,
+                        bids: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                        asks: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                        timestamp: recorded.timestamp,
+                    })
+                }
+                ProxyEvent::BookUpdate { symbol, bids, asks } => {
+                    let pair = trading_primitives::Ticker::from(symbol.as_str());
+                    Some(EngineEvent::BookUpdate {
+                        pair,
+                        bid_updates: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                        ask_updates: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                        timestamp: recorded.timestamp,
+                    })
+                }
+                ProxyEvent::Fill {
+                    order_id,
+                    cl_ord_id,
+                    symbol,
+                    side,
+                    qty,
+                    price,
+                    fee,
+                    is_maker,
+                    timestamp,
+                    is_fully_filled,
+                } => {
+                    let order_side = if side == "buy" {
                         OrderSide::Buy
                     } else {
                         OrderSide::Sell
                     };
-                    match report.exec_type.as_str() {
-                        "trade" | "filled" => Some(EngineEvent::Fill(Fill {
-                            order_id: report.order_id,
-                            cl_ord_id: report.cl_ord_id,
-                            pair: report.pair,
-                            side,
-                            price: report.last_price,
-                            qty: report.last_qty,
-                            fee: report.fee,
-                            is_maker: report.is_maker,
-                            is_fully_filled: report.order_status == "filled",
-                            timestamp: report.timestamp,
-                        })),
-                        _ => None,
-                    }
+                    let ts = timestamp
+                        .parse()
+                        .unwrap_or(recorded.timestamp);
+                    Some(EngineEvent::Fill(Fill {
+                        order_id,
+                        cl_ord_id,
+                        pair: trading_primitives::Ticker::from(symbol.as_str()),
+                        side: order_side,
+                        price,
+                        qty,
+                        fee,
+                        is_maker,
+                        is_fully_filled,
+                        timestamp: ts,
+                    }))
+                }
+                ProxyEvent::OrderAccepted { cl_ord_id, order_id, .. } => {
+                    Some(EngineEvent::OrderAcknowledged { cl_ord_id, order_id })
+                }
+                ProxyEvent::OrderCancelled { cl_ord_id, reason, symbol } => {
+                    let pair = symbol
+                        .map(|s| trading_primitives::Ticker::from(s.as_str()))
+                        .unwrap_or_else(|| trading_primitives::Ticker::from("UNKNOWN/UNKNOWN"));
+                    Some(EngineEvent::OrderCancelled { cl_ord_id, pair, reason })
+                }
+                ProxyEvent::OrderRejected { cl_ord_id, error, symbol, .. } => {
+                    let pair = symbol
+                        .map(|s| trading_primitives::Ticker::from(s.as_str()))
+                        .unwrap_or_else(|| trading_primitives::Ticker::from("UNKNOWN/UNKNOWN"));
+                    Some(EngineEvent::OrderRejected { cl_ord_id, pair, reason: error })
                 }
                 _ => None,
             };

@@ -1,14 +1,16 @@
 /// Translation between proxy protocol (bot) and Coinbase formats.
 ///
-/// The bot speaks the proxy wire protocol. This module translates:
-/// - Coinbase level2 book data → protocol book snapshot/update format
-/// - Coinbase user channel events → protocol execution format
-/// - Protocol subscribe messages → Coinbase subscribe format
+/// The bot speaks ProxyEvent/ProxyCommand protocol. This module translates:
+/// - Coinbase level2 book data → ProxyEvent::BookSnapshot/BookUpdate
+/// - Coinbase user channel events → ProxyEvent::Fill/OrderAccepted/OrderCancelled
+/// - Subscribe messages → Coinbase subscribe format
 
 use crate::pairs;
+use exchange_api::{BookLevel, ProxyEvent};
+use rust_decimal::Decimal;
 use serde_json::Value;
 use std::collections::HashMap;
-use trading_primitives::protocol;
+use std::str::FromStr;
 
 /// Tracks cumulative fill data per order to compute incremental fill deltas.
 ///
@@ -80,20 +82,25 @@ impl FillTracker {
     }
 }
 
-/// Translate a Coinbase level2 (l2_data) message to proxy protocol book format.
-#[cfg(test)]
-pub fn coinbase_book_to_kraken(coinbase_msg: &Value) -> Option<String> {
-    coinbase_book_to_kraken_mapped(coinbase_msg, &std::collections::HashMap::new())
+/// Convert f64 to Decimal for ProxyEvent fields.
+fn to_decimal(f: f64) -> Decimal {
+    Decimal::from_f64_retain(f).unwrap_or_default()
 }
 
-/// Translate a Coinbase level2 (l2_data) message to proxy protocol book format,
+/// Translate a Coinbase level2 (l2_data) message to ProxyEvent book format.
+#[cfg(test)]
+pub fn coinbase_book_to_proxy_event(coinbase_msg: &Value) -> Option<String> {
+    coinbase_book_to_proxy_event_mapped(coinbase_msg, &HashMap::new())
+}
+
+/// Translate a Coinbase level2 (l2_data) message to ProxyEvent book format,
 /// using a product_id → internal symbol mapping.
 ///
 /// Coinbase merges USD/USDC order books and always returns the base-USD product_id
 /// in level2 data. The mapping allows relabeling (e.g., "DOGE-USD" → "DOGE/USDC").
-pub fn coinbase_book_to_kraken_mapped(
+pub fn coinbase_book_to_proxy_event_mapped(
     coinbase_msg: &Value,
-    product_id_map: &std::collections::HashMap<String, String>,
+    product_id_map: &HashMap<String, String>,
 ) -> Option<String> {
     let events = coinbase_msg.get("events")?.as_array()?;
 
@@ -112,9 +119,9 @@ pub fn coinbase_book_to_kraken_mapped(
 
         for update in updates {
             let side = update.get("side")?.as_str()?;
-            let price: f64 = update.get("price_level")?.as_str()?.parse().ok()?;
-            let qty: f64 = update.get("new_quantity")?.as_str()?.parse().ok()?;
-            let level = protocol::build_book_level(price, qty);
+            let price = Decimal::from_str(update.get("price_level")?.as_str()?).ok()?;
+            let qty = Decimal::from_str(update.get("new_quantity")?.as_str()?).ok()?;
+            let level = BookLevel { price, qty };
 
             match side {
                 "bid" => bids.push(level),
@@ -123,24 +130,24 @@ pub fn coinbase_book_to_kraken_mapped(
             }
         }
 
-        let msg_type = match event_type {
-            "snapshot" => "snapshot",
-            "update" => "update",
+        let proxy_event = match event_type {
+            "snapshot" => ProxyEvent::book_snapshot(&symbol, bids, asks),
+            "update" => ProxyEvent::book_update(&symbol, bids, asks),
             _ => continue,
         };
 
-        return Some(protocol::build_book_message(msg_type, &symbol, bids, asks));
+        return Some(proxy_event.to_json());
     }
 
     None
 }
 
-/// Translate a Coinbase user channel message to proxy protocol execution format.
+/// Translate a Coinbase user channel message to ProxyEvent format.
 ///
 /// The `fill_tracker` converts Coinbase's cumulative fill data to incremental
 /// quantities expected by the bot. For snapshot events, it seeds the tracker
 /// without emitting fills; for updates, it computes deltas and emits trade events.
-pub fn coinbase_user_to_kraken(
+pub fn coinbase_user_to_proxy_events(
     coinbase_msg: &Value,
     fill_tracker: &mut FillTracker,
 ) -> Vec<String> {
@@ -161,23 +168,18 @@ pub fn coinbase_user_to_kraken(
         if event_type == "snapshot" {
             // Seed the fill tracker with current cumulative state but don't emit fills.
             // Snapshot orders reflect pre-existing state, not new fills.
-            let exec_reports: Vec<Value> = orders
-                .iter()
-                .filter_map(|order| {
-                    seed_tracker_from_order(order, fill_tracker);
-                    translate_order_to_exec(order)
-                })
-                .collect();
-
-            if !exec_reports.is_empty() {
-                results.push(protocol::build_execution_snapshot(exec_reports));
+            for order in orders {
+                seed_tracker_from_order(order, fill_tracker);
+                if let Some(proxy_event) = translate_order_to_event(order) {
+                    results.push(proxy_event.to_json());
+                }
             }
         } else {
             for order in orders {
-                if let Some(exec_report) =
-                    translate_order_to_exec_tracked(order, fill_tracker)
+                if let Some(proxy_event) =
+                    translate_order_to_event_tracked(order, fill_tracker)
                 {
-                    results.push(protocol::build_execution_update(exec_report));
+                    results.push(proxy_event.to_json());
                 }
             }
         }
@@ -186,8 +188,8 @@ pub fn coinbase_user_to_kraken(
     results
 }
 
-/// Translate a single Coinbase order object to a protocol execution report.
-fn translate_order_to_exec(order: &Value) -> Option<Value> {
+/// Translate a single Coinbase order object to a ProxyEvent (snapshot mode, no fill tracking).
+fn translate_order_to_event(order: &Value) -> Option<ProxyEvent> {
     let status = order.get("status")?.as_str()?;
     let product_id = order.get("product_id")?.as_str()?;
     let symbol = pairs::to_internal(product_id);
@@ -195,59 +197,35 @@ fn translate_order_to_exec(order: &Value) -> Option<Value> {
     let client_order_id = order.get("client_order_id")?.as_str().unwrap_or("");
     let side = order.get("order_side")?.as_str().unwrap_or("").to_lowercase();
 
-    // Map Coinbase status to protocol exec_type
-    let (exec_type, order_status) = match status {
-        "FILLED" => ("trade", "filled"),
-        "OPEN" => ("new", "open"),
-        "PENDING" => ("pending_new", "pending"),
-        "CANCELLED" => ("canceled", "canceled"),
-        "EXPIRED" => ("expired", "expired"),
-        "FAILED" => ("canceled", "canceled"),
-        _ => return None,
-    };
-
-    let avg_price: f64 = order
-        .get("avg_price")
-        .and_then(|p| p.as_str())
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0.0);
-
-    let filled_qty: f64 = order
-        .get("cumulative_quantity")
-        .and_then(|q| q.as_str())
-        .and_then(|q| q.parse().ok())
-        .unwrap_or(0.0);
-
-    let total_fees: f64 = order
-        .get("total_fees")
-        .and_then(|f| f.as_str())
-        .and_then(|f| f.parse().ok())
-        .unwrap_or(0.0);
-
-    let timestamp = order
-        .get("creation_time")
-        .and_then(|t| t.as_str())
-        .unwrap_or("1970-01-01T00:00:00Z");
-
     let cancel_reason = order
         .get("cancel_reason")
         .and_then(|r| r.as_str())
         .filter(|r| !r.is_empty());
 
-    Some(protocol::build_exec_report(
-        exec_type,
-        order_id,
-        client_order_id,
-        &symbol,
-        &side,
-        filled_qty,
-        avg_price,
-        total_fees,
-        order_status,
-        "m", // assume maker (Coinbase doesn't always report this)
-        timestamp,
-        cancel_reason,
-    ))
+    match status {
+        "FILLED" => {
+            let avg_price: f64 = order.get("avg_price").and_then(|p| p.as_str()).and_then(|p| p.parse().ok()).unwrap_or(0.0);
+            let filled_qty: f64 = order.get("cumulative_quantity").and_then(|q| q.as_str()).and_then(|q| q.parse().ok()).unwrap_or(0.0);
+            let total_fees: f64 = order.get("total_fees").and_then(|f| f.as_str()).and_then(|f| f.parse().ok()).unwrap_or(0.0);
+            let timestamp = order.get("creation_time").and_then(|t| t.as_str()).unwrap_or("1970-01-01T00:00:00Z");
+            Some(ProxyEvent::fill(
+                order_id, client_order_id, &symbol, &side,
+                to_decimal(filled_qty), to_decimal(avg_price), to_decimal(total_fees),
+                true, timestamp, true,
+            ))
+        }
+        "OPEN" => {
+            Some(ProxyEvent::order_accepted(0, client_order_id, order_id))
+        }
+        "PENDING" => {
+            // Pending orders — emit as accepted (will get another ack when OPEN)
+            Some(ProxyEvent::order_accepted(0, client_order_id, order_id))
+        }
+        "CANCELLED" | "EXPIRED" | "FAILED" => {
+            Some(ProxyEvent::order_cancelled(client_order_id, cancel_reason, Some(&symbol)))
+        }
+        _ => None,
+    }
 }
 
 /// Extract cumulative fill data from a Coinbase order and seed the fill tracker.
@@ -278,18 +256,18 @@ fn seed_tracker_from_order(order: &Value, tracker: &mut FillTracker) {
     tracker.seed(cl_ord_id, cum_qty, avg_price, total_fees);
 }
 
-/// Translate a Coinbase order to a protocol exec report, using the fill tracker
+/// Translate a Coinbase order to a ProxyEvent, using the fill tracker
 /// to convert cumulative quantities to incremental.
 ///
 /// Key behaviors:
-/// - OPEN + cumulative_qty > 0 with new fill delta → exec_type "trade" (partial fill)
-/// - OPEN + no new fill → exec_type "new" (order ack or duplicate update)
-/// - FILLED → exec_type "trade" with incremental delta from last partial
-/// - Terminal states (CANCELLED/EXPIRED/FAILED) → clean up tracker
-fn translate_order_to_exec_tracked(
+/// - OPEN + cumulative_qty > 0 with new fill delta → Fill event (partial fill)
+/// - OPEN + no new fill → OrderAccepted (order ack or duplicate update)
+/// - FILLED → Fill event with incremental delta from last partial
+/// - Terminal states (CANCELLED/EXPIRED/FAILED) → OrderCancelled + clean up tracker
+fn translate_order_to_event_tracked(
     order: &Value,
     tracker: &mut FillTracker,
-) -> Option<Value> {
+) -> Option<ProxyEvent> {
     let status = order.get("status")?.as_str()?;
     let product_id = order.get("product_id")?.as_str()?;
     let symbol = pairs::to_internal(product_id);
@@ -329,110 +307,43 @@ fn translate_order_to_exec_tracked(
                 tracker.incremental(client_order_id, cum_qty, avg_price, total_fees)
             {
                 // There's a new fill (partial or complete)
-                let order_status = if status == "FILLED" { "filled" } else { "open" };
-                if status == "FILLED" {
+                let is_fully_filled = status == "FILLED";
+                if is_fully_filled {
                     tracker.remove(client_order_id);
                 }
-                Some(protocol::build_exec_report(
-                    "trade",
-                    order_id,
-                    client_order_id,
-                    &symbol,
-                    &side,
-                    inc_qty,
-                    inc_price,
-                    inc_fees,
-                    order_status,
-                    "m",
-                    timestamp,
-                    cancel_reason,
+                Some(ProxyEvent::fill(
+                    order_id, client_order_id, &symbol, &side,
+                    to_decimal(inc_qty), to_decimal(inc_price), to_decimal(inc_fees),
+                    true, timestamp, is_fully_filled,
                 ))
             } else if status == "OPEN" {
                 // No fill delta — this is an order ack or duplicate update
-                Some(protocol::build_exec_report(
-                    "new",
-                    order_id,
-                    client_order_id,
-                    &symbol,
-                    &side,
-                    0.0,
-                    0.0,
-                    0.0,
-                    "open",
-                    "m",
-                    timestamp,
-                    cancel_reason,
-                ))
+                Some(ProxyEvent::order_accepted(0, client_order_id, order_id))
             } else {
                 // FILLED with no delta (e.g., duplicate) — still report it
                 tracker.remove(client_order_id);
-                Some(protocol::build_exec_report(
-                    "trade",
-                    order_id,
-                    client_order_id,
-                    &symbol,
-                    &side,
-                    cum_qty,
-                    avg_price,
-                    total_fees,
-                    "filled",
-                    "m",
-                    timestamp,
-                    cancel_reason,
+                Some(ProxyEvent::fill(
+                    order_id, client_order_id, &symbol, &side,
+                    to_decimal(cum_qty), to_decimal(avg_price), to_decimal(total_fees),
+                    true, timestamp, true,
                 ))
             }
         }
-        "PENDING" => Some(protocol::build_exec_report(
-            "pending_new",
-            order_id,
-            client_order_id,
-            &symbol,
-            &side,
-            0.0,
-            0.0,
-            0.0,
-            "pending",
-            "m",
-            timestamp,
-            cancel_reason,
-        )),
+        "PENDING" => Some(ProxyEvent::order_accepted(0, client_order_id, order_id)),
         "CANCELLED" | "EXPIRED" | "FAILED" => {
             tracker.remove(client_order_id);
-            let (exec_type, order_status) = match status {
-                "CANCELLED" => ("canceled", "canceled"),
-                "EXPIRED" => ("expired", "expired"),
-                "FAILED" => ("canceled", "canceled"),
-                _ => unreachable!(),
-            };
-            Some(protocol::build_exec_report(
-                exec_type,
-                order_id,
-                client_order_id,
-                &symbol,
-                &side,
-                0.0,
-                0.0,
-                0.0,
-                order_status,
-                "m",
-                timestamp,
-                cancel_reason,
-            ))
+            Some(ProxyEvent::order_cancelled(client_order_id, cancel_reason, Some(&symbol)))
         }
         _ => None,
     }
 }
 
-/// Translate a protocol subscribe message to Coinbase format.
+/// Translate a subscribe message to Coinbase format.
+/// Handles both new ProxyCommand format and old Kraken WS v2 format.
 /// Returns the Coinbase subscribe JSON (without auth fields — caller adds those).
-pub fn kraken_subscribe_to_coinbase(kraken_msg: &Value) -> Option<Value> {
-    let params = kraken_msg.get("params")?;
-    let channel = params.get("channel")?.as_str()?;
-    let symbols = params.get("symbol")?.as_array()?;
-
+pub fn subscribe_to_coinbase(channel: &str, symbols: &[String]) -> Option<Value> {
     let product_ids: Vec<String> = symbols
         .iter()
-        .filter_map(|s| s.as_str())
         .map(|s| pairs::to_coinbase(s))
         .collect();
 
@@ -449,80 +360,78 @@ pub fn kraken_subscribe_to_coinbase(kraken_msg: &Value) -> Option<Value> {
     }))
 }
 
-/// Build a protocol subscribe confirmation response.
+/// Build a ProxyEvent subscribe confirmation response.
 pub fn subscribe_confirmed(channel: &str) -> String {
-    protocol::build_subscribe_confirmed(channel)
+    ProxyEvent::subscribed(channel).to_json()
 }
 
-/// Build a protocol order response (success).
+/// Build a ProxyEvent order response (success).
 pub fn order_response_success(method: &str, req_id: u64, order_id: &str, cl_ord_id: &str) -> String {
-    protocol::build_order_response_success(method, req_id, order_id, cl_ord_id)
+    match method {
+        "add_order" | "place_order" => ProxyEvent::order_accepted(req_id, cl_ord_id, order_id).to_json(),
+        _ => ProxyEvent::command_ack(req_id, method).to_json(),
+    }
 }
 
-/// Build a protocol order response (error).
-pub fn order_response_error(method: &str, req_id: u64, error: &str) -> String {
-    protocol::build_order_response_error(method, req_id, error)
+/// Build a ProxyEvent order response (error).
+pub fn order_response_error(_method: &str, req_id: u64, error: &str) -> String {
+    ProxyEvent::order_rejected(req_id, "", error, None).to_json()
 }
 
-/// Build a protocol pong response.
+/// Build a ProxyEvent pong response.
 pub fn pong_response(req_id: u64) -> String {
-    protocol::build_pong(req_id)
+    ProxyEvent::pong(req_id).to_json()
 }
 
-/// Build a synthetic "new" execution report for when an order is accepted via REST.
+/// Build a synthetic OrderAccepted for when an order is accepted via REST.
 ///
 /// Coinbase's user WS may deliver an OPEN event later, but the bot needs an immediate
 /// ack to track the order. Duplicate acks are harmless.
-pub fn synthetic_exec_new(order_id: &str, cl_ord_id: &str, symbol: &str, side: &str) -> String {
-    let report = protocol::build_exec_report(
-        "new",
-        order_id,
-        cl_ord_id,
-        symbol,
-        side,
-        0.0,  // no fill yet
-        0.0,  // no price yet
-        0.0,  // no fees yet
-        "open",
-        "m",
-        "1970-01-01T00:00:00Z",
-        None,
-    );
-    protocol::build_execution_update(report)
+pub fn synthetic_exec_new(order_id: &str, cl_ord_id: &str, _symbol: &str, _side: &str) -> String {
+    ProxyEvent::order_accepted(0, cl_ord_id, order_id).to_json()
 }
 
-/// Build a synthetic "canceled" execution report for when a cancel succeeds via REST.
-pub fn synthetic_exec_canceled(cl_ord_id: &str, symbol: &str, side: &str) -> String {
-    let report = protocol::build_exec_report(
-        "canceled",
-        cl_ord_id,  // use cl_ord_id as order_id too
-        cl_ord_id,
-        symbol,
-        side,
-        0.0,
-        0.0,
-        0.0,
-        "canceled",
-        "m",
-        "1970-01-01T00:00:00Z",
-        Some("USER_CANCEL"),
-    );
-    protocol::build_execution_update(report)
+/// Build a synthetic OrderCancelled for when a cancel succeeds via REST.
+pub fn synthetic_exec_canceled(cl_ord_id: &str, symbol: &str, _side: &str) -> String {
+    ProxyEvent::order_cancelled(cl_ord_id, Some("USER_CANCEL"), Some(symbol)).to_json()
 }
 
-/// Build a protocol heartbeat message.
+/// Build a ProxyEvent command acknowledgement.
+pub fn command_ack(req_id: u64, cmd: &str) -> String {
+    ProxyEvent::command_ack(req_id, cmd).to_json()
+}
+
+/// Build a ProxyEvent heartbeat message.
 pub fn heartbeat() -> String {
-    protocol::build_heartbeat()
+    ProxyEvent::heartbeat().to_json()
+}
+
+/// Build a ProxyEvent fill message (used by reconciliation).
+pub fn build_fill_event(
+    order_id: &str,
+    cl_ord_id: &str,
+    symbol: &str,
+    side: &str,
+    qty: f64,
+    price: f64,
+    fee: f64,
+    timestamp: &str,
+) -> String {
+    ProxyEvent::fill(
+        order_id, cl_ord_id, symbol, side,
+        to_decimal(qty), to_decimal(price), to_decimal(fee),
+        true, timestamp, true,
+    ).to_json()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exchange_api::parse_proxy_event;
     use serde_json::json;
-    use trading_primitives::protocol::{parse_ws_message, WsMessage};
 
     #[test]
-    fn test_coinbase_book_snapshot_to_kraken() {
+    fn test_coinbase_book_snapshot_to_proxy_event() {
         let coinbase = json!({
             "channel": "l2_data",
             "timestamp": "2024-01-01T00:00:00Z",
@@ -537,11 +446,10 @@ mod tests {
             }]
         });
 
-        let result = coinbase_book_to_kraken(&coinbase).unwrap();
-        // Verify it parses correctly through the protocol parser
-        match parse_ws_message(&result) {
-            WsMessage::BookSnapshot { pair, bids, asks } => {
-                assert_eq!(pair.to_string(), "BTC/USDC");
+        let result = coinbase_book_to_proxy_event(&coinbase).unwrap();
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::BookSnapshot { symbol, bids, asks } => {
+                assert_eq!(symbol, "BTC/USDC");
                 assert_eq!(bids.len(), 2);
                 assert_eq!(asks.len(), 1);
             }
@@ -550,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_coinbase_book_update_to_kraken() {
+    fn test_coinbase_book_update_to_proxy_event() {
         let coinbase = json!({
             "channel": "l2_data",
             "events": [{
@@ -563,17 +471,17 @@ mod tests {
             }]
         });
 
-        let result = coinbase_book_to_kraken(&coinbase).unwrap();
-        match parse_ws_message(&result) {
-            WsMessage::BookUpdate { pair, .. } => {
-                assert_eq!(pair.to_string(), "ETH/USDC");
+        let result = coinbase_book_to_proxy_event(&coinbase).unwrap();
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::BookUpdate { symbol, .. } => {
+                assert_eq!(symbol, "ETH/USDC");
             }
             other => panic!("Expected BookUpdate, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_coinbase_user_fill_to_kraken() {
+    fn test_coinbase_user_fill_to_proxy_event() {
         let coinbase = json!({
             "channel": "user",
             "events": [{
@@ -594,21 +502,20 @@ mod tests {
         });
 
         let mut tracker = FillTracker::new();
-        let results = coinbase_user_to_kraken(&coinbase, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&coinbase, &mut tracker);
         assert_eq!(results.len(), 1);
-        // Verify it parses correctly through the protocol parser
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "trade");
-                assert_eq!(report.pair.to_string(), "BTC/USDC");
-                assert_eq!(report.side, "buy");
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::Fill { cl_ord_id, symbol, side, .. } => {
+                assert_eq!(cl_ord_id, "mm_buy_btc_001");
+                assert_eq!(symbol, "BTC/USDC");
+                assert_eq!(side, "buy");
             }
-            other => panic!("Expected Execution, got {:?}", other),
+            other => panic!("Expected Fill, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_coinbase_user_cancel_to_kraken() {
+    fn test_coinbase_user_cancel_to_proxy_event() {
         let coinbase = json!({
             "channel": "user",
             "events": [{
@@ -629,14 +536,14 @@ mod tests {
         });
 
         let mut tracker = FillTracker::new();
-        let results = coinbase_user_to_kraken(&coinbase, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&coinbase, &mut tracker);
         assert_eq!(results.len(), 1);
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "canceled");
-                assert_eq!(report.cancel_reason, Some("USER_CANCEL".to_string()));
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::OrderCancelled { cl_ord_id, reason, .. } => {
+                assert_eq!(cl_ord_id, "mm_sell_eth_002");
+                assert_eq!(reason, Some("USER_CANCEL".to_string()));
             }
-            other => panic!("Expected Execution, got {:?}", other),
+            other => panic!("Expected OrderCancelled, got {:?}", other),
         }
     }
 
@@ -664,19 +571,18 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&msg1, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&msg1, &mut tracker);
         assert_eq!(results.len(), 1);
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "trade");
-                // Incremental: 0.3 (first fill, no previous)
-                assert_eq!(report.last_qty.to_string(), "0.3");
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::Fill { qty, .. } => {
+                let qty_f64: f64 = qty.to_string().parse().unwrap();
+                assert!((qty_f64 - 0.3).abs() < 0.001,
+                    "Expected incremental qty ~0.3, got {}", qty_f64);
             }
-            other => panic!("Expected Execution trade, got {:?}", other),
+            other => panic!("Expected Fill, got {:?}", other),
         }
 
         // Second partial fill: cumulative 0.7 at weighted avg price 95
-        // Incremental: 0.4 units, cost delta = 0.7*95 - 0.3*100 = 66.5 - 30 = 36.5, price = 91.25
         let msg2 = json!({
             "channel": "user",
             "events": [{
@@ -696,20 +602,18 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&msg2, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&msg2, &mut tracker);
         assert_eq!(results.len(), 1);
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "trade");
-                // Incremental qty: 0.7 - 0.3 = 0.4
-                let qty_f64: f64 = report.last_qty.to_string().parse().unwrap();
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::Fill { qty, .. } => {
+                let qty_f64: f64 = qty.to_string().parse().unwrap();
                 assert!((qty_f64 - 0.4).abs() < 0.001,
                     "Expected incremental qty ~0.4, got {}", qty_f64);
             }
-            other => panic!("Expected Execution trade, got {:?}", other),
+            other => panic!("Expected Fill, got {:?}", other),
         }
 
-        // Final fill: cumulative 1.0 at weighted avg price 90
+        // Final fill: cumulative 1.0
         let msg3 = json!({
             "channel": "user",
             "events": [{
@@ -729,17 +633,16 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&msg3, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&msg3, &mut tracker);
         assert_eq!(results.len(), 1);
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "trade");
-                // Incremental qty: 1.0 - 0.7 = 0.3
-                let qty_f64: f64 = report.last_qty.to_string().parse().unwrap();
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::Fill { qty, is_fully_filled, .. } => {
+                let qty_f64: f64 = qty.to_string().parse().unwrap();
                 assert!((qty_f64 - 0.3).abs() < 0.001,
                     "Expected incremental qty ~0.3, got {}", qty_f64);
+                assert!(is_fully_filled);
             }
-            other => panic!("Expected Execution trade, got {:?}", other),
+            other => panic!("Expected Fill, got {:?}", other),
         }
 
         // Tracker should have cleaned up after FILLED
@@ -750,7 +653,6 @@ mod tests {
     fn test_open_no_fill_emits_ack() {
         let mut tracker = FillTracker::new();
 
-        // OPEN with zero cumulative_quantity is just an ack
         let msg = json!({
             "channel": "user",
             "events": [{
@@ -770,13 +672,13 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&msg, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&msg, &mut tracker);
         assert_eq!(results.len(), 1);
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "new");
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::OrderAccepted { cl_ord_id, .. } => {
+                assert_eq!(cl_ord_id, "mm_buy_new_001");
             }
-            other => panic!("Expected Execution new, got {:?}", other),
+            other => panic!("Expected OrderAccepted, got {:?}", other),
         }
     }
 
@@ -804,9 +706,10 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&msg, &mut tracker);
-        // Snapshot should produce an execution snapshot message (ack, not trade)
+        let results = coinbase_user_to_proxy_events(&msg, &mut tracker);
+        // Snapshot should produce an OrderAccepted message
         assert_eq!(results.len(), 1);
+        assert!(matches!(parse_proxy_event(&results[0]).unwrap(), ProxyEvent::OrderAccepted { .. }));
 
         // Now if an update arrives with the SAME cumulative_quantity, no fill should be emitted
         let update = json!({
@@ -828,15 +731,10 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&update, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&update, &mut tracker);
         assert_eq!(results.len(), 1);
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                // No new fill, should be an ack
-                assert_eq!(report.exec_type, "new");
-            }
-            other => panic!("Expected Execution new (no fill delta), got {:?}", other),
-        }
+        // No new fill, should be an ack
+        assert!(matches!(parse_proxy_event(&results[0]).unwrap(), ProxyEvent::OrderAccepted { .. }));
 
         // But a NEW partial fill SHOULD be emitted
         let update2 = json!({
@@ -858,32 +756,21 @@ mod tests {
             }]
         });
 
-        let results = coinbase_user_to_kraken(&update2, &mut tracker);
+        let results = coinbase_user_to_proxy_events(&update2, &mut tracker);
         assert_eq!(results.len(), 1);
-        match parse_ws_message(&results[0]) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "trade");
-                // Incremental: 0.8 - 0.5 = 0.3
-                let qty_f64: f64 = report.last_qty.to_string().parse().unwrap();
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::Fill { qty, .. } => {
+                let qty_f64: f64 = qty.to_string().parse().unwrap();
                 assert!((qty_f64 - 0.3).abs() < 0.001,
                     "Expected incremental qty ~0.3, got {}", qty_f64);
             }
-            other => panic!("Expected Execution trade, got {:?}", other),
+            other => panic!("Expected Fill, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_kraken_subscribe_to_coinbase() {
-        let kraken = json!({
-            "method": "subscribe",
-            "params": {
-                "channel": "book",
-                "symbol": ["BTC/USD", "ETH/USD"],
-                "depth": 10
-            }
-        });
-
-        let result = kraken_subscribe_to_coinbase(&kraken).unwrap();
+    fn test_subscribe_to_coinbase() {
+        let result = subscribe_to_coinbase("book", &["BTC/USD".to_string(), "ETH/USD".to_string()]).unwrap();
         assert_eq!(result["type"], "subscribe");
         assert_eq!(result["channel"], "level2");
         let product_ids = result["product_ids"].as_array().unwrap();
@@ -894,56 +781,48 @@ mod tests {
     #[test]
     fn test_order_response_success() {
         let result = order_response_success("add_order", 42, "cb-123", "mm_buy_001");
-        match parse_ws_message(&result) {
-            WsMessage::OrderResponse { req_id, success, method, order_id, cl_ord_id, .. } => {
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::OrderAccepted { req_id, cl_ord_id, order_id } => {
                 assert_eq!(req_id, 42);
-                assert!(success);
-                assert_eq!(method, "add_order");
-                assert_eq!(order_id, Some("cb-123".to_string()));
-                assert_eq!(cl_ord_id, Some("mm_buy_001".to_string()));
+                assert_eq!(cl_ord_id, "mm_buy_001");
+                assert_eq!(order_id, "cb-123");
             }
-            other => panic!("Expected OrderResponse, got {:?}", other),
+            other => panic!("Expected OrderAccepted, got {:?}", other),
         }
     }
 
     #[test]
     fn test_synthetic_exec_new() {
         let result = synthetic_exec_new("cb-order-789", "mm_buy_doge_001", "DOGE/USDC", "buy");
-        match parse_ws_message(&result) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "new");
-                assert_eq!(report.order_id, "cb-order-789");
-                assert_eq!(report.cl_ord_id, "mm_buy_doge_001");
-                assert_eq!(report.pair.to_string(), "DOGE/USDC");
-                assert_eq!(report.side, "buy");
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::OrderAccepted { cl_ord_id, order_id, .. } => {
+                assert_eq!(cl_ord_id, "mm_buy_doge_001");
+                assert_eq!(order_id, "cb-order-789");
             }
-            other => panic!("Expected Execution, got {:?}", other),
+            other => panic!("Expected OrderAccepted, got {:?}", other),
         }
     }
 
     #[test]
     fn test_synthetic_exec_canceled() {
         let result = synthetic_exec_canceled("mm_sell_xrp_002", "XRP/USDC", "sell");
-        match parse_ws_message(&result) {
-            WsMessage::Execution(report) => {
-                assert_eq!(report.exec_type, "canceled");
-                assert_eq!(report.cl_ord_id, "mm_sell_xrp_002");
-                assert_eq!(report.pair.to_string(), "XRP/USDC");
-                assert_eq!(report.cancel_reason, Some("USER_CANCEL".to_string()));
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::OrderCancelled { cl_ord_id, reason, .. } => {
+                assert_eq!(cl_ord_id, "mm_sell_xrp_002");
+                assert_eq!(reason, Some("USER_CANCEL".to_string()));
             }
-            other => panic!("Expected Execution, got {:?}", other),
+            other => panic!("Expected OrderCancelled, got {:?}", other),
         }
     }
 
     #[test]
     fn test_order_response_error() {
         let result = order_response_error("add_order", 99, "Insufficient funds");
-        match parse_ws_message(&result) {
-            WsMessage::OrderResponse { success, error, .. } => {
-                assert!(!success);
-                assert_eq!(error, Some("Insufficient funds".to_string()));
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::OrderRejected { error, .. } => {
+                assert_eq!(error, "Insufficient funds");
             }
-            other => panic!("Expected OrderResponse, got {:?}", other),
+            other => panic!("Expected OrderRejected, got {:?}", other),
         }
     }
 }

@@ -27,19 +27,30 @@ pub async fn handle_public_ws(
             if let Message::Text(text) = msg {
                 let text_str = text.to_string();
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text_str) {
-                    if v["method"].as_str() == Some("subscribe")
-                        && v["params"]["channel"].as_str() == Some("book")
-                    {
-                        let symbols: Vec<String> = v["params"]["symbol"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|s| s.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                    // Support both ProxyCommand format (cmd) and legacy (method)
+                    let cmd = v.get("cmd").or_else(|| v.get("method"))
+                        .and_then(|m| m.as_str()).unwrap_or("");
 
-                        let _ = sub_tx.send(symbols).await;
+                    if cmd == "subscribe" {
+                        // New format: {"cmd":"subscribe","channel":"book","symbols":["BTC/USD"]}
+                        // Old format: {"method":"subscribe","params":{"channel":"book","symbol":["BTC/USD"]}}
+                        let channel = v.get("channel")
+                            .or_else(|| v.get("params").and_then(|p| p.get("channel")))
+                            .and_then(|c| c.as_str()).unwrap_or("");
+
+                        if channel == "book" {
+                            let symbols: Vec<String> = v.get("symbols")
+                                .or_else(|| v.get("params").and_then(|p| p.get("symbol")))
+                                .and_then(|s| s.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|s| s.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            let _ = sub_tx.send(symbols).await;
+                        }
                     }
                 }
             }
@@ -54,8 +65,8 @@ pub async fn handle_public_ws(
         }
 
         // Send subscription confirmations
-        for sym in &subscribed_symbols {
-            let confirm = crate::messages::subscribe_book_confirm(sym);
+        for _sym in &subscribed_symbols {
+            let confirm = crate::messages::subscribe_confirm("book");
             let msg = serde_json::to_string(&confirm).unwrap();
             if ws_write.send(Message::Text(msg.into())).await.is_err() {
                 return;
@@ -82,12 +93,14 @@ pub async fn handle_public_ws(
                 Ok(msg_str) => {
                     // Check if this update is for a subscribed symbol, or a heartbeat
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg_str) {
-                        let channel = v["channel"].as_str().unwrap_or("");
-                        let should_send = if channel == "heartbeat" {
-                            true
-                        } else {
-                            let sym = v["data"][0]["symbol"].as_str().unwrap_or("");
-                            subscribed_symbols.iter().any(|s| s == sym)
+                        let event = v["event"].as_str().unwrap_or("");
+                        let should_send = match event {
+                            "heartbeat" => true,
+                            "book_snapshot" | "book_update" => {
+                                let sym = v["symbol"].as_str().unwrap_or("");
+                                subscribed_symbols.iter().any(|s| s == sym)
+                            }
+                            _ => false,
                         };
                         if should_send {
                             if ws_write

@@ -14,6 +14,7 @@ path = "src/bootstrap.rs"
 [dependencies]
 kraken-core = { path = "../core" }
 trading-primitives = { path = "../trading-primitives" }
+exchange-api = { path = "../exchange-api" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

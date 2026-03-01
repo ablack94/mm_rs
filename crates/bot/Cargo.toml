@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 kraken-core = { path = "../core" }
+exchange-api = { path = "../exchange-api" }
+trading-primitives = { path = "../trading-primitives" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

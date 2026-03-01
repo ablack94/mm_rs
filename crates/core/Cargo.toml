@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 trading-primitives = { path = "../trading-primitives" }
+exchange-api = { path = "../exchange-api" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 futures = "0.3"

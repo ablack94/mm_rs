@@ -27,10 +27,67 @@ use proxy_common::rate_limit::{TokenBucket, TokenBucketConfig};
 const COINBASE_MARKET_WS: &str = "wss://advanced-trade-ws.coinbase.com";
 const COINBASE_USER_WS: &str = "wss://advanced-trade-ws-user.coinbase.com";
 
+/// Convert f64 to Decimal for order tracking.
+fn dec(f: f64) -> Decimal {
+    Decimal::from_f64_retain(f).unwrap_or_default()
+}
+
+/// Parse a legacy-format WS message (method/params style) into a ProxyCommand.
+fn parse_legacy_command(parsed: &serde_json::Value) -> Option<ProxyCommand> {
+    let method = parsed.get("method").and_then(|m| m.as_str())?;
+    let params = parsed.get("params").unwrap_or(parsed);
+    let req_id = params.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
+
+    match method {
+        "subscribe" => {
+            let channel = params.get("channel").and_then(|c| c.as_str())?.to_string();
+            let symbols = params.get("symbol").and_then(|s| s.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Some(ProxyCommand::Subscribe { channel, symbols, depth: None })
+        }
+        "add_order" => {
+            let symbol = params.get("symbol").and_then(|s| s.as_str())?.to_string();
+            let side = params.get("side").and_then(|s| s.as_str())?.to_string();
+            let cl_ord_id = params.get("cl_ord_id").and_then(|c| c.as_str())?.to_string();
+            let price = dec(params.get("limit_price").and_then(|p| p.as_f64()).unwrap_or(0.0));
+            let qty = dec(params.get("order_qty").and_then(|q| q.as_f64()).unwrap_or(0.0));
+            let post_only = params.get("post_only").and_then(|p| p.as_bool()).unwrap_or(true);
+            let market = params.get("market").and_then(|m| m.as_bool()).unwrap_or(false);
+            Some(ProxyCommand::PlaceOrder {
+                req_id, symbol, side, order_type: "limit".to_string(),
+                price, qty, cl_ord_id, post_only,
+                priority: exchange_api::OrderPriority::Normal, market,
+            })
+        }
+        "amend_order" => {
+            let cl_ord_id = params.get("cl_ord_id").and_then(|c| c.as_str())?.to_string();
+            let price = params.get("limit_price").and_then(|p| p.as_f64()).map(dec);
+            let qty = params.get("order_qty").and_then(|q| q.as_f64()).map(dec);
+            Some(ProxyCommand::AmendOrder { req_id, cl_ord_id, price, qty })
+        }
+        "cancel_order" => {
+            let cl_ord_ids = params.get("cl_ord_id").and_then(|c| c.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            Some(ProxyCommand::CancelOrders { req_id, cl_ord_ids })
+        }
+        "cancel_all" => Some(ProxyCommand::CancelAll { req_id }),
+        "cancel_all_orders_after" => {
+            let timeout_secs = params.get("timeout").and_then(|t| t.as_u64()).unwrap_or(0);
+            Some(ProxyCommand::SetDms { req_id, timeout_secs })
+        }
+        "ping" => Some(ProxyCommand::Ping { req_id }),
+        _ => None,
+    }
+}
+
 use crate::state::ProxyOrderState;
-use proxy_common::order_tracking::{
+use exchange_api::ProxyCommand;
+use exchange_api::order_tracking::{
     TrackedOrder as ProxyTrackedOrder, OrderStatus, FillRecord, FillSource,
 };
+use rust_decimal::Decimal;
 
 /// State for Coinbase WS proxy.
 pub struct CoinbaseWsState {
@@ -216,40 +273,33 @@ async fn run_private_ws_proxy(
             match msg {
                 ws::Message::Text(text) => {
                     let text_str = text.to_string();
-                    let parsed: serde_json::Value = match serde_json::from_str(&text_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+
+                    // Try typed ProxyCommand deserialization first, fall back to legacy format
+                    let cmd = serde_json::from_str::<ProxyCommand>(&text_str)
+                        .ok()
+                        .or_else(|| {
+                            let parsed: serde_json::Value = serde_json::from_str(&text_str).ok()?;
+                            parse_legacy_command(&parsed)
+                        });
+
+                    let cmd = match cmd {
+                        Some(c) => c,
+                        None => {
+                            tracing::debug!("Unknown WS message from bot, ignoring");
+                            continue;
+                        }
                     };
 
-                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
-
-                    match method {
-                        "subscribe" => {
-                            // Handle executions subscription
-                            let channel = parsed
-                                .get("params")
-                                .and_then(|p| p.get("channel"))
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("");
-
+                    match cmd {
+                        ProxyCommand::Subscribe { channel, symbols, .. } => {
                             if channel == "executions" {
                                 let mut sub = subscribed_for_orders.lock().await;
                                 if !*sub {
-                                    // Subscribe to user channel on Coinbase.
-                                    // Coinbase delivers ALL order events regardless of product_ids,
-                                    // but still requires at least one product_id in the subscribe.
-                                    // Extract the bot's symbols from the subscribe params and convert.
-                                    let product_ids: Vec<String> = parsed
-                                        .get("params")
-                                        .and_then(|p| p.get("symbol"))
-                                        .and_then(|s| s.as_array())
-                                        .map(|arr| {
-                                            arr.iter()
-                                                .filter_map(|v| v.as_str())
-                                                .map(|s| pairs::to_coinbase(s))
-                                                .collect()
-                                        })
-                                        .unwrap_or_else(|| vec!["BTC-USD".to_string()]);
+                                    let product_ids: Vec<String> = if symbols.is_empty() {
+                                        vec!["BTC-USD".to_string()]
+                                    } else {
+                                        symbols.iter().map(|s| pairs::to_coinbase(s)).collect()
+                                    };
                                     let sub_msg = state_for_orders.ws_subscribe_msg(
                                         "user",
                                         &product_ids,
@@ -257,51 +307,48 @@ async fn run_private_ws_proxy(
                                     let mut writer = coinbase_write_for_sub.lock().await;
                                     let _ = writer.send(Message::Text(sub_msg.into())).await;
                                     *sub = true;
-                                    // Store products for reconnect
                                     *subscribed_products_for_orders.lock().await = product_ids;
                                 }
 
-                                // Send confirmation back to bot
                                 let confirm = translate::subscribe_confirmed("executions");
                                 let mut writer = bot_write_for_orders.lock().await;
                                 let _ = writer.send(ws::Message::Text(confirm.into())).await;
-
-                                // Send empty snapshot
-                                let snapshot = serde_json::json!({
-                                    "channel": "executions",
-                                    "type": "snapshot",
-                                    "data": []
-                                })
-                                .to_string();
-                                let _ = writer.send(ws::Message::Text(snapshot.into())).await;
                             }
                         }
-                        "ping" => {
-                            let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
+                        ProxyCommand::Ping { req_id } => {
                             let pong = translate::pong_response(req_id);
                             let mut writer = bot_write_for_orders.lock().await;
                             let _ = writer.send(ws::Message::Text(pong.into())).await;
                         }
-                        "add_order" => {
-                            handle_add_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
+                        ProxyCommand::PlaceOrder { req_id, symbol, side, cl_ord_id, price, qty, post_only, market, .. } => {
+                            handle_place_order(
+                                req_id, &symbol, &side, &cl_ord_id, price, qty, post_only, market,
+                                &state_for_orders, &bot_write_for_orders,
+                                &order_id_map_for_orders, &order_state_for_orders,
+                            ).await;
                         }
-                        "amend_order" => {
-                            handle_amend_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
+                        ProxyCommand::AmendOrder { req_id, cl_ord_id, price, qty } => {
+                            handle_amend_order(
+                                req_id, &cl_ord_id, price, qty,
+                                &state_for_orders, &bot_write_for_orders,
+                                &order_id_map_for_orders, &order_state_for_orders,
+                            ).await;
                         }
-                        "cancel_order" => {
-                            handle_cancel_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
+                        ProxyCommand::CancelOrders { req_id, cl_ord_ids } => {
+                            handle_cancel_orders(
+                                req_id, &cl_ord_ids,
+                                &state_for_orders, &bot_write_for_orders,
+                                &order_id_map_for_orders, &order_state_for_orders,
+                            ).await;
                         }
-                        "cancel_all" => {
-                            handle_cancel_all(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
+                        ProxyCommand::CancelAll { req_id } => {
+                            handle_cancel_all_cmd(
+                                req_id,
+                                &state_for_orders, &bot_write_for_orders,
+                                &order_id_map_for_orders, &order_state_for_orders,
+                            ).await;
                         }
-                        "cancel_all_orders_after" => {
-                            let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
-                            let timeout_secs = parsed
-                                .get("params")
-                                .and_then(|p| p.get("timeout"))
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-
+                        ProxyCommand::SetDms { req_id, timeout_secs } => {
                             // Abort any existing DMS timer
                             {
                                 let mut timer = dms_timer_for_orders.lock().await;
@@ -320,23 +367,14 @@ async fn run_private_ws_proxy(
                                     tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
                                     tracing::warn!(timeout_secs, "DMS timer expired — cancelling all orders");
                                     cancel_all_orders(&state_for_dms, &order_id_map_for_dms, &order_state_for_dms).await;
-                                    // Clear self from the handle slot
                                     *dms_timer_ref.lock().await = None;
                                 });
                                 dms_timer_for_orders.lock().await.replace(handle);
                             }
 
-                            let resp = translate::order_response_success(
-                                "cancel_all_orders_after",
-                                req_id,
-                                "",
-                                "",
-                            );
+                            let resp = translate::command_ack(req_id, "set_dms");
                             let mut writer = bot_write_for_orders.lock().await;
                             let _ = writer.send(ws::Message::Text(resp.into())).await;
-                        }
-                        _ => {
-                            tracing::debug!(method, "Unknown WS method from bot, ignoring");
                         }
                     }
                 }
@@ -379,7 +417,7 @@ async fn run_private_ws_proxy(
                                 record_ws_fills(&parsed, &order_state_for_upstream).await;
 
                                 let kraken_msgs =
-                                    translate::coinbase_user_to_kraken(&parsed, &mut fill_tracker);
+                                    translate::coinbase_user_to_proxy_events(&parsed, &mut fill_tracker);
                                 if !kraken_msgs.is_empty() {
                                     tracing::info!(count = kraken_msgs.len(), msg_type, "Forwarding user events to bot");
                                 }
@@ -508,50 +546,54 @@ async fn run_private_ws_proxy(
     Ok(())
 }
 
-/// Handle add_order: translate Kraken WS add_order to Coinbase REST POST /orders
-async fn handle_add_order(
-    parsed: &serde_json::Value,
+/// Handle place_order: translate to Coinbase REST POST /orders
+async fn handle_place_order(
+    req_id: u64,
+    symbol: &str,
+    side: &str,
+    cl_ord_id: &str,
+    price: Decimal,
+    qty: Decimal,
+    post_only: bool,
+    is_market: bool,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
     order_id_map: &Arc<Mutex<OrderIdMap>>,
     order_state: &Arc<ProxyOrderState>,
 ) {
-    let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
-    let params = match parsed.get("params") {
-        Some(p) => p,
-        None => {
-            send_error(bot_write, "add_order", req_id, "Missing params").await;
-            return;
-        }
-    };
-
-    let symbol = params.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-    let side = params.get("side").and_then(|s| s.as_str()).unwrap_or("buy");
-    let cl_ord_id = params.get("cl_ord_id").and_then(|c| c.as_str()).unwrap_or("");
-    let limit_price = params.get("limit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
-    let order_qty = params.get("order_qty").and_then(|q| q.as_f64()).unwrap_or(0.0);
-    let post_only = params.get("post_only").and_then(|p| p.as_bool()).unwrap_or(true);
-
     let product_id = pairs::to_coinbase(symbol);
 
-    let body = serde_json::json!({
-        "client_order_id": cl_ord_id,
-        "product_id": product_id,
-        "side": side.to_uppercase(),
-        "order_configuration": {
-            "limit_limit_gtc": {
-                "base_size": format!("{}", order_qty),
-                "limit_price": format!("{}", limit_price),
-                "post_only": post_only
+    let body = if is_market {
+        serde_json::json!({
+            "client_order_id": cl_ord_id,
+            "product_id": product_id,
+            "side": side.to_uppercase(),
+            "order_configuration": {
+                "market_market_ioc": {
+                    "base_size": qty.to_string()
+                }
             }
-        }
-    });
+        })
+    } else {
+        serde_json::json!({
+            "client_order_id": cl_ord_id,
+            "product_id": product_id,
+            "side": side.to_uppercase(),
+            "order_configuration": {
+                "limit_limit_gtc": {
+                    "base_size": qty.to_string(),
+                    "limit_price": price.to_string(),
+                    "post_only": post_only
+                }
+            }
+        })
+    };
 
     // Rate limit check
     {
-        let allowed = state.rate_limiter.lock().await.try_consume("add_order");
+        let allowed = state.rate_limiter.lock().await.try_consume("place_order");
         if !allowed {
-            send_error(bot_write, "add_order", req_id, "EOrder:Rate limit exceeded [proxy]").await;
+            send_error(bot_write, "place_order", req_id, "EOrder:Rate limit exceeded [proxy]").await;
             return;
         }
     }
@@ -567,32 +609,28 @@ async fn handle_add_order(
                     .and_then(|id| id.as_str())
                     .unwrap_or("");
 
-                // Store cl_ord_id → (exchange order_id, size) for amend/cancel
                 if !order_id.is_empty() {
                     order_id_map.lock().await.insert(cl_ord_id.to_string(), OrderInfo {
                         exchange_id: order_id.to_string(),
-                        size: format!("{}", order_qty),
+                        size: qty.to_string(),
                     });
 
-                    // Register in order tracking state
                     order_state.orders.lock().await.insert(ProxyTrackedOrder {
                         cl_ord_id: cl_ord_id.to_string(),
                         exchange_id: order_id.to_string(),
                         pair: pairs::to_internal(&product_id),
                         side: side.to_string(),
-                        price: limit_price,
-                        original_qty: order_qty,
-                        filled_qty: 0.0,
+                        price,
+                        original_qty: qty,
+                        filled_qty: Decimal::ZERO,
                         status: OrderStatus::Pending,
                     });
                 }
 
-                let response = translate::order_response_success("add_order", req_id, order_id, cl_ord_id);
+                let response = translate::order_response_success("place_order", req_id, order_id, cl_ord_id);
                 let mut writer = bot_write.lock().await;
                 let _ = writer.send(ws::Message::Text(response.into())).await;
 
-                // Send synthetic execution report so bot gets OrderAcknowledged immediately.
-                // The user WS may also send an OPEN event later; duplicate acks are harmless.
                 let exec_msg = translate::synthetic_exec_new(order_id, cl_ord_id, symbol, side);
                 let _ = writer.send(ws::Message::Text(exec_msg.into())).await;
             } else {
@@ -601,35 +639,26 @@ async fn handle_add_order(
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
                     .unwrap_or("Unknown Coinbase error");
-                send_error(bot_write, "add_order", req_id, error).await;
+                send_error(bot_write, "place_order", req_id, error).await;
             }
         }
         Err(e) => {
-            send_error(bot_write, "add_order", req_id, &format!("REST error: {}", e)).await;
+            send_error(bot_write, "place_order", req_id, &format!("REST error: {}", e)).await;
         }
     }
 }
 
 /// Handle amend_order: translate to Coinbase REST POST /orders/edit
 async fn handle_amend_order(
-    parsed: &serde_json::Value,
+    req_id: u64,
+    cl_ord_id: &str,
+    price: Option<Decimal>,
+    qty: Option<Decimal>,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
     order_id_map: &Arc<Mutex<OrderIdMap>>,
     order_state: &Arc<ProxyOrderState>,
 ) {
-    let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
-    let params = match parsed.get("params") {
-        Some(p) => p,
-        None => {
-            send_error(bot_write, "amend_order", req_id, "Missing params").await;
-            return;
-        }
-    };
-
-    let cl_ord_id = params.get("cl_ord_id").and_then(|c| c.as_str()).unwrap_or("");
-
-    // Look up the Coinbase exchange order_id and current size from our mapping
     let order_info = order_id_map.lock().await.get(cl_ord_id).cloned();
     let order_info = match order_info {
         Some(info) => info,
@@ -639,9 +668,6 @@ async fn handle_amend_order(
             return;
         }
     };
-
-    let limit_price = params.get("limit_price").and_then(|p| p.as_f64());
-    let order_qty = params.get("order_qty").and_then(|q| q.as_f64());
 
     // Rate limit check
     {
@@ -653,8 +679,8 @@ async fn handle_amend_order(
     }
 
     // Coinbase requires `size` on every edit — use provided qty or fall back to stored size.
-    let size = match order_qty {
-        Some(qty) => format!("{}", qty),
+    let size = match qty {
+        Some(q) => q.to_string(),
         None => order_info.size.clone(),
     };
 
@@ -663,27 +689,21 @@ async fn handle_amend_order(
         "size": size
     });
 
-    if let Some(price) = limit_price {
-        body["price"] = serde_json::json!(format!("{}", price));
+    if let Some(p) = price {
+        body["price"] = serde_json::json!(p.to_string());
     }
 
     match state.rest_post("/api/v3/brokerage/orders/edit", &body).await {
         Ok(resp) => {
             let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
             if success {
-                // Update stored size if it changed
-                if order_qty.is_some() {
+                if qty.is_some() {
                     if let Some(info) = order_id_map.lock().await.get_mut(cl_ord_id) {
                         info.size = size.clone();
                     }
                 }
 
-                // Update order tracking state
-                order_state.orders.lock().await.update_price_qty(
-                    cl_ord_id,
-                    limit_price,
-                    order_qty,
-                );
+                order_state.orders.lock().await.update_price_qty(cl_ord_id, price, qty);
 
                 let response = translate::order_response_success("amend_order", req_id, &order_info.exchange_id, cl_ord_id);
                 let mut writer = bot_write.lock().await;
@@ -704,51 +724,32 @@ async fn handle_amend_order(
     }
 }
 
-/// Handle cancel_order: translate to Coinbase REST POST /orders/batch_cancel
-async fn handle_cancel_order(
-    parsed: &serde_json::Value,
+/// Handle cancel_orders: translate to Coinbase REST POST /orders/batch_cancel
+async fn handle_cancel_orders(
+    req_id: u64,
+    cl_ord_ids: &[String],
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
     order_id_map: &Arc<Mutex<OrderIdMap>>,
     order_state: &Arc<ProxyOrderState>,
 ) {
-    let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
-    let params = match parsed.get("params") {
-        Some(p) => p,
-        None => {
-            send_error(bot_write, "cancel_order", req_id, "Missing params").await;
-            return;
-        }
-    };
-
-    let cl_ord_ids: Vec<String> = params
-        .get("cl_ord_id")
-        .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
     if cl_ord_ids.is_empty() {
-        send_error(bot_write, "cancel_order", req_id, "No order IDs provided").await;
+        send_error(bot_write, "cancel_orders", req_id, "No order IDs provided").await;
         return;
     }
 
     // Rate limit check
     {
-        let allowed = state.rate_limiter.lock().await.try_consume("cancel_order");
+        let allowed = state.rate_limiter.lock().await.try_consume("cancel_orders");
         if !allowed {
-            send_error(bot_write, "cancel_order", req_id, "EOrder:Rate limit exceeded [proxy]").await;
+            send_error(bot_write, "cancel_orders", req_id, "EOrder:Rate limit exceeded [proxy]").await;
             return;
         }
     }
 
-    // Translate cl_ord_ids to Coinbase exchange order_ids
     let map = order_id_map.lock().await;
     let mut exchange_ids: Vec<String> = Vec::new();
-    for cl_id in &cl_ord_ids {
+    for cl_id in cl_ord_ids {
         match map.get(cl_id) {
             Some(info) => exchange_ids.push(info.exchange_id.clone()),
             None => tracing::warn!(cl_ord_id = cl_id.as_str(), "No exchange order_id for cancel — skipping"),
@@ -757,37 +758,32 @@ async fn handle_cancel_order(
     drop(map);
 
     if exchange_ids.is_empty() {
-        send_error(bot_write, "cancel_order", req_id, "No exchange order_ids found for given cl_ord_ids").await;
+        send_error(bot_write, "cancel_orders", req_id, "No exchange order_ids found for given cl_ord_ids").await;
         return;
     }
 
-    let body = serde_json::json!({
-        "order_ids": exchange_ids
-    });
+    let body = serde_json::json!({ "order_ids": exchange_ids });
 
     match state.rest_post("/api/v3/brokerage/orders/batch_cancel", &body).await {
         Ok(_resp) => {
-            // Remove cancelled orders from the mapping
             let mut map = order_id_map.lock().await;
-            for cl_id in &cl_ord_ids {
+            for cl_id in cl_ord_ids {
                 map.remove(cl_id);
             }
 
-            // Mark orders as cancelled in tracking state
             {
                 let mut orders = order_state.orders.lock().await;
-                for cl_id in &cl_ord_ids {
+                for cl_id in cl_ord_ids {
                     orders.update_status(cl_id, OrderStatus::Cancelled);
                 }
             }
 
-            // Send success for the cancel
-            let response = translate::order_response_success("cancel_order", req_id, "", "");
+            let response = translate::order_response_success("cancel_orders", req_id, "", "");
             let mut writer = bot_write.lock().await;
             let _ = writer.send(ws::Message::Text(response.into())).await;
         }
         Err(e) => {
-            send_error(bot_write, "cancel_order", req_id, &format!("REST error: {}", e)).await;
+            send_error(bot_write, "cancel_orders", req_id, &format!("REST error: {}", e)).await;
         }
     }
 }
@@ -868,14 +864,13 @@ async fn cancel_all_orders(
 }
 
 /// Handle cancel_all: cancel all open orders via Coinbase REST
-async fn handle_cancel_all(
-    parsed: &serde_json::Value,
+async fn handle_cancel_all_cmd(
+    req_id: u64,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
     order_id_map: &Arc<Mutex<OrderIdMap>>,
     order_state: &Arc<ProxyOrderState>,
 ) {
-    let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
     cancel_all_orders(state, order_id_map, order_state).await;
     let response = translate::order_response_success("cancel_all", req_id, "", "");
     let mut writer = bot_write.lock().await;
@@ -929,54 +924,48 @@ async fn reconcile_fills(
         let product_id = fill.get("product_id").and_then(|p| p.as_str()).unwrap_or("");
         let symbol = pairs::to_internal(product_id);
         let side = fill.get("side").and_then(|s| s.as_str()).unwrap_or("BUY").to_lowercase();
-        let price: f64 = fill.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let qty: f64 = fill.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let fee: f64 = fill.get("commission").and_then(|c| c.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let price_f: f64 = fill.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let qty_f: f64 = fill.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let fee_f: f64 = fill.get("commission").and_then(|c| c.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let timestamp = fill.get("trade_time").and_then(|t| t.as_str()).unwrap_or("");
 
-        if qty <= 0.0 || price <= 0.0 {
+        if qty_f <= 0.0 || price_f <= 0.0 {
             continue;
         }
 
         tracing::warn!(
-            trade_id, cl_ord_id, product_id, side = side.as_str(), price, qty,
+            trade_id, cl_ord_id, product_id, side = side.as_str(), price = price_f, qty = qty_f,
             "Fill reconciliation: emitting missed fill"
         );
 
-        // Record reconciliation fill in tracking state
+        // Record reconciliation fill in tracking state (Decimal)
         {
             let fill = FillRecord {
                 fill_id: trade_id.to_string(),
                 cl_ord_id: cl_ord_id.to_string(),
                 pair: symbol.clone(),
                 side: side.clone(),
-                price,
-                qty,
-                fee,
+                price: dec(price_f),
+                qty: dec(qty_f),
+                fee: dec(fee_f),
                 timestamp: timestamp.to_string(),
                 source: FillSource::Reconciliation,
             };
             order_state.fills.lock().await.record(fill);
-            order_state.orders.lock().await.add_fill(cl_ord_id, qty);
-            order_state.positions.lock().await.apply_fill(&symbol, &side, qty, price);
+            order_state.orders.lock().await.add_fill(cl_ord_id, dec(qty_f));
+            order_state.positions.lock().await.apply_fill(&symbol, &side, dec(qty_f), dec(price_f));
         }
 
-        let exec_report = trading_primitives::protocol::build_exec_report(
-            "trade",
+        new_fills.push(translate::build_fill_event(
             exchange_order_id,
             cl_ord_id,
             &symbol,
             &side,
-            qty,
-            price,
-            fee,
-            "filled",
-            "m",
+            qty_f,
+            price_f,
+            fee_f,
             timestamp,
-            None,
-        );
-
-        new_fills.push(trading_primitives::protocol::build_execution_update(exec_report));
+        ));
 
         // Clean up the order from our map since it's filled
         order_id_map.lock().await.remove(cl_ord_id);
@@ -1094,7 +1083,6 @@ async fn record_ws_fills(
             let symbol = pairs::to_internal(product_id);
 
             // Use a synthetic fill_id based on cl_ord_id + cumulative qty to deduplicate.
-            // WS may send multiple updates for the same cumulative state.
             let fill_id = format!("{}-ws-{:.8}", client_order_id, cum_qty);
 
             let fill = FillRecord {
@@ -1102,33 +1090,27 @@ async fn record_ws_fills(
                 cl_ord_id: client_order_id.to_string(),
                 pair: symbol.clone(),
                 side: side.clone(),
-                price: avg_price,
-                qty: cum_qty, // FillLedger handles dedup; qty here is cumulative for this fill_id
-                fee: total_fees,
+                price: dec(avg_price),
+                qty: dec(cum_qty),
+                fee: dec(total_fees),
                 timestamp: timestamp.to_string(),
                 source: FillSource::WebSocket,
             };
 
-            // Only record if this is a new fill_id (dedup handles cumulative duplication)
             let recorded = order_state.fills.lock().await.record(fill);
             if recorded {
-                // Update order registry and position tracker with the incremental fill
-                // Since we're using cumulative data with unique fill_ids per cumulative state,
-                // we need to compute the increment. The order registry's add_fill is additive,
-                // so we track via the filled_qty on the order.
                 let prev_filled = order_state.orders.lock().await
                     .get(client_order_id)
                     .map(|o| o.filled_qty)
-                    .unwrap_or(0.0);
-                let inc_qty = cum_qty - prev_filled;
-                if inc_qty > 1e-12 {
-                    let inc_cost = avg_price * cum_qty - avg_price * prev_filled;
-                    let inc_price = if inc_qty > 0.0 { inc_cost / inc_qty } else { avg_price };
+                    .unwrap_or(Decimal::ZERO);
+                let inc_qty = dec(cum_qty) - prev_filled;
+                if inc_qty > dec(1e-12) {
+                    let inc_cost = dec(avg_price) * dec(cum_qty) - dec(avg_price) * prev_filled;
+                    let inc_price = if inc_qty > Decimal::ZERO { inc_cost / inc_qty } else { dec(avg_price) };
                     order_state.orders.lock().await.add_fill(client_order_id, inc_qty);
                     order_state.positions.lock().await.apply_fill(&symbol, &side, inc_qty, inc_price);
                 }
 
-                // Update order status
                 if status == "FILLED" {
                     order_state.orders.lock().await.update_status(client_order_id, OrderStatus::Filled);
                 }
@@ -1213,68 +1195,52 @@ async fn run_public_ws_proxy(
             match msg {
                 ws::Message::Text(text) => {
                     let text_str = text.to_string();
-                    let parsed: serde_json::Value = match serde_json::from_str(&text_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
 
-                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    let cmd = serde_json::from_str::<ProxyCommand>(&text_str)
+                        .ok()
+                        .or_else(|| {
+                            let parsed: serde_json::Value = serde_json::from_str(&text_str).ok()?;
+                            parse_legacy_command(&parsed)
+                        });
 
-                    if method == "subscribe" {
-                        // Extract the original symbols the bot requested (e.g., ["DOGE/USDC"])
-                        let bot_symbols: Vec<String> = parsed
-                            .get("params")
-                            .and_then(|p| p.get("symbol"))
-                            .and_then(|s| s.as_array())
-                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
+                    match cmd {
+                        Some(ProxyCommand::Subscribe { channel, symbols, .. }) => {
+                            if let Some(coinbase_sub) = translate::subscribe_to_coinbase(&channel, &symbols) {
+                                let coinbase_channel = coinbase_sub.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+                                let product_ids: Vec<String> = coinbase_sub
+                                    .get("product_ids")
+                                    .and_then(|p| p.as_array())
+                                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                    .unwrap_or_default();
 
-                        if let Some(coinbase_sub) = translate::kraken_subscribe_to_coinbase(&parsed) {
-                            // Add HMAC auth to subscription
-                            let channel = coinbase_sub.get("channel").and_then(|c| c.as_str()).unwrap_or("");
-                            let product_ids: Vec<String> = coinbase_sub
-                                .get("product_ids")
-                                .and_then(|p| p.as_array())
-                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                                .unwrap_or_default();
-
-                            // Build mapping: Coinbase returns USD product_ids for USDC subscriptions.
-                            // E.g., subscribe DOGE-USDC → Coinbase returns DOGE-USD in book data.
-                            {
-                                let mut map = product_id_map_for_sub.lock().await;
-                                for (pid, sym) in product_ids.iter().zip(bot_symbols.iter()) {
-                                    // The base USD product_id that Coinbase will return
-                                    let base_pid = pid.replace("-USDC", "-USD");
-                                    map.insert(base_pid, sym.clone());
-                                    // Also map the exact product_id in case Coinbase uses it
-                                    map.insert(pid.clone(), sym.clone());
+                                {
+                                    let mut map = product_id_map_for_sub.lock().await;
+                                    for (pid, sym) in product_ids.iter().zip(symbols.iter()) {
+                                        let base_pid = pid.replace("-USDC", "-USD");
+                                        map.insert(base_pid, sym.clone());
+                                        map.insert(pid.clone(), sym.clone());
+                                    }
                                 }
+
+                                let sub_msg = state_for_sub.ws_subscribe_msg(coinbase_channel, &product_ids);
+                                let mut writer = coinbase_write_for_sub.lock().await;
+                                let _ = writer.send(Message::Text(sub_msg.into())).await;
+                                drop(writer);
+
+                                subscribed_channels_for_sub.lock().await
+                                    .push((coinbase_channel.to_string(), product_ids.clone()));
+
+                                let confirm = translate::subscribe_confirmed(&channel);
+                                let mut bot_writer = bot_write_for_sub.lock().await;
+                                let _ = bot_writer.send(ws::Message::Text(confirm.into())).await;
                             }
-
-                            let sub_msg = state_for_sub.ws_subscribe_msg(channel, &product_ids);
-                            let mut writer = coinbase_write_for_sub.lock().await;
-                            let _ = writer.send(Message::Text(sub_msg.into())).await;
-                            drop(writer);
-
-                            // Store subscription for reconnect
-                            subscribed_channels_for_sub.lock().await
-                                .push((channel.to_string(), product_ids.clone()));
-
-                            // Send confirmation back to bot
-                            let kraken_channel = parsed
-                                .get("params")
-                                .and_then(|p| p.get("channel"))
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("book");
-                            let confirm = translate::subscribe_confirmed(kraken_channel);
-                            let mut bot_writer = bot_write_for_sub.lock().await;
-                            let _ = bot_writer.send(ws::Message::Text(confirm.into())).await;
                         }
-                    } else if method == "ping" {
-                        let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
-                        let pong = translate::pong_response(req_id);
-                        let mut writer = bot_write_for_sub.lock().await;
-                        let _ = writer.send(ws::Message::Text(pong.into())).await;
+                        Some(ProxyCommand::Ping { req_id }) => {
+                            let pong = translate::pong_response(req_id);
+                            let mut writer = bot_write_for_sub.lock().await;
+                            let _ = writer.send(ws::Message::Text(pong.into())).await;
+                        }
+                        _ => {}
                     }
                 }
                 ws::Message::Close(_) => break,
@@ -1305,7 +1271,7 @@ async fn run_public_ws_proxy(
                         match channel {
                             "l2_data" => {
                                 let map = product_id_map.lock().await;
-                                if let Some(kraken_msg) = translate::coinbase_book_to_kraken_mapped(&parsed, &map) {
+                                if let Some(kraken_msg) = translate::coinbase_book_to_proxy_event_mapped(&parsed, &map) {
                                     drop(map);
                                     let mut writer = bot_write_for_upstream.lock().await;
                                     if writer

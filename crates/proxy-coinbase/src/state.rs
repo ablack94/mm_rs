@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use proxy_common::order_tracking::{OrderRegistry, FillLedger, PositionTracker};
+use exchange_api::order_tracking::{OrderRegistry, FillLedger, PositionTracker};
 
 /// Shared proxy state for order/fill/position tracking.
 /// Wrapped in Arc and shared between REST and WS handlers.

@@ -61,6 +61,7 @@ pub async fn handle_private_ws(
 }
 
 /// Process a single incoming private WS message.
+/// Accepts both ProxyCommand format (cmd field) and legacy format (method field).
 async fn process_private_message(
     raw: &str,
     state: &Arc<RwLock<ExchangeState>>,
@@ -74,66 +75,47 @@ async fn process_private_message(
         }
     };
 
-    let method = match v["method"].as_str() {
+    // Support both new ProxyCommand format ("cmd") and legacy format ("method")
+    let cmd = match v.get("cmd").or_else(|| v.get("method")).and_then(|m| m.as_str()) {
         Some(m) => m,
         None => {
-            // Might be a subscription request
-            if v["method"].is_null() {
-                tracing::debug!(raw, "No method in message");
-            }
+            tracing::debug!(raw, "No cmd/method in message");
             return;
         }
     };
 
-    match method {
+    match cmd {
         "subscribe" => handle_subscribe(&v, state, out_tx).await,
-        "add_order" => handle_add_order(&v, state, out_tx).await,
+        "place_order" | "add_order" => handle_add_order(&v, state, out_tx).await,
         "amend_order" => handle_amend_order(&v, state, out_tx).await,
-        "cancel_order" => handle_cancel_order(&v, state, out_tx).await,
+        "cancel_orders" | "cancel_order" => handle_cancel_order(&v, state, out_tx).await,
         "cancel_all" => handle_cancel_all(&v, state, out_tx).await,
-        "cancel_all_orders_after" => handle_cancel_all_after(&v, state, out_tx).await,
+        "set_dms" | "cancel_all_orders_after" => handle_dms(&v, out_tx).await,
         "ping" => handle_ping(&v, out_tx).await,
         other => {
-            tracing::warn!(method = other, "Unknown private WS method");
+            tracing::warn!(cmd = other, "Unknown private WS command");
         }
     }
 }
 
 async fn handle_subscribe(
     v: &serde_json::Value,
-    state: &Arc<RwLock<ExchangeState>>,
+    _state: &Arc<RwLock<ExchangeState>>,
     out_tx: &mpsc::Sender<String>,
 ) {
-    let channel = v["params"]["channel"].as_str().unwrap_or("");
-    if channel == "executions" {
-        // Send subscription confirmation
-        let confirm = messages::subscribe_executions_confirm();
+    // New format: {"cmd":"subscribe","channel":"executions"}
+    // Old format: {"method":"subscribe","params":{"channel":"executions"}}
+    let channel = v.get("channel")
+        .or_else(|| v.get("params").and_then(|p| p.get("channel")))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    if channel == "executions" || channel == "book" {
+        let confirm = messages::subscribe_confirm(channel);
         let _ = out_tx
             .send(serde_json::to_string(&confirm).unwrap())
             .await;
-
-        let snap_trades = v["params"]["snap_trades"].as_bool().unwrap_or(false);
-        let snap_orders = v["params"]["snap_orders"].as_bool().unwrap_or(false);
-
-        // Send trades snapshot (empty)
-        if snap_trades {
-            let snap = messages::executions_snapshot_trades();
-            let _ = out_tx
-                .send(serde_json::to_string(&snap).unwrap())
-                .await;
-        }
-
-        // Send orders snapshot
-        if snap_orders {
-            let st = state.read().await;
-            let open_orders: Vec<&Order> = st.orders.all_open_orders();
-            let snap = messages::executions_snapshot_orders(&open_orders);
-            let _ = out_tx
-                .send(serde_json::to_string(&snap).unwrap())
-                .await;
-        }
-
-        tracing::info!("Executions subscription confirmed");
+        tracing::info!(channel, "Subscription confirmed");
     }
 }
 
@@ -143,29 +125,39 @@ async fn handle_add_order(
     out_tx: &mpsc::Sender<String>,
 ) {
     let req_id = v["req_id"].as_u64().unwrap_or(0);
-    let params = &v["params"];
+    // New format: fields at top level; old format: nested in params
+    let params = v.get("params").unwrap_or(v);
 
-    let symbol = params["symbol"].as_str().unwrap_or("").to_string();
-    let side_str = params["side"].as_str().unwrap_or("buy");
-    let side = if side_str == "sell" {
-        Side::Sell
-    } else {
-        Side::Buy
-    };
-    let order_type_str = params["order_type"].as_str().unwrap_or("limit");
-    let order_type = if order_type_str == "market" {
+    let symbol = params.get("symbol").or_else(|| v.get("symbol"))
+        .and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let side_str = params.get("side").or_else(|| v.get("side"))
+        .and_then(|s| s.as_str()).unwrap_or("buy");
+    let side = if side_str == "sell" { Side::Sell } else { Side::Buy };
+
+    let order_type_str = params.get("order_type").or_else(|| v.get("order_type"))
+        .and_then(|s| s.as_str()).unwrap_or("limit");
+    let is_market = v.get("market").and_then(|m| m.as_bool()).unwrap_or(false);
+    let order_type = if order_type_str == "market" || is_market {
         OrderType::Market
     } else {
         OrderType::Limit
     };
-    let price = params["limit_price"].as_f64().unwrap_or(0.0);
-    let qty = params["order_qty"].as_f64().unwrap_or(0.0);
-    let cl_ord_id = params["cl_ord_id"].as_str().unwrap_or("").to_string();
-    let post_only = params["post_only"].as_bool().unwrap_or(false);
+
+    // New format: "price"/"qty"; old format: "limit_price"/"order_qty"
+    let price = params.get("price").or_else(|| params.get("limit_price"))
+        .or_else(|| v.get("price"))
+        .and_then(|p| p.as_f64()).unwrap_or(0.0);
+    let qty = params.get("qty").or_else(|| params.get("order_qty"))
+        .or_else(|| v.get("qty"))
+        .and_then(|q| q.as_f64()).unwrap_or(0.0);
+    let cl_ord_id = params.get("cl_ord_id").or_else(|| v.get("cl_ord_id"))
+        .and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let post_only = params.get("post_only").or_else(|| v.get("post_only"))
+        .and_then(|b| b.as_bool()).unwrap_or(false);
 
     // Validate
     if symbol.is_empty() || cl_ord_id.is_empty() || qty <= 0.0 {
-        let resp = messages::order_response_error("add_order", req_id, "Invalid order parameters");
+        let resp = messages::order_rejected(req_id, &cl_ord_id, "Invalid order parameters");
         let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
         return;
     }
@@ -174,9 +166,9 @@ async fn handle_add_order(
 
     // Check if pair exists
     if !st.books.contains_key(&symbol) {
-        let resp = messages::order_response_error(
-            "add_order",
+        let resp = messages::order_rejected(
             req_id,
+            &cl_ord_id,
             &format!("Unknown symbol: {}", symbol),
         );
         let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
@@ -198,25 +190,7 @@ async fn handle_add_order(
         post_only,
     };
 
-    // Send success response
-    let resp = messages::order_response_success("add_order", req_id, &order_id, &cl_ord_id);
-    let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
-
-    // Send pending_new exec report
-    let pending = messages::exec_report("pending_new", &order, 0.0, 0.0, 0.0, false);
-    let _ = out_tx
-        .send(serde_json::to_string(&pending).unwrap())
-        .await;
-
     // Check for immediate fill (crossing the book)
-    //
-    // Use ROUNDED prices (same precision as book update messages) for the
-    // crossing check.  The bot computes its limit prices from the rounded
-    // book data it receives, so the mock must compare against the same
-    // rounded values.  Without this, a sub-tick timing race between the
-    // book update broadcast and the add_order arrival can cause the raw
-    // (unrounded) ask to sit fractionally below the bot's bid, triggering
-    // a spurious post_only cancellation.
     let book = st.books.get(&symbol).unwrap();
     let pd = crate::state::price_decimals_for(book.mid_price());
     let round = |v: f64| -> f64 {
@@ -236,18 +210,15 @@ async fn handle_add_order(
         let fill_price = match (order_type, side) {
             (OrderType::Market, Side::Buy) => book.best_ask().unwrap_or(0.0),
             (OrderType::Market, Side::Sell) => book.best_bid().unwrap_or(0.0),
-            (OrderType::Limit, Side::Buy) => rounded_ask,  // fill at rounded ask (taker)
-            (OrderType::Limit, Side::Sell) => rounded_bid,  // fill at rounded bid (taker)
+            (OrderType::Limit, Side::Buy) => rounded_ask,
+            (OrderType::Limit, Side::Sell) => rounded_bid,
         };
 
         // If post_only and would cross, reject instead of filling
         if post_only {
-            let mut order = order;
-            order.status = OrderStatus::Canceled;
-            let cancel_report =
-                messages::exec_report("canceled", &order, 0.0, 0.0, 0.0, false);
+            let cancel_msg = messages::order_cancelled(&cl_ord_id, "post_only_crossing", &symbol);
             let _ = out_tx
-                .send(serde_json::to_string(&cancel_report).unwrap())
+                .send(serde_json::to_string(&cancel_msg).unwrap())
                 .await;
             tracing::info!(
                 cl_ord_id = cl_ord_id,
@@ -277,17 +248,13 @@ async fn handle_add_order(
         // Update balances
         update_balances(&mut st.balances, &symbol, side, qty, fill_price, fee);
 
-        // Send new ack
-        let new_ack = messages::exec_report("new", &order, 0.0, 0.0, 0.0, false);
-        let _ = out_tx
-            .send(serde_json::to_string(&new_ack).unwrap())
-            .await;
+        // Send order accepted
+        let ack = messages::order_accepted(req_id, &order_id, &cl_ord_id);
+        let _ = out_tx.send(serde_json::to_string(&ack).unwrap()).await;
 
-        // Send trade execution
-        let trade = messages::exec_report("trade", &order, qty, fill_price, fee, false);
-        let _ = out_tx
-            .send(serde_json::to_string(&trade).unwrap())
-            .await;
+        // Send fill event
+        let fill = messages::fill_event(&order, qty, fill_price, fee, false);
+        let _ = out_tx.send(serde_json::to_string(&fill).unwrap()).await;
 
         tracing::info!(
             cl_ord_id = cl_ord_id,
@@ -302,11 +269,9 @@ async fn handle_add_order(
         // Store the filled order
         st.orders.insert(order);
     } else {
-        // Send new ack and rest the order
-        let new_ack = messages::exec_report("new", &order, 0.0, 0.0, 0.0, false);
-        let _ = out_tx
-            .send(serde_json::to_string(&new_ack).unwrap())
-            .await;
+        // Send order accepted and rest the order
+        let ack = messages::order_accepted(req_id, &order_id, &cl_ord_id);
+        let _ = out_tx.send(serde_json::to_string(&ack).unwrap()).await;
 
         tracing::info!(
             cl_ord_id = cl_ord_id,
@@ -331,40 +296,34 @@ async fn handle_amend_order(
     out_tx: &mpsc::Sender<String>,
 ) {
     let req_id = v["req_id"].as_u64().unwrap_or(0);
-    let params = &v["params"];
-    let cl_ord_id = params["cl_ord_id"].as_str().unwrap_or("").to_string();
+    let params = v.get("params").unwrap_or(v);
+    let cl_ord_id = params.get("cl_ord_id").or_else(|| v.get("cl_ord_id"))
+        .and_then(|s| s.as_str()).unwrap_or("").to_string();
 
     let mut st = state.write().await;
 
     if let Some(order) = st.orders.get_mut(&cl_ord_id) {
-        // Update price if provided
-        if let Some(price) = params["limit_price"].as_f64() {
+        // Update price if provided (new: "price", old: "limit_price")
+        if let Some(price) = params.get("price").or_else(|| params.get("limit_price"))
+            .or_else(|| v.get("price"))
+            .and_then(|p| p.as_f64())
+        {
             order.price = price;
         }
-        // Update qty if provided
-        if let Some(qty) = params["order_qty"].as_f64() {
+        // Update qty if provided (new: "qty", old: "order_qty")
+        if let Some(qty) = params.get("qty").or_else(|| params.get("order_qty"))
+            .or_else(|| v.get("qty"))
+            .and_then(|q| q.as_f64())
+        {
             order.qty = qty;
         }
 
-        let resp = messages::order_response_success(
-            "amend_order",
-            req_id,
-            &order.order_id.clone(),
-            &cl_ord_id,
-        );
+        let resp = messages::command_ack(req_id, "amend_order");
         let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
-
-        // Send exec report for the amended order
-        let order_clone = order.clone();
-        let report = messages::exec_report("new", &order_clone, 0.0, 0.0, 0.0, false);
-        let _ = out_tx
-            .send(serde_json::to_string(&report).unwrap())
-            .await;
 
         tracing::info!(cl_ord_id = cl_ord_id, "Order amended");
     } else {
-        let resp =
-            messages::order_response_error("amend_order", req_id, "Order not found");
+        let resp = messages::order_rejected(req_id, &cl_ord_id, "Order not found");
         let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
     }
 }
@@ -375,10 +334,14 @@ async fn handle_cancel_order(
     out_tx: &mpsc::Sender<String>,
 ) {
     let req_id = v["req_id"].as_u64().unwrap_or(0);
-    let params = &v["params"];
+    let params = v.get("params").unwrap_or(v);
 
-    let cl_ord_ids: Vec<String> = params["cl_ord_id"]
-        .as_array()
+    // New format: "cl_ord_ids" array at top level
+    // Old format: "cl_ord_id" array in params
+    let cl_ord_ids: Vec<String> = params.get("cl_ord_ids")
+        .or_else(|| v.get("cl_ord_ids"))
+        .or_else(|| params.get("cl_ord_id"))
+        .and_then(|ids| ids.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|s| s.as_str().map(String::from))
@@ -391,30 +354,20 @@ async fn handle_cancel_order(
     for cl_ord_id in &cl_ord_ids {
         if let Some(order) = st.orders.get_mut(cl_ord_id) {
             order.status = OrderStatus::Canceled;
-            let order_clone = order.clone();
+            let symbol = order.symbol.clone();
 
-            // Send cancel exec report
-            let report =
-                messages::exec_report("canceled", &order_clone, 0.0, 0.0, 0.0, false);
+            // Send cancel event
+            let cancel = messages::order_cancelled(cl_ord_id, "user_requested", &symbol);
             let _ = out_tx
-                .send(serde_json::to_string(&report).unwrap())
+                .send(serde_json::to_string(&cancel).unwrap())
                 .await;
 
             tracing::info!(cl_ord_id = cl_ord_id, "Order cancelled");
         }
     }
 
-    // Send success response
-    let resp = if let Some(first_id) = cl_ord_ids.first() {
-        let order_id = st
-            .orders
-            .get(first_id)
-            .map(|o| o.order_id.clone())
-            .unwrap_or_default();
-        messages::order_response_success("cancel_order", req_id, &order_id, first_id)
-    } else {
-        messages::order_response_error("cancel_order", req_id, "No orders specified")
-    };
+    // Send ack
+    let resp = messages::command_ack(req_id, "cancel_orders");
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
 }
 
@@ -427,7 +380,7 @@ async fn handle_cancel_all(
 
     let mut st = state.write().await;
 
-    // First collect orders to cancel, then cancel them
+    // Collect orders to cancel
     let open_orders: Vec<Order> = st
         .orders
         .all_open_orders()
@@ -441,34 +394,29 @@ async fn handle_cancel_all(
         if let Some(o) = st.orders.get_mut(&order.cl_ord_id) {
             o.status = OrderStatus::Canceled;
         }
-        let report =
-            messages::exec_report("canceled", order, 0.0, 0.0, 0.0, false);
+        let cancel = messages::order_cancelled(&order.cl_ord_id, "cancel_all", &order.symbol);
         let _ = out_tx
-            .send(serde_json::to_string(&report).unwrap())
+            .send(serde_json::to_string(&cancel).unwrap())
             .await;
     }
 
-    let resp = messages::cancel_all_response(req_id, count);
+    let resp = messages::command_ack(req_id, "cancel_all");
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
 
     tracing::info!(count = count, "Cancel all orders");
 }
 
-async fn handle_cancel_all_after(
+async fn handle_dms(
     v: &serde_json::Value,
-    _state: &Arc<RwLock<ExchangeState>>,
     out_tx: &mpsc::Sender<String>,
 ) {
     let req_id = v["req_id"].as_u64().unwrap_or(0);
-    let _timeout = v["params"]["timeout"].as_u64().unwrap_or(0);
 
-    // Just acknowledge -- we don't implement the actual timer for now
-    // In a more complete implementation, we'd set a timer that cancels all
-    // orders if not refreshed within the timeout period.
-    let resp = messages::cancel_all_orders_after_response(req_id);
+    // Just acknowledge -- we don't implement the actual timer
+    let resp = messages::command_ack(req_id, "set_dms");
     let _ = out_tx.send(serde_json::to_string(&resp).unwrap()).await;
 
-    tracing::debug!(req_id = req_id, "cancel_all_orders_after acknowledged");
+    tracing::debug!(req_id = req_id, "set_dms acknowledged");
 }
 
 async fn handle_ping(v: &serde_json::Value, out_tx: &mpsc::Sender<String>) {
@@ -488,4 +436,3 @@ fn update_balances(
 ) {
     crate::state::update_balances(balances, symbol, side, qty, price, fee);
 }
-

@@ -5,7 +5,7 @@ use crate::orderbook::OrderBook;
 use crate::orders::Order;
 use crate::state::{price_decimals_for, qty_decimals_for};
 
-// ─── Book messages ───
+// ─── Book messages (ProxyEvent format) ───
 
 /// Build a book snapshot message for a symbol.
 pub fn book_snapshot(symbol: &str, book: &OrderBook) -> Value {
@@ -54,15 +54,10 @@ pub fn book_snapshot(symbol: &str, book: &OrderBook) -> Value {
     }
 
     json!({
-        "channel": "book",
-        "type": "snapshot",
-        "data": [{
-            "symbol": symbol,
-            "bids": bids,
-            "asks": asks,
-            "checksum": 0,
-            "timestamp": Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-        }]
+        "event": "book_snapshot",
+        "symbol": symbol,
+        "bids": bids,
+        "asks": asks,
     })
 }
 
@@ -101,204 +96,96 @@ pub fn book_update(symbol: &str, book: &OrderBook) -> Value {
         .collect();
 
     json!({
-        "channel": "book",
-        "type": "update",
-        "data": [{
-            "symbol": symbol,
-            "bids": bids,
-            "asks": asks,
-            "checksum": 0,
-            "timestamp": Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-        }]
+        "event": "book_update",
+        "symbol": symbol,
+        "bids": bids,
+        "asks": asks,
     })
 }
 
 // ─── Subscription confirmations ───
 
-pub fn subscribe_book_confirm(symbol: &str) -> Value {
+pub fn subscribe_confirm(channel: &str) -> Value {
     json!({
-        "method": "subscribe",
-        "result": {
-            "channel": "book",
-            "depth": 10,
-            "snapshot": true,
-            "symbol": symbol,
-        },
-        "success": true,
-        "time_in": Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-        "time_out": Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-    })
-}
-
-pub fn subscribe_executions_confirm() -> Value {
-    json!({
-        "method": "subscribe",
-        "result": {
-            "channel": "executions",
-            "snapshot": true,
-        },
-        "success": true,
-        "time_in": Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-        "time_out": Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-    })
-}
-
-// ─── Execution snapshots ───
-
-pub fn executions_snapshot_trades() -> Value {
-    json!({
-        "channel": "executions",
-        "type": "snapshot",
-        "data": [],
-    })
-}
-
-pub fn executions_snapshot_orders(orders: &[&Order]) -> Value {
-    let data: Vec<Value> = orders
-        .iter()
-        .map(|o| {
-            json!({
-                "order_id": o.order_id,
-                "cl_ord_id": o.cl_ord_id,
-                "symbol": o.symbol,
-                "side": o.side.to_string(),
-                "order_type": match o.order_type {
-                    crate::orders::OrderType::Limit => "limit",
-                    crate::orders::OrderType::Market => "market",
-                },
-                "limit_price": o.price,
-                "order_qty": o.qty,
-                "filled_qty": o.filled_qty,
-                "order_status": if o.filled_qty > 0.0 { "partially_filled" } else { "new" },
-                "exec_type": "new",
-                "timestamp": Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
-            })
-        })
-        .collect();
-
-    json!({
-        "channel": "executions",
-        "type": "snapshot",
-        "data": data,
+        "event": "subscribed",
+        "channel": channel,
     })
 }
 
 // ─── Order responses ───
 
-pub fn order_response_success(method: &str, req_id: u64, order_id: &str, cl_ord_id: &str) -> Value {
+pub fn order_accepted(req_id: u64, order_id: &str, cl_ord_id: &str) -> Value {
     json!({
-        "method": method,
+        "event": "order_accepted",
         "req_id": req_id,
-        "success": true,
-        "result": {
-            "order_id": order_id,
-            "cl_ord_id": cl_ord_id,
-        }
+        "cl_ord_id": cl_ord_id,
+        "order_id": order_id,
     })
 }
 
-pub fn order_response_error(method: &str, req_id: u64, error: &str) -> Value {
+pub fn order_rejected(req_id: u64, cl_ord_id: &str, error: &str) -> Value {
     json!({
-        "method": method,
+        "event": "order_rejected",
         "req_id": req_id,
-        "success": false,
+        "cl_ord_id": cl_ord_id,
         "error": error,
     })
 }
 
-pub fn cancel_all_response(req_id: u64, count: usize) -> Value {
+pub fn order_cancelled(cl_ord_id: &str, reason: &str, symbol: &str) -> Value {
     json!({
-        "method": "cancel_all",
-        "req_id": req_id,
-        "success": true,
-        "result": {
-            "count": count,
-        }
+        "event": "order_cancelled",
+        "cl_ord_id": cl_ord_id,
+        "reason": reason,
+        "symbol": symbol,
     })
 }
 
-pub fn cancel_all_orders_after_response(req_id: u64) -> Value {
+pub fn command_ack(req_id: u64, cmd: &str) -> Value {
     json!({
-        "method": "cancel_all_orders_after",
+        "event": "command_ack",
         "req_id": req_id,
-        "success": true,
-        "result": {
-            "currentTime": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            "triggerTime": "0",
-        }
+        "cmd": cmd,
     })
 }
 
 pub fn pong_response(req_id: u64) -> Value {
     json!({
-        "method": "pong",
+        "event": "pong",
         "req_id": req_id,
     })
 }
 
-// ─── Execution reports ───
+// ─── Fill events ───
 
-pub fn exec_report(
-    exec_type: &str,
+pub fn fill_event(
     order: &Order,
     last_qty: f64,
     last_price: f64,
     fee: f64,
     is_maker: bool,
 ) -> Value {
-    let order_status = match exec_type {
-        "trade" => {
-            if order.filled_qty + last_qty >= order.qty {
-                "filled"
-            } else {
-                "partially_filled"
-            }
-        }
-        "new" | "pending_new" => "new",
-        "canceled" | "expired" => "canceled",
-        "amended" => "new",
-        _ => "new",
-    };
-
-    let liquidity = if is_maker { "m" } else { "t" };
+    let is_fully_filled = order.filled_qty + last_qty >= order.qty;
     let ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
 
-    let mut data = json!({
-        "exec_type": exec_type,
+    json!({
+        "event": "fill",
         "order_id": order.order_id,
         "cl_ord_id": order.cl_ord_id,
         "symbol": order.symbol,
         "side": order.side.to_string(),
-        "order_status": order_status,
+        "qty": last_qty,
+        "price": last_price,
+        "fee": fee,
+        "is_maker": is_maker,
         "timestamp": ts,
-        "order_type": match order.order_type {
-            crate::orders::OrderType::Limit => "limit",
-            crate::orders::OrderType::Market => "market",
-        },
-        "limit_price": order.price,
-        "order_qty": order.qty,
-        "filled_qty": order.filled_qty + last_qty,
-    });
-
-    // Add trade-specific fields only for trade exec_type
-    if exec_type == "trade" {
-        data["last_qty"] = json!(last_qty);
-        data["last_price"] = json!(last_price);
-        data["fee"] = json!(fee);
-        data["liquidity_ind"] = json!(liquidity);
-        data["fees"] = json!([{"asset": "USD", "qty": fee}]);
-    }
-
-    json!({
-        "channel": "executions",
-        "type": "update",
-        "data": [data],
+        "is_fully_filled": is_fully_filled,
     })
 }
 
 /// Heartbeat message.
 pub fn heartbeat() -> Value {
-    json!({"channel": "heartbeat"})
+    json!({"event": "heartbeat"})
 }
 
 // ─── Utility ───
@@ -321,13 +208,12 @@ mod tests {
         let book = OrderBook::new(0.004, 5.0);
         let snap = book_snapshot("CAMP/USD", &book);
 
-        // Verify structure
-        assert_eq!(snap["channel"], "book");
-        assert_eq!(snap["type"], "snapshot");
-        assert_eq!(snap["data"][0]["symbol"], "CAMP/USD");
+        // Verify new ProxyEvent structure
+        assert_eq!(snap["event"], "book_snapshot");
+        assert_eq!(snap["symbol"], "CAMP/USD");
 
-        let bids = snap["data"][0]["bids"].as_array().unwrap();
-        let asks = snap["data"][0]["asks"].as_array().unwrap();
+        let bids = snap["bids"].as_array().unwrap();
+        let asks = snap["asks"].as_array().unwrap();
         assert_eq!(bids.len(), 10);
         assert_eq!(asks.len(), 10);
 
@@ -357,8 +243,8 @@ mod tests {
         let book = OrderBook::new(0.50, 5.0);
         let snap = book_snapshot("OMG/USD", &book);
 
-        let bids = snap["data"][0]["bids"].as_array().unwrap();
-        let asks = snap["data"][0]["asks"].as_array().unwrap();
+        let bids = snap["bids"].as_array().unwrap();
+        let asks = snap["asks"].as_array().unwrap();
 
         let best_bid = bids[0]["price"].as_f64().unwrap();
         let best_ask = asks[0]["price"].as_f64().unwrap();
@@ -392,8 +278,8 @@ mod tests {
         // Parse back (as bot would)
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
-        let bids = parsed["data"][0]["bids"].as_array().unwrap();
-        let asks = parsed["data"][0]["asks"].as_array().unwrap();
+        let bids = parsed["bids"].as_array().unwrap();
+        let asks = parsed["asks"].as_array().unwrap();
 
         let best_bid = bids[0]["price"].as_f64().unwrap();
         let best_ask = asks[0]["price"].as_f64().unwrap();
@@ -430,8 +316,8 @@ mod tests {
         let book = OrderBook::new(0.004, 5.0);
         let snap = book_snapshot("CAMP/USD", &book);
 
-        let bids = snap["data"][0]["bids"].as_array().unwrap();
-        let asks = snap["data"][0]["asks"].as_array().unwrap();
+        let bids = snap["bids"].as_array().unwrap();
+        let asks = snap["asks"].as_array().unwrap();
 
         // Bids should be descending (best first)
         for i in 1..bids.len() {

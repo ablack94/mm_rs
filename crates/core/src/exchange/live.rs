@@ -2,7 +2,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -11,6 +10,7 @@ use crate::exchange::messages::*;
 use crate::exchange::ws::*;
 use crate::traits::{DeadManSwitch, ExchangeClient, OrderManager};
 use crate::types::*;
+use trading_primitives::book::LevelUpdate;
 
 /// A serialized WS write request sent through a channel.
 #[derive(Debug)]
@@ -26,9 +26,6 @@ pub struct LiveExchange {
     /// Channel to send serialized WS messages to the write loop.
     ws_write_tx: mpsc::Sender<WsRequest>,
     req_counter: Arc<Mutex<u64>>,
-    token: String,
-    /// Maps req_id → cl_ord_id so we can route rejection responses.
-    req_id_map: Arc<Mutex<HashMap<u64, String>>>,
     /// Shared writer that gets swapped on reconnect (kept alive via Arc clones in tasks).
     #[allow(dead_code)]
     shared_writer: Arc<Mutex<Option<WsWriter>>>,
@@ -41,9 +38,6 @@ impl LiveExchange {
     /// Connect to exchange via proxy: opens one private WS connection, splits it into
     /// a write loop (for orders/DMS) and a read loop (for executions/responses).
     /// The read loop automatically reconnects on disconnect with exponential backoff.
-    ///
-    /// In proxy mode, connects to the proxy's WS endpoint and uses a placeholder
-    /// token (the proxy injects the real token on the upstream side).
     pub async fn connect(
         config: Config,
         event_tx: mpsc::Sender<EngineEvent>,
@@ -51,7 +45,7 @@ impl LiveExchange {
     ) -> Result<Self> {
         // Get auth token (proxy returns placeholder, injected upstream)
         tracing::info!("Fetching WS auth token...");
-        let token = exchange.get_ws_token().await?;
+        let _token = exchange.get_ws_token().await?;
 
         // Build WS URL
         let base = config.exchange.proxy_url.trim_end_matches('/');
@@ -60,21 +54,18 @@ impl LiveExchange {
         tracing::info!(url = ws_url, "Connecting private WS...");
 
         // Initial connection + subscribe
-        let (writer, reader) = try_private_connect(&ws_url, &config.exchange.proxy_token, &token).await?;
+        let (writer, reader) = try_private_connect(&ws_url, &config.exchange.proxy_token).await?;
 
         // Shared state
         let shared_writer: Arc<Mutex<Option<WsWriter>>> = Arc::new(Mutex::new(Some(writer)));
-        let req_id_map = Arc::new(Mutex::new(HashMap::<u64, String>::new()));
 
         // Spawn reconnect loop (owns the read side lifecycle)
         let reconnect_writer = shared_writer.clone();
-        let reconnect_token = token.clone();
         let proxy_token = config.exchange.proxy_token.clone();
-        let req_id_map_read = req_id_map.clone();
 
         let reconnect_handle = tokio::spawn(async move {
             // Run initial read loop
-            run_private_read_loop(reader, &event_tx, &req_id_map_read).await;
+            run_private_read_loop(reader, &event_tx).await;
 
             // Reconnect loop: backoff → connect → subscribe → read → repeat
             loop {
@@ -97,7 +88,7 @@ impl LiveExchange {
                         return;
                     }
 
-                    match try_private_connect(&ws_url, &proxy_token, &reconnect_token).await {
+                    match try_private_connect(&ws_url, &proxy_token).await {
                         Ok(pair) => break pair,
                         Err(e) => {
                             tracing::error!(error = %e, "Private WS reconnect failed");
@@ -111,7 +102,7 @@ impl LiveExchange {
                 tracing::info!("Private WS reconnected successfully");
 
                 // Run read loop until next disconnect
-                run_private_read_loop(new_reader, &event_tx, &req_id_map_read).await;
+                run_private_read_loop(new_reader, &event_tx).await;
             }
         });
 
@@ -140,8 +131,6 @@ impl LiveExchange {
             config,
             ws_write_tx,
             req_counter: Arc::new(Mutex::new(0u64)),
-            token,
-            req_id_map,
             shared_writer,
             reconnect_handle: Mutex::new(Some(reconnect_handle)),
             write_handle: Mutex::new(Some(write_handle)),
@@ -164,8 +153,8 @@ impl LiveExchange {
         *c
     }
 
-    async fn send_json(&self, msg: &impl serde::Serialize) -> Result<()> {
-        let text = serde_json::to_string(msg)?;
+    async fn send_command(&self, cmd: &ProxyCommand) -> Result<()> {
+        let text = serde_json::to_string(cmd)?;
         tracing::debug!(msg = &text, "WS send");
         self.ws_write_tx
             .send(WsRequest::Json(text))
@@ -175,12 +164,6 @@ impl LiveExchange {
     }
 
     /// Spawn the public WS feed as a background task that sends events into the channel.
-    /// In proxy mode, connects to the proxy's public WS endpoint instead of the
-    /// default Kraken endpoint, so book data comes from the same source as orders.
-    ///
-    /// Accepts an optional `sub_rx` channel for dynamic pair subscriptions. When new
-    /// pairs arrive on this channel, the book feed subscribes to them on the existing
-    /// WS connection without reconnecting.
     pub async fn spawn_book_feed(
         &self,
         tx: mpsc::Sender<EngineEvent>,
@@ -233,23 +216,17 @@ impl LiveExchange {
 impl OrderManager for LiveExchange {
     async fn place_order(&self, request: &OrderRequest) -> Result<()> {
         let req_id = self.next_req_id().await;
-        self.req_id_map.lock().await.insert(req_id, request.cl_ord_id.clone());
-        let order_type = if request.market { "market" } else { "limit" };
-        self.send_json(&AddOrderMsg {
-            method: "add_order",
-            params: AddOrderParams {
-                order_type,
-                side: request.side.to_string(),
-                symbol: request.pair.to_string(),
-                limit_price: request.price,
-                order_qty: request.qty,
-                post_only: if request.market { false } else { request.post_only },
-                time_in_force: "gtc",
-                cl_ord_id: request.cl_ord_id.clone(),
-                token: self.token.clone(),
-            },
+        self.send_command(&ProxyCommand::PlaceOrder {
             req_id,
-            _priority: if request.urgent { Some("urgent".into()) } else { None },
+            symbol: request.pair.to_string(),
+            side: request.side.to_string(),
+            order_type: if request.market { "market".into() } else { "limit".into() },
+            price: request.price,
+            qty: request.qty,
+            cl_ord_id: request.cl_ord_id.clone(),
+            post_only: if request.market { false } else { request.post_only },
+            priority: if request.urgent { OrderPriority::Urgent } else { OrderPriority::Normal },
+            market: request.market,
         })
         .await
     }
@@ -261,45 +238,28 @@ impl OrderManager for LiveExchange {
         new_qty: Option<Decimal>,
     ) -> Result<()> {
         let req_id = self.next_req_id().await;
-        self.send_json(&AmendOrderMsg {
-            method: "amend_order",
-            params: AmendOrderParams {
-                cl_ord_id: cl_ord_id.to_string(),
-                limit_price: new_price,
-                order_qty: new_qty,
-                post_only: true,
-                token: self.token.clone(),
-            },
+        self.send_command(&ProxyCommand::AmendOrder {
             req_id,
-            _priority: None,
+            cl_ord_id: cl_ord_id.to_string(),
+            price: new_price,
+            qty: new_qty,
         })
         .await
     }
 
     async fn cancel_orders(&self, cl_ord_ids: &[String]) -> Result<()> {
         let req_id = self.next_req_id().await;
-        self.send_json(&CancelOrderMsg {
-            method: "cancel_order",
-            params: CancelOrderParams {
-                cl_ord_id: cl_ord_ids.to_vec(),
-                token: self.token.clone(),
-            },
+        self.send_command(&ProxyCommand::CancelOrders {
             req_id,
-            _priority: None,
+            cl_ord_ids: cl_ord_ids.to_vec(),
         })
         .await
     }
 
     async fn cancel_all(&self) -> Result<()> {
         let req_id = self.next_req_id().await;
-        self.send_json(&CancelAllMsg {
-            method: "cancel_all",
-            params: CancelAllParams {
-                token: self.token.clone(),
-            },
-            req_id,
-        })
-        .await
+        self.send_command(&ProxyCommand::CancelAll { req_id })
+            .await
     }
 }
 
@@ -307,13 +267,9 @@ impl OrderManager for LiveExchange {
 impl DeadManSwitch for LiveExchange {
     async fn refresh(&self, timeout_secs: u64) -> Result<()> {
         let req_id = self.next_req_id().await;
-        self.send_json(&DmsMsg {
-            method: "cancel_all_orders_after",
-            params: DmsParams {
-                timeout: timeout_secs,
-                token: self.token.clone(),
-            },
+        self.send_command(&ProxyCommand::SetDms {
             req_id,
+            timeout_secs,
         })
         .await
     }
@@ -329,146 +285,124 @@ impl DeadManSwitch for LiveExchange {
 async fn try_private_connect(
     ws_url: &str,
     proxy_token: &str,
-    exec_token: &str,
 ) -> Result<(WsWriter, WsReader)> {
     let ws = WsConnection::connect_with_token(ws_url, proxy_token).await?;
     let (mut writer, reader) = ws.into_split();
-    let sub_msg = serde_json::to_string(&SubscribeExecMsg {
-        method: "subscribe",
-        params: SubscribeExecParams {
-            channel: "executions",
-            snap_orders: true,
-            snap_trades: false,
-            ratecounter: true,
-            token: exec_token.to_string(),
-        },
-    })?;
+    let sub_cmd = ProxyCommand::Subscribe {
+        channel: "executions".into(),
+        symbols: vec![],
+        depth: None,
+    };
+    let sub_msg = serde_json::to_string(&sub_cmd)?;
     writer.send_raw(&sub_msg).await?;
     Ok((writer, reader))
 }
 
-/// Read loop for private WS: routes executions and order responses into the engine.
+/// Read loop for private WS: routes events into the engine.
 /// Returns when the WS connection closes or the event channel is dropped.
 async fn run_private_read_loop(
     mut reader: WsReader,
     event_tx: &mpsc::Sender<EngineEvent>,
-    req_id_map: &Arc<Mutex<HashMap<u64, String>>>,
 ) {
     while let Some(raw) = reader.recv().await {
-        let msg = parse_ws_message(&raw);
-        let event = match msg {
-            WsMessage::Execution(report) => {
-                match report.exec_type.as_str() {
-                    "trade" => {
-                        let side = if report.side == "buy" {
-                            OrderSide::Buy
-                        } else {
-                            OrderSide::Sell
-                        };
-                        tracing::info!(
-                            pair = %report.pair,
-                            side = report.side,
-                            price = %report.last_price,
-                            qty = %report.last_qty,
-                            order_status = report.order_status,
-                            "Execution report: trade"
-                        );
-                        Some(EngineEvent::Fill(Fill {
-                            order_id: report.order_id,
-                            cl_ord_id: report.cl_ord_id,
-                            pair: report.pair,
-                            side,
-                            price: report.last_price,
-                            qty: report.last_qty,
-                            fee: report.fee,
-                            is_maker: report.is_maker,
-                            is_fully_filled: report.order_status == "filled",
-                            timestamp: report.timestamp,
-                        }))
-                    }
-                    "filled" => {
-                        tracing::info!(
-                            cl_ord_id = report.cl_ord_id,
-                            pair = %report.pair,
-                            "Order fully filled (status update)"
-                        );
-                        None
-                    }
-                    "new" | "pending_new" => {
-                        tracing::info!(
-                            cl_ord_id = report.cl_ord_id,
-                            order_id = report.order_id,
-                            exec_type = report.exec_type,
-                            "Order acknowledged by exchange"
-                        );
-                        Some(EngineEvent::OrderAcknowledged {
-                            cl_ord_id: report.cl_ord_id,
-                            order_id: report.order_id,
-                        })
-                    }
-                    "canceled" | "expired" => {
-                        tracing::info!(
-                            cl_ord_id = report.cl_ord_id,
-                            pair = %report.pair,
-                            exec_type = report.exec_type,
-                            cancel_reason = report.cancel_reason.as_deref().unwrap_or("none"),
-                            "Order cancelled/expired"
-                        );
-                        Some(EngineEvent::OrderCancelled {
-                            cl_ord_id: report.cl_ord_id,
-                            pair: report.pair,
-                            reason: report.cancel_reason,
-                        })
-                    }
-                    other => {
-                        tracing::debug!(
-                            exec_type = other,
-                            cl_ord_id = report.cl_ord_id,
-                            "Unhandled exec_type"
-                        );
-                        None
-                    }
-                }
+        let proxy_event = match parse_proxy_event(&raw) {
+            Ok(e) => e,
+            Err(_) => {
+                tracing::debug!(raw, "Unknown private WS message");
+                continue;
             }
-            WsMessage::OrderResponse {
-                success,
-                method,
-                error,
+        };
+
+        let event = match proxy_event {
+            ProxyEvent::Fill {
+                order_id,
                 cl_ord_id,
-                req_id,
+                symbol,
+                side,
+                qty,
+                price,
+                fee,
+                is_maker,
+                timestamp,
+                is_fully_filled,
+            } => {
+                let order_side = if side == "buy" {
+                    OrderSide::Buy
+                } else {
+                    OrderSide::Sell
+                };
+                let ts = timestamp
+                    .parse()
+                    .unwrap_or_else(|_| Utc::now());
+                tracing::info!(
+                    pair = symbol,
+                    side,
+                    price = %price,
+                    qty = %qty,
+                    "Fill"
+                );
+                Some(EngineEvent::Fill(Fill {
+                    order_id,
+                    cl_ord_id,
+                    pair: trading_primitives::Ticker::from(symbol.as_str()),
+                    side: order_side,
+                    price,
+                    qty,
+                    fee,
+                    is_maker,
+                    is_fully_filled,
+                    timestamp: ts,
+                }))
+            }
+            ProxyEvent::OrderAccepted {
+                cl_ord_id,
+                order_id,
                 ..
             } => {
-                if !success {
-                    let resolved_id = match cl_ord_id {
-                        Some(id) => Some(id),
-                        None => req_id_map.lock().await.remove(&req_id),
-                    };
-                    let err_msg = error.as_deref().unwrap_or("unknown");
-                    tracing::warn!(
-                        method,
-                        req_id,
-                        cl_ord_id = resolved_id.as_deref().unwrap_or("?"),
-                        error = err_msg,
-                        "Order rejected by exchange"
-                    );
-                    resolved_id.map(|id| EngineEvent::OrderRejected {
-                        cl_ord_id: id,
-                        pair: trading_primitives::Ticker::from("UNKNOWN/UNKNOWN"),
-                        reason: err_msg.to_string(),
-                    })
-                } else {
-                    req_id_map.lock().await.remove(&req_id);
-                    tracing::debug!(method, "Order response OK");
-                    None
-                }
+                tracing::info!(cl_ord_id, order_id, "Order accepted");
+                Some(EngineEvent::OrderAcknowledged {
+                    cl_ord_id,
+                    order_id,
+                })
             }
-            WsMessage::SubscribeConfirmed { channel } => {
+            ProxyEvent::OrderCancelled {
+                cl_ord_id,
+                reason,
+                symbol,
+            } => {
+                tracing::info!(cl_ord_id, reason = reason.as_deref().unwrap_or("none"), "Order cancelled");
+                let pair = symbol
+                    .map(|s| trading_primitives::Ticker::from(s.as_str()))
+                    .unwrap_or_else(|| trading_primitives::Ticker::from("UNKNOWN/UNKNOWN"));
+                Some(EngineEvent::OrderCancelled {
+                    cl_ord_id,
+                    pair,
+                    reason,
+                })
+            }
+            ProxyEvent::OrderRejected {
+                cl_ord_id,
+                error,
+                symbol,
+                ..
+            } => {
+                tracing::warn!(cl_ord_id, error, "Order rejected");
+                let pair = symbol
+                    .map(|s| trading_primitives::Ticker::from(s.as_str()))
+                    .unwrap_or_else(|| trading_primitives::Ticker::from("UNKNOWN/UNKNOWN"));
+                Some(EngineEvent::OrderRejected {
+                    cl_ord_id,
+                    pair,
+                    reason: error,
+                })
+            }
+            ProxyEvent::Subscribed { channel } => {
                 tracing::info!(channel, "Private subscription confirmed");
                 None
             }
-            WsMessage::Heartbeat | WsMessage::Pong => None,
-            WsMessage::ExecutionSnapshot(_) => {
-                tracing::info!("Ignoring execution snapshot (positions loaded from state)");
+            ProxyEvent::Heartbeat | ProxyEvent::Pong { .. } => None,
+            ProxyEvent::CommandAck { cmd, .. } => {
+                tracing::debug!(cmd, "Command acknowledged");
                 None
             }
             _ => None,
@@ -498,45 +432,39 @@ async fn run_book_feed_dynamic(
 
     // Subscribe to initial pairs
     if !pairs.is_empty() {
-        let sub_msg = serde_json::to_string(&SubscribeBookMsg {
-            method: "subscribe",
-            params: SubscribeBookParams {
-                channel: "book",
-                symbol: pairs.to_vec(),
-                depth,
-            },
-        })?;
+        let sub_cmd = ProxyCommand::Subscribe {
+            channel: "book".into(),
+            symbols: pairs.to_vec(),
+            depth: Some(depth),
+        };
+        let sub_msg = serde_json::to_string(&sub_cmd)?;
         writer.send_raw(&sub_msg).await?;
     }
 
     let mut sub_rx = sub_rx;
     loop {
-        // If we have a subscription channel, select on both WS and channel.
-        // Otherwise, just read WS.
         let ws_msg = if let Some(ref mut rx) = sub_rx {
             tokio::select! {
                 raw = reader.recv() => {
                     match raw {
                         Some(text) => Some(text),
-                        None => break, // WS closed
+                        None => break,
                     }
                 }
                 new_pairs = rx.recv() => {
                     if let Some(new_pairs) = new_pairs {
                         if !new_pairs.is_empty() {
                             tracing::info!(?new_pairs, "Subscribing to new pairs dynamically");
-                            let sub_msg = serde_json::to_string(&SubscribeBookMsg {
-                                method: "subscribe",
-                                params: SubscribeBookParams {
-                                    channel: "book",
-                                    symbol: new_pairs,
-                                    depth,
-                                },
-                            })?;
+                            let sub_cmd = ProxyCommand::Subscribe {
+                                channel: "book".into(),
+                                symbols: new_pairs,
+                                depth: Some(depth),
+                            };
+                            let sub_msg = serde_json::to_string(&sub_cmd)?;
                             writer.send_raw(&sub_msg).await?;
                         }
                     }
-                    continue; // Go back to select
+                    continue;
                 }
             }
         } else {
@@ -547,41 +475,38 @@ async fn run_book_feed_dynamic(
         };
 
         if let Some(raw) = ws_msg {
-            let msg = parse_ws_message(&raw);
-            match msg {
-                WsMessage::BookSnapshot {
-                    pair,
-                    bids,
-                    asks,
-                } => {
+            let proxy_event = match parse_proxy_event(&raw) {
+                Ok(e) => e,
+                Err(_) => {
+                    tracing::debug!(raw, "Unknown public WS message");
+                    continue;
+                }
+            };
+            match proxy_event {
+                ProxyEvent::BookSnapshot { symbol, bids, asks } => {
+                    let pair = trading_primitives::Ticker::from(symbol.as_str());
                     tx.send(EngineEvent::BookSnapshot {
                         pair,
-                        bids,
-                        asks,
+                        bids: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                        asks: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
                         timestamp: Utc::now(),
                     })
                     .await?;
                 }
-                WsMessage::BookUpdate {
-                    pair,
-                    bid_updates,
-                    ask_updates,
-                } => {
+                ProxyEvent::BookUpdate { symbol, bids, asks } => {
+                    let pair = trading_primitives::Ticker::from(symbol.as_str());
                     tx.send(EngineEvent::BookUpdate {
                         pair,
-                        bid_updates,
-                        ask_updates,
+                        bid_updates: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                        ask_updates: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
                         timestamp: Utc::now(),
                     })
                     .await?;
                 }
-                WsMessage::SubscribeConfirmed { channel } => {
+                ProxyEvent::Subscribed { channel } => {
                     tracing::info!(channel, "Subscription confirmed");
                 }
-                WsMessage::Heartbeat | WsMessage::Pong => {}
-                WsMessage::Unknown(raw) => {
-                    tracing::debug!(raw, "Unknown public message");
-                }
+                ProxyEvent::Heartbeat | ProxyEvent::Pong { .. } => {}
                 _ => {}
             }
         }

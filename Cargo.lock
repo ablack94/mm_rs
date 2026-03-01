@@ -514,6 +514,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "exchange-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "trading-primitives",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1020,6 +1034,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "exchange-api",
  "futures",
  "hmac",
  "reqwest",
@@ -1043,11 +1058,13 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "exchange-api",
  "kraken-core",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "trading-primitives",
 ]
 
 [[package]]
@@ -1256,6 +1273,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "exchange-api",
  "kraken-core",
  "reqwest",
  "rust_decimal",
@@ -1323,11 +1341,13 @@ dependencies = [
  "base64",
  "clap",
  "ed25519-dalek",
+ "exchange-api",
  "futures",
  "hmac",
  "proxy-common",
  "rand 0.8.5",
  "reqwest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2",
@@ -1346,6 +1366,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "exchange-api",
  "futures",
  "reqwest",
  "serde",
@@ -1363,6 +1384,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "exchange-api",
  "futures",
  "hmac",
  "proxy-common",
@@ -2334,7 +2356,6 @@ name = "trading-primitives"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "chrono",
  "rust_decimal",
  "rust_decimal_macros",

@@ -44,7 +44,9 @@ pub fn build_kraken_rest_router(state: Arc<KrakenRestState>) -> Router {
 }
 
 async fn capabilities() -> (StatusCode, Json<Value>) {
-    (StatusCode::OK, Json(json!({})))
+    (StatusCode::OK, Json(json!({
+        "dead_man_switch": true,
+    })))
 }
 
 async fn health() -> (StatusCode, Json<Value>) {

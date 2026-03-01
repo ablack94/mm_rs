@@ -8,7 +8,6 @@ use tokio::time::{Duration, Instant};
 
 use kraken_core::exchange::ws::*;
 
-
 #[derive(Parser)]
 #[command(name = "recorder", about = "Record Kraken WS data for replay testing")]
 struct Args {
@@ -59,7 +58,16 @@ async fn main() -> Result<()> {
     let mut ws = WsConnection::connect("wss://ws.kraken.com/v2").await?;
     tracing::info!("Connected to public WS");
 
-    subscribe_book(&mut ws, &args.pairs, args.depth).await?;
+    // Send Kraken-native subscribe message (recorder talks directly to Kraken, not via proxy)
+    let sub = serde_json::json!({
+        "method": "subscribe",
+        "params": {
+            "channel": "book",
+            "symbol": args.pairs,
+            "depth": args.depth,
+        }
+    });
+    ws.send_json(&sub).await?;
     tracing::info!("Subscribed to book for {} pairs", args.pairs.len());
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
