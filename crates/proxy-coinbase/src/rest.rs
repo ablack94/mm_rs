@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -10,6 +11,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::auth::build_jwt;
+use crate::state::ProxyOrderState;
 use proxy_common::auth::check_auth;
 
 /// Shared state for the Coinbase REST proxy.
@@ -23,6 +25,8 @@ pub struct CoinbaseRestState {
     pub maker_fee_pct: f64,
     /// Taker fee percentage. Configurable via COINBASE_TAKER_FEE env.
     pub taker_fee_pct: f64,
+    /// Shared order/fill/position tracking state.
+    pub order_state: Arc<ProxyOrderState>,
 }
 
 pub fn build_coinbase_rest_router(state: Arc<CoinbaseRestState>) -> Router {
@@ -34,6 +38,11 @@ pub fn build_coinbase_rest_router(state: Arc<CoinbaseRestState>) -> Router {
         .route("/0/private/GetWebSocketsToken", post(handle_ws_token))
         .route("/0/private/OpenOrders", post(handle_open_orders))
         .route("/0/private/TradesHistory", post(handle_trades_history))
+        .route("/0/public/Depth", get(handle_depth))
+        // Proxy state endpoints
+        .route("/positions", get(handle_positions))
+        .route("/orders", get(handle_orders))
+        .route("/fills", get(handle_fills))
         // Capabilities & health
         .route("/capabilities", get(capabilities))
         .route("/health", get(health))
@@ -332,9 +341,17 @@ async fn handle_asset_pairs(
     }
 }
 
-/// GET /0/public/Ticker → GET /api/v3/brokerage/best_bid_ask
+/// Volume data extracted from the products endpoint.
+struct ProductInfo {
+    volume_24h: String,
+    price: String,
+    open_price: String,
+}
+
+/// GET /0/public/Ticker → GET /api/v3/brokerage/best_bid_ask + /api/v3/brokerage/products
 ///
 /// Translates to Kraken ticker format. The bot uses: a (ask), b (bid), c (last).
+/// Fetches bid/ask from best_bid_ask and volume/price from products concurrently.
 async fn handle_ticker(
     headers: HeaderMap,
     State(state): State<Arc<CoinbaseRestState>>,
@@ -345,23 +362,93 @@ async fn handle_ticker(
     }
 
     let query = uri.query().unwrap_or("");
-    let pair = query
+    let pair_raw = query
         .split('&')
         .find(|p| p.starts_with("pair="))
         .map(|p| p.trim_start_matches("pair="))
         .unwrap_or("");
+    // Decode URL-encoded commas (%2C) so we can split product IDs
+    let pair = pair_raw.replace("%2C", ",").replace("%2c", ",");
 
-    // Coinbase uses product_ids parameter
-    let path = if pair.is_empty() {
+    // Build paths for both endpoints
+    let bba_path = if pair.is_empty() {
         "/api/v3/brokerage/best_bid_ask".to_string()
     } else {
-        format!(
-            "/api/v3/brokerage/best_bid_ask?product_ids={}",
-            pair
-        )
+        let ids: String = pair
+            .split(',')
+            .map(|id| format!("product_ids={id}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("/api/v3/brokerage/best_bid_ask?{ids}")
     };
 
-    match coinbase_get(&state, &path).await {
+    let products_path = if pair.is_empty() {
+        "/api/v3/brokerage/products?product_type=SPOT&limit=250".to_string()
+    } else {
+        let ids: String = pair
+            .split(',')
+            .map(|id| format!("product_ids={id}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("/api/v3/brokerage/products?{ids}")
+    };
+
+    // Fetch bid/ask and volume data concurrently
+    let (bba_result, products_result) = tokio::join!(
+        coinbase_get(&state, &bba_path),
+        coinbase_get(&state, &products_path),
+    );
+
+    // Parse volume data from products response (graceful fallback on failure)
+    let volume_map: HashMap<String, ProductInfo> = match products_result {
+        Ok(data) => {
+            let mut map = HashMap::new();
+            if let Some(products) = data.get("products").and_then(|p| p.as_array()) {
+                for product in products {
+                    let product_id = product
+                        .get("product_id")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    if product_id.is_empty() {
+                        continue;
+                    }
+                    let volume_24h = product
+                        .get("volume_24h")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0")
+                        .to_string();
+                    let price = product
+                        .get("price")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("0")
+                        .to_string();
+                    let pct_change: f64 = product
+                        .get("price_percentage_change_24h")
+                        .and_then(|p| p.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    let price_f64: f64 = price.parse().unwrap_or(0.0);
+                    let open_price = if pct_change.abs() > f64::EPSILON && price_f64 > 0.0 {
+                        format!("{}", price_f64 / (1.0 + pct_change / 100.0))
+                    } else {
+                        price.clone()
+                    };
+                    map.insert(product_id.to_string(), ProductInfo {
+                        volume_24h,
+                        price,
+                        open_price,
+                    });
+                }
+            }
+            map
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e.1, "Failed to fetch products for volume data, using zeros");
+            HashMap::new()
+        }
+    };
+
+    match bba_result {
         Ok(data) => {
             let mut result = serde_json::Map::new();
             if let Some(pricebooks) = data.get("pricebooks").and_then(|p| p.as_array()) {
@@ -385,19 +472,31 @@ async fn handle_ticker(
                         .and_then(|p| p.as_str())
                         .unwrap_or("0");
 
-                    // Kraken ticker format: a=[ask_price, ...], b=[bid_price, ...], c=[last_price, ...]
-                    let mid: f64 = (best_bid.parse::<f64>().unwrap_or(0.0)
-                        + best_ask.parse::<f64>().unwrap_or(0.0))
-                        / 2.0;
+                    // Use product info for volume, price, and open; fall back to computed mid
+                    let (volume, close, open) = match volume_map.get(product_id) {
+                        Some(info) if info.price != "0" => (
+                            info.volume_24h.clone(),
+                            info.price.clone(),
+                            info.open_price.clone(),
+                        ),
+                        _ => {
+                            let mid = (best_bid.parse::<f64>().unwrap_or(0.0)
+                                + best_ask.parse::<f64>().unwrap_or(0.0))
+                                / 2.0;
+                            let mid_str = mid.to_string();
+                            ("0".to_string(), mid_str.clone(), mid_str)
+                        }
+                    };
 
                     result.insert(
                         product_id.to_string(),
                         json!({
                             "a": [best_ask, "0", "0"],
                             "b": [best_bid, "0", "0"],
-                            "c": [mid.to_string(), "0"],
-                            "o": mid.to_string(),
-                            "v": ["0", "0"]
+                            "c": [close, "0"],
+                            "o": open,
+                            "v": [&volume, &volume],
+                            "t": [0, 0]
                         }),
                     );
                 }
@@ -406,6 +505,133 @@ async fn handle_ticker(
         }
         Err(e) => e,
     }
+}
+
+/// GET /0/public/Depth → GET /api/v3/brokerage/market/product_book
+///
+/// Returns order book depth for a given pair. Translates to Kraken Depth format:
+/// { "error": [], "result": { "PAIR": { "asks": [[price, volume, timestamp], ...], "bids": [...] } } }
+async fn handle_depth(
+    headers: HeaderMap,
+    State(state): State<Arc<CoinbaseRestState>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> (StatusCode, Json<Value>) {
+    if let Err(e) = check_auth(&headers, &state.proxy_token) {
+        return e;
+    }
+
+    let query = uri.query().unwrap_or("");
+    let pair = query
+        .split('&')
+        .find(|p| p.starts_with("pair="))
+        .map(|p| p.trim_start_matches("pair="))
+        .unwrap_or("");
+    let count: u32 = query
+        .split('&')
+        .find(|p| p.starts_with("count="))
+        .map(|p| p.trim_start_matches("count="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
+
+    if pair.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": ["pair parameter required"]})),
+        );
+    }
+
+    // Coinbase uses public endpoint (no auth needed), but coinbase_get adds auth which is fine
+    let path = format!(
+        "/api/v3/brokerage/market/product_book?product_id={}&limit={}",
+        pair, count
+    );
+
+    // Use a direct GET since this is a public endpoint
+    let url = format!("{}{}", state.coinbase_base_url, path);
+    let resp = match state.client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "Coinbase product_book request failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": [e.to_string()]})),
+            );
+        }
+    };
+
+    let status = resp.status();
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": [e.to_string()]})),
+            );
+        }
+    };
+
+    if !status.is_success() {
+        tracing::warn!(%status, %body, "Coinbase product_book error");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": [format!("Coinbase returned {status}: {body}")]})),
+        );
+    }
+
+    let data: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": [format!("Invalid JSON: {e}")]})),
+            );
+        }
+    };
+
+    // Translate Coinbase format to Kraken Depth format
+    let pricebook = &data["pricebook"];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let bids: Vec<Value> = pricebook["bids"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|level| {
+                    json!([
+                        level["price"].as_str().unwrap_or("0"),
+                        level["size"].as_str().unwrap_or("0"),
+                        now
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let asks: Vec<Value> = pricebook["asks"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|level| {
+                    json!([
+                        level["price"].as_str().unwrap_or("0"),
+                        level["size"].as_str().unwrap_or("0"),
+                        now
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut result = serde_json::Map::new();
+    result.insert(
+        pair.to_string(),
+        json!({ "asks": asks, "bids": bids }),
+    );
+
+    (StatusCode::OK, Json(json!({"error": [], "result": result})))
 }
 
 /// POST /0/private/GetWebSocketsToken
@@ -517,6 +743,87 @@ async fn handle_trades_history(
         }
         Err(e) => e,
     }
+}
+
+/// GET /positions — proxy-tracked positions with avg_cost and realized_pnl.
+async fn handle_positions(
+    headers: HeaderMap,
+    State(state): State<Arc<CoinbaseRestState>>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(e) = check_auth(&headers, &state.proxy_token) {
+        return e;
+    }
+
+    let positions = state.order_state.positions.lock().await;
+    let mut result = serde_json::Map::new();
+    for (pair, pos) in positions.all_positions() {
+        result.insert(pair.clone(), json!({
+            "qty": pos.qty,
+            "avg_cost": pos.avg_cost,
+            "realized_pnl": pos.realized_pnl,
+        }));
+    }
+    (StatusCode::OK, Json(json!({"positions": result})))
+}
+
+/// GET /orders — all tracked orders.
+async fn handle_orders(
+    headers: HeaderMap,
+    State(state): State<Arc<CoinbaseRestState>>,
+) -> (StatusCode, Json<Value>) {
+    if let Err(e) = check_auth(&headers, &state.proxy_token) {
+        return e;
+    }
+
+    let orders = state.order_state.orders.lock().await;
+    let order_list: Vec<Value> = orders.all_orders().iter().map(|o| {
+        json!({
+            "cl_ord_id": o.cl_ord_id,
+            "exchange_id": o.exchange_id,
+            "pair": o.pair,
+            "side": o.side,
+            "price": o.price,
+            "qty": o.original_qty,
+            "filled_qty": o.filled_qty,
+            "status": o.status,
+        })
+    }).collect();
+    (StatusCode::OK, Json(json!({"orders": order_list})))
+}
+
+/// GET /fills?limit=N — recent fill records.
+async fn handle_fills(
+    headers: HeaderMap,
+    State(state): State<Arc<CoinbaseRestState>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> (StatusCode, Json<Value>) {
+    if let Err(e) = check_auth(&headers, &state.proxy_token) {
+        return e;
+    }
+
+    let query = uri.query().unwrap_or("");
+    let limit: usize = query
+        .split('&')
+        .find(|p| p.starts_with("limit="))
+        .map(|p| p.trim_start_matches("limit="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    let fills = state.order_state.fills.lock().await;
+    let fill_list: Vec<Value> = fills.recent(limit).iter().map(|f| {
+        json!({
+            "fill_id": f.fill_id,
+            "cl_ord_id": f.cl_ord_id,
+            "pair": f.pair,
+            "side": f.side,
+            "price": f.price,
+            "qty": f.qty,
+            "fee": f.fee,
+            "timestamp": f.timestamp,
+            "source": f.source,
+        })
+    }).collect();
+    (StatusCode::OK, Json(json!({"fills": fill_list})))
 }
 
 /// Count decimal places in a string like "0.01" → 2, "0.00000001" → 8

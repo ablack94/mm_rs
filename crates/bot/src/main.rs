@@ -95,8 +95,9 @@ async fn main() -> Result<()> {
         config.exchange.proxy_url.clone(),
         config.exchange.proxy_token.clone(),
     );
+    let proxy_client = Arc::new(proxy_client);
 
-    let exchange: Arc<dyn ExchangeClient> = Arc::new(proxy_client);
+    let exchange: Arc<dyn ExchangeClient> = proxy_client.clone();
 
     // Fetch pair info for state store pairs (skip if empty — pairs will be fetched dynamically)
     let pair_info = if pairs.is_empty() {
@@ -127,16 +128,27 @@ async fn main() -> Result<()> {
     });
     engine.handle_event(snapshot_event);
 
-    // Restore positions from Kraken balances.
-    // This ensures the bot knows about existing positions (e.g., from a previous session)
-    // and overrides Disabled → WindDown for pairs with open positions.
+    // Restore positions: try proxy-tracked positions first (preserves avg_cost),
+    // fall back to raw exchange balances (loses avg_cost).
     if !pairs.is_empty() {
-        match exchange.get_balances().await {
-            Ok(balances) => {
-                engine.restore_balances(&balances);
+        match proxy_client.get_proxy_positions().await {
+            Ok(positions) if !positions.is_empty() => {
+                tracing::info!(count = positions.len(), "Restoring positions from proxy");
+                engine.restore_positions_from_proxy(&positions);
+            }
+            Ok(_) => {
+                tracing::info!("No proxy positions — falling back to exchange balances");
+                match exchange.get_balances().await {
+                    Ok(balances) => engine.restore_balances(&balances),
+                    Err(e) => tracing::warn!(error = %e, "Failed to fetch balances — positions may be stale"),
+                }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to fetch balances — positions may be stale");
+                tracing::info!(error = %e, "Proxy /positions not available — falling back to exchange balances");
+                match exchange.get_balances().await {
+                    Ok(balances) => engine.restore_balances(&balances),
+                    Err(e) => tracing::warn!(error = %e, "Failed to fetch balances — positions may be stale"),
+                }
             }
         }
     }

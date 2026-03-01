@@ -175,6 +175,53 @@ impl Engine {
         }
     }
 
+    /// Restore positions from proxy-tracked positions.
+    /// Unlike restore_balances, this preserves avg_cost.
+    /// Pairs are keyed by internal symbol (e.g., "BTC/USDC").
+    pub fn restore_positions_from_proxy(
+        &mut self,
+        proxy_positions: &HashMap<String, (Decimal, Decimal, Decimal)>, // pair → (qty, avg_cost, realized_pnl)
+    ) {
+        for (pair_str, &(qty, avg_cost, _realized_pnl)) in proxy_positions {
+            if qty.is_zero() {
+                continue;
+            }
+            let pair: Ticker = match pair_str.parse() {
+                Ok(t) => t,
+                Err(_) => {
+                    tracing::warn!(pair = pair_str, "Failed to parse proxy position pair — skipping");
+                    continue;
+                }
+            };
+            let position = self.state.positions.entry(pair.clone()).or_default();
+            if position.qty.is_zero() {
+                position.qty = qty;
+                position.avg_cost = avg_cost;
+                tracing::info!(
+                    pair = %pair,
+                    qty = %qty,
+                    avg_cost = %avg_cost,
+                    "Restored position from proxy"
+                );
+            }
+
+            // If this pair is Disabled but has a position, override to WindDown
+            if let Some(mp) = self.pairs.get_mut(&pair) {
+                if mp.state == PairState::Disabled {
+                    let is_dust = mp.pair_info.as_ref().map_or(false, |pi| qty < pi.min_order_qty);
+                    if !is_dust {
+                        tracing::warn!(
+                            pair = %pair,
+                            qty = %qty,
+                            "Pair is Disabled but holds position — overriding to WindDown"
+                        );
+                        mp.state = PairState::WindDown;
+                    }
+                }
+            }
+        }
+    }
+
     /// Mark pairs as sell-only (downtrend filter). No new buys will be placed.
     /// Sets their state to WindDown if currently Active.
     pub fn set_sell_only(&mut self, pair_symbols: std::collections::HashSet<Ticker>) {

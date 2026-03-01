@@ -61,6 +61,33 @@ impl ProxyClient {
 
         Ok(resp)
     }
+
+    /// Query proxy-tracked positions (qty, avg_cost, realized_pnl).
+    /// Returns pair → (qty, avg_cost, realized_pnl) or an error if the proxy
+    /// doesn't support this endpoint (e.g., Kraken proxy).
+    pub async fn get_proxy_positions(&self) -> Result<HashMap<String, (Decimal, Decimal, Decimal)>> {
+        let resp = self.proxy_get("/positions").await?;
+        let positions = resp.get("positions").and_then(|p| p.as_object())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'positions' field in proxy response"))?;
+
+        let mut result = HashMap::new();
+        for (pair, data) in positions {
+            let qty: Decimal = data.get("qty")
+                .and_then(|v| v.as_f64())
+                .map(|f| Decimal::try_from(f).unwrap_or_default())
+                .unwrap_or_default();
+            let avg_cost: Decimal = data.get("avg_cost")
+                .and_then(|v| v.as_f64())
+                .map(|f| Decimal::try_from(f).unwrap_or_default())
+                .unwrap_or_default();
+            let realized_pnl: Decimal = data.get("realized_pnl")
+                .and_then(|v| v.as_f64())
+                .map(|f| Decimal::try_from(f).unwrap_or_default())
+                .unwrap_or_default();
+            result.insert(pair.clone(), (qty, avg_cost, realized_pnl));
+        }
+        Ok(result)
+    }
 }
 
 #[async_trait]

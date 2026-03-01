@@ -1,6 +1,7 @@
 mod auth;
 mod pairs;
 mod rest;
+mod state;
 mod translate;
 mod ws;
 
@@ -19,6 +20,7 @@ use proxy_common::auth::check_ws_auth;
 use proxy_common::rate_limit::TokenBucketConfig;
 
 use crate::rest::{CoinbaseRestState, build_coinbase_rest_router};
+use crate::state::ProxyOrderState;
 use crate::ws::{CoinbaseWsState, handle_coinbase_private_ws, handle_coinbase_public_ws};
 
 #[derive(Parser)]
@@ -63,6 +65,9 @@ async fn main() -> Result<()> {
 
     tracing::info!(maker_fee_pct, taker_fee_pct, "Fee config");
 
+    // Shared order/fill/position tracking state
+    let order_state = ProxyOrderState::new();
+
     // REST proxy state
     let rest_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -76,6 +81,7 @@ async fn main() -> Result<()> {
         client: rest_client,
         maker_fee_pct,
         taker_fee_pct,
+        order_state: order_state.clone(),
     });
 
     // Rate limit config
@@ -104,6 +110,7 @@ async fn main() -> Result<()> {
         api_secret,
         coinbase_base_url,
         rate_limit_config,
+        order_state,
     ));
 
     // Build combined router

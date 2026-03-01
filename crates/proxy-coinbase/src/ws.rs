@@ -12,10 +12,25 @@ use crate::translate;
 
 /// Type alias for the bot's write half.
 type BotWriter = SplitSink<WebSocket, ws::Message>;
+
+/// Tracks exchange order_id and current size for each cl_ord_id.
+/// Coinbase requires `size` on every edit, even price-only amends.
+#[derive(Clone, Debug)]
+struct OrderInfo {
+    exchange_id: String,
+    size: String,
+}
+
+type OrderIdMap = std::collections::HashMap<String, OrderInfo>;
 use proxy_common::rate_limit::{TokenBucket, TokenBucketConfig};
 
 const COINBASE_MARKET_WS: &str = "wss://advanced-trade-ws.coinbase.com";
 const COINBASE_USER_WS: &str = "wss://advanced-trade-ws-user.coinbase.com";
+
+use crate::state::ProxyOrderState;
+use proxy_common::order_tracking::{
+    TrackedOrder as ProxyTrackedOrder, OrderStatus, FillRecord, FillSource,
+};
 
 /// State for Coinbase WS proxy.
 pub struct CoinbaseWsState {
@@ -25,6 +40,8 @@ pub struct CoinbaseWsState {
     /// Shared rate limiter.
     rate_limiter: Mutex<TokenBucket>,
     client: reqwest::Client,
+    /// Shared order/fill/position tracking state.
+    pub order_state: Arc<ProxyOrderState>,
 }
 
 impl CoinbaseWsState {
@@ -33,6 +50,7 @@ impl CoinbaseWsState {
         api_secret: String,
         coinbase_base_url: String,
         rate_limit_config: TokenBucketConfig,
+        order_state: Arc<ProxyOrderState>,
     ) -> Self {
         Self {
             api_key,
@@ -43,6 +61,7 @@ impl CoinbaseWsState {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("Failed to build HTTP client"),
+            order_state,
         }
     }
 
@@ -53,6 +72,32 @@ impl CoinbaseWsState {
             .or_else(|| self.coinbase_base_url.strip_prefix("http://"))
             .unwrap_or(&self.coinbase_base_url)
             .trim_end_matches('/')
+    }
+
+    /// Make an authenticated GET request to Coinbase REST API.
+    async fn rest_get(&self, path: &str) -> Result<serde_json::Value> {
+        let host = self.api_host();
+        let jwt = build_jwt(&self.api_key, &self.api_secret, "GET", host, path)
+            .map_err(|e| anyhow::anyhow!("JWT build error: {}", e))?;
+
+        let url = format!("{}{}", self.coinbase_base_url, path);
+        let resp = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", jwt))
+            .header("Content-Type", "application/json")
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let resp_body = resp.text().await?;
+
+        if !status.is_success() {
+            tracing::error!(path, %status, body = &resp_body[..resp_body.len().min(300)], "Coinbase REST GET error");
+            anyhow::bail!("Coinbase {} {}: {}", status, path, &resp_body[..resp_body.len().min(200)]);
+        }
+
+        let data: serde_json::Value = serde_json::from_str(&resp_body)?;
+        Ok(data)
     }
 
     /// Make an authenticated POST request to Coinbase REST API.
@@ -140,10 +185,9 @@ async fn run_private_ws_proxy(
     .to_string();
     coinbase_write.send(Message::Text(heartbeat_sub.into())).await?;
 
-    // Track cl_ord_id → Coinbase order_id mapping for amend/cancel operations.
+    // Track cl_ord_id → (exchange order_id, size) for amend/cancel operations.
     // Coinbase REST returns exchange order_ids, but the bot sends cl_ord_ids.
-    let order_id_map: Arc<Mutex<std::collections::HashMap<String, String>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let order_id_map: Arc<Mutex<OrderIdMap>> = Arc::new(Mutex::new(OrderIdMap::new()));
 
     // DMS timer handle — spawned on cancel_all_orders_after, aborted on reset/disconnect
     let dms_timer: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
@@ -154,6 +198,7 @@ async fn run_private_ws_proxy(
     let subscribed_for_orders = subscribed.clone();
     let order_id_map_for_orders = order_id_map.clone();
     let dms_timer_for_orders = dms_timer.clone();
+    let order_state_for_orders = state.order_state.clone();
     let coinbase_write = Arc::new(Mutex::new(coinbase_write));
     let coinbase_write_for_sub = coinbase_write.clone();
 
@@ -238,16 +283,16 @@ async fn run_private_ws_proxy(
                             let _ = writer.send(ws::Message::Text(pong.into())).await;
                         }
                         "add_order" => {
-                            handle_add_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
+                            handle_add_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
                         }
                         "amend_order" => {
-                            handle_amend_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
+                            handle_amend_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
                         }
                         "cancel_order" => {
-                            handle_cancel_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
+                            handle_cancel_order(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
                         }
                         "cancel_all" => {
-                            handle_cancel_all(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders).await;
+                            handle_cancel_all(&parsed, &state_for_orders, &bot_write_for_orders, &order_id_map_for_orders, &order_state_for_orders).await;
                         }
                         "cancel_all_orders_after" => {
                             let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
@@ -269,11 +314,12 @@ async fn run_private_ws_proxy(
                             if timeout_secs > 0 {
                                 let state_for_dms = state_for_orders.clone();
                                 let order_id_map_for_dms = order_id_map_for_orders.clone();
+                                let order_state_for_dms = order_state_for_orders.clone();
                                 let dms_timer_ref = dms_timer_for_orders.clone();
                                 let handle = tokio::spawn(async move {
                                     tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
                                     tracing::warn!(timeout_secs, "DMS timer expired — cancelling all orders");
-                                    cancel_all_orders(&state_for_dms, &order_id_map_for_dms).await;
+                                    cancel_all_orders(&state_for_dms, &order_id_map_for_dms, &order_state_for_dms).await;
                                     // Clear self from the handle slot
                                     *dms_timer_ref.lock().await = None;
                                 });
@@ -303,6 +349,7 @@ async fn run_private_ws_proxy(
     // Coinbase user WS -> Bot: translate events to Kraken execution format
     let bot_write_for_upstream = bot_write.clone();
     let order_id_map_for_cleanup = order_id_map.clone();
+    let order_state_for_upstream = state.order_state.clone();
     let coinbase_to_bot = tokio::spawn(async move {
         let mut fill_tracker = translate::FillTracker::new();
         let mut coinbase_read = coinbase_read;
@@ -323,10 +370,19 @@ async fn run_private_ws_proxy(
 
                         match channel {
                             "user" => {
-                                cleanup_terminal_orders(&parsed, &order_id_map_for_cleanup).await;
+                                let msg_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                                tracing::debug!(msg_type, "Received Coinbase user WS event");
+
+                                cleanup_terminal_orders(&parsed, &order_id_map_for_cleanup, &order_state_for_upstream).await;
+
+                                // Extract and record fills in order tracking state
+                                record_ws_fills(&parsed, &order_state_for_upstream).await;
 
                                 let kraken_msgs =
                                     translate::coinbase_user_to_kraken(&parsed, &mut fill_tracker);
+                                if !kraken_msgs.is_empty() {
+                                    tracing::info!(count = kraken_msgs.len(), msg_type, "Forwarding user events to bot");
+                                }
                                 let mut writer = bot_write_for_upstream.lock().await;
                                 for msg in kraken_msgs {
                                     if writer.send(ws::Message::Text(msg.into())).await.is_err() {
@@ -411,11 +467,40 @@ async fn run_private_ws_proxy(
         }
     });
 
+    // Fill reconciliation task — polls recent fills to catch any missed by WS
+    let state_for_fills = state.clone();
+    let bot_write_for_fills = bot_write.clone();
+    let order_id_map_for_fills = order_id_map.clone();
+    let order_state_for_fills = state.order_state.clone();
+    let fill_reconciler = tokio::spawn(async move {
+        let mut seen_trade_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Wait for subscriptions to be established before polling
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        tracing::info!("Fill reconciler started, polling every 10s");
+        loop {
+            interval.tick().await;
+            let tracked = order_id_map_for_fills.lock().await.len();
+            tracing::debug!(tracked_orders = tracked, seen_fills = seen_trade_ids.len(), "Fill reconciler polling");
+            if let Err(e) = reconcile_fills(
+                &state_for_fills,
+                &bot_write_for_fills,
+                &order_id_map_for_fills,
+                &mut seen_trade_ids,
+                &order_state_for_fills,
+            ).await {
+                tracing::warn!(error = %e, "Fill reconciliation poll failed");
+            }
+        }
+    });
+
     // Only exit when the bot disconnects; coinbase_to_bot handles reconnection internally
     let _ = bot_to_coinbase.await;
     tracing::info!("Coinbase private WS proxy: bot disconnected");
     coinbase_to_bot.abort();
     heartbeat_handle.abort();
+    fill_reconciler.abort();
     // Abort DMS timer on disconnect
     if let Some(handle) = dms_timer.lock().await.take() {
         handle.abort();
@@ -428,7 +513,8 @@ async fn handle_add_order(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
-    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+    order_state: &Arc<ProxyOrderState>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
     let params = match parsed.get("params") {
@@ -481,9 +567,24 @@ async fn handle_add_order(
                     .and_then(|id| id.as_str())
                     .unwrap_or("");
 
-                // Store cl_ord_id → exchange order_id mapping for amend/cancel
+                // Store cl_ord_id → (exchange order_id, size) for amend/cancel
                 if !order_id.is_empty() {
-                    order_id_map.lock().await.insert(cl_ord_id.to_string(), order_id.to_string());
+                    order_id_map.lock().await.insert(cl_ord_id.to_string(), OrderInfo {
+                        exchange_id: order_id.to_string(),
+                        size: format!("{}", order_qty),
+                    });
+
+                    // Register in order tracking state
+                    order_state.orders.lock().await.insert(ProxyTrackedOrder {
+                        cl_ord_id: cl_ord_id.to_string(),
+                        exchange_id: order_id.to_string(),
+                        pair: pairs::to_internal(&product_id),
+                        side: side.to_string(),
+                        price: limit_price,
+                        original_qty: order_qty,
+                        filled_qty: 0.0,
+                        status: OrderStatus::Pending,
+                    });
                 }
 
                 let response = translate::order_response_success("add_order", req_id, order_id, cl_ord_id);
@@ -514,7 +615,8 @@ async fn handle_amend_order(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
-    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+    order_state: &Arc<ProxyOrderState>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
     let params = match parsed.get("params") {
@@ -527,10 +629,10 @@ async fn handle_amend_order(
 
     let cl_ord_id = params.get("cl_ord_id").and_then(|c| c.as_str()).unwrap_or("");
 
-    // Look up the Coinbase exchange order_id from our mapping
-    let exchange_order_id = order_id_map.lock().await.get(cl_ord_id).cloned();
-    let exchange_order_id = match exchange_order_id {
-        Some(id) => id,
+    // Look up the Coinbase exchange order_id and current size from our mapping
+    let order_info = order_id_map.lock().await.get(cl_ord_id).cloned();
+    let order_info = match order_info {
+        Some(info) => info,
         None => {
             tracing::warn!(cl_ord_id, "No exchange order_id found for amend — rejecting");
             send_error(bot_write, "amend_order", req_id, "Unknown order (no order_id mapping)").await;
@@ -550,22 +652,40 @@ async fn handle_amend_order(
         }
     }
 
+    // Coinbase requires `size` on every edit — use provided qty or fall back to stored size.
+    let size = match order_qty {
+        Some(qty) => format!("{}", qty),
+        None => order_info.size.clone(),
+    };
+
     let mut body = serde_json::json!({
-        "order_id": exchange_order_id
+        "order_id": order_info.exchange_id,
+        "size": size
     });
 
     if let Some(price) = limit_price {
         body["price"] = serde_json::json!(format!("{}", price));
-    }
-    if let Some(qty) = order_qty {
-        body["size"] = serde_json::json!(format!("{}", qty));
     }
 
     match state.rest_post("/api/v3/brokerage/orders/edit", &body).await {
         Ok(resp) => {
             let success = resp.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
             if success {
-                let response = translate::order_response_success("amend_order", req_id, &exchange_order_id, cl_ord_id);
+                // Update stored size if it changed
+                if order_qty.is_some() {
+                    if let Some(info) = order_id_map.lock().await.get_mut(cl_ord_id) {
+                        info.size = size.clone();
+                    }
+                }
+
+                // Update order tracking state
+                order_state.orders.lock().await.update_price_qty(
+                    cl_ord_id,
+                    limit_price,
+                    order_qty,
+                );
+
+                let response = translate::order_response_success("amend_order", req_id, &order_info.exchange_id, cl_ord_id);
                 let mut writer = bot_write.lock().await;
                 let _ = writer.send(ws::Message::Text(response.into())).await;
             } else {
@@ -589,7 +709,8 @@ async fn handle_cancel_order(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
-    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+    order_state: &Arc<ProxyOrderState>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
     let params = match parsed.get("params") {
@@ -629,7 +750,7 @@ async fn handle_cancel_order(
     let mut exchange_ids: Vec<String> = Vec::new();
     for cl_id in &cl_ord_ids {
         match map.get(cl_id) {
-            Some(exchange_id) => exchange_ids.push(exchange_id.clone()),
+            Some(info) => exchange_ids.push(info.exchange_id.clone()),
             None => tracing::warn!(cl_ord_id = cl_id.as_str(), "No exchange order_id for cancel — skipping"),
         }
     }
@@ -652,6 +773,14 @@ async fn handle_cancel_order(
                 map.remove(cl_id);
             }
 
+            // Mark orders as cancelled in tracking state
+            {
+                let mut orders = order_state.orders.lock().await;
+                for cl_id in &cl_ord_ids {
+                    orders.update_status(cl_id, OrderStatus::Cancelled);
+                }
+            }
+
             // Send success for the cancel
             let response = translate::order_response_success("cancel_order", req_id, "", "");
             let mut writer = bot_write.lock().await;
@@ -667,7 +796,8 @@ async fn handle_cancel_order(
 /// Used by both the `cancel_all` WS handler and the DMS timer.
 async fn cancel_all_orders(
     state: &CoinbaseWsState,
-    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+    order_state: &Arc<ProxyOrderState>,
 ) {
     let path = "/api/v3/brokerage/orders/historical/batch?order_status=OPEN&limit=250";
     let host = state.api_host();
@@ -732,6 +862,9 @@ async fn cancel_all_orders(
             tracing::debug!(cleared = count, "cancel_all_orders: cleared order_id_map");
         }
     }
+
+    // Mark all tracked orders as cancelled
+    order_state.orders.lock().await.cancel_all();
 }
 
 /// Handle cancel_all: cancel all open orders via Coinbase REST
@@ -739,19 +872,132 @@ async fn handle_cancel_all(
     parsed: &serde_json::Value,
     state: &CoinbaseWsState,
     bot_write: &Arc<Mutex<BotWriter>>,
-    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+    order_state: &Arc<ProxyOrderState>,
 ) {
     let req_id = parsed.get("req_id").and_then(|r| r.as_u64()).unwrap_or(0);
-    cancel_all_orders(state, order_id_map).await;
+    cancel_all_orders(state, order_id_map, order_state).await;
     let response = translate::order_response_success("cancel_all", req_id, "", "");
     let mut writer = bot_write.lock().await;
     let _ = writer.send(ws::Message::Text(response.into())).await;
 }
 
+/// Poll recent fills from Coinbase REST and emit any that the WS missed.
+/// Tracks seen trade_ids to avoid duplicates.
+async fn reconcile_fills(
+    state: &CoinbaseWsState,
+    bot_write: &Arc<Mutex<BotWriter>>,
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+    seen_trade_ids: &mut std::collections::HashSet<String>,
+    order_state: &Arc<ProxyOrderState>,
+) -> Result<()> {
+    let path = "/api/v3/brokerage/orders/historical/fills?limit=20";
+    let data = state.rest_get(path).await?;
+
+    let fills = match data.get("fills").and_then(|f| f.as_array()) {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+
+    let mut new_fills = Vec::new();
+
+    // Build reverse map: exchange_id → cl_ord_id (Coinbase fills API doesn't return client_order_id)
+    let reverse_map: std::collections::HashMap<String, String> = {
+        let map = order_id_map.lock().await;
+        map.iter().map(|(cl_id, info)| (info.exchange_id.clone(), cl_id.clone())).collect()
+    };
+
+    for fill in fills {
+        let trade_id = fill.get("trade_id").and_then(|t| t.as_str()).unwrap_or("");
+        if trade_id.is_empty() {
+            continue;
+        }
+
+        // Skip if we've seen this fill before
+        if seen_trade_ids.contains(trade_id) {
+            continue;
+        }
+        seen_trade_ids.insert(trade_id.to_string());
+
+        // Match by order_id (exchange_id) since Coinbase doesn't return client_order_id in fills
+        let exchange_order_id = fill.get("order_id").and_then(|o| o.as_str()).unwrap_or("");
+        let cl_ord_id = match reverse_map.get(exchange_order_id) {
+            Some(cl_id) => cl_id.as_str(),
+            None => continue, // Not one of our orders
+        };
+
+        let product_id = fill.get("product_id").and_then(|p| p.as_str()).unwrap_or("");
+        let symbol = pairs::to_internal(product_id);
+        let side = fill.get("side").and_then(|s| s.as_str()).unwrap_or("BUY").to_lowercase();
+        let price: f64 = fill.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let qty: f64 = fill.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let fee: f64 = fill.get("commission").and_then(|c| c.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let timestamp = fill.get("trade_time").and_then(|t| t.as_str()).unwrap_or("");
+
+        if qty <= 0.0 || price <= 0.0 {
+            continue;
+        }
+
+        tracing::warn!(
+            trade_id, cl_ord_id, product_id, side = side.as_str(), price, qty,
+            "Fill reconciliation: emitting missed fill"
+        );
+
+        // Record reconciliation fill in tracking state
+        {
+            let fill = FillRecord {
+                fill_id: trade_id.to_string(),
+                cl_ord_id: cl_ord_id.to_string(),
+                pair: symbol.clone(),
+                side: side.clone(),
+                price,
+                qty,
+                fee,
+                timestamp: timestamp.to_string(),
+                source: FillSource::Reconciliation,
+            };
+            order_state.fills.lock().await.record(fill);
+            order_state.orders.lock().await.add_fill(cl_ord_id, qty);
+            order_state.positions.lock().await.apply_fill(&symbol, &side, qty, price);
+        }
+
+        let exec_report = trading_primitives::protocol::build_exec_report(
+            "trade",
+            exchange_order_id,
+            cl_ord_id,
+            &symbol,
+            &side,
+            qty,
+            price,
+            fee,
+            "filled",
+            "m",
+            timestamp,
+            None,
+        );
+
+        new_fills.push(trading_primitives::protocol::build_execution_update(exec_report));
+
+        // Clean up the order from our map since it's filled
+        order_id_map.lock().await.remove(cl_ord_id);
+    }
+
+    if !new_fills.is_empty() {
+        tracing::warn!(count = new_fills.len(), "Fill reconciliation: forwarding missed fills to bot");
+        let mut writer = bot_write.lock().await;
+        for msg in new_fills {
+            let _ = writer.send(ws::Message::Text(msg.into())).await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Remove entries from order_id_map when orders reach terminal states (filled, cancelled, expired, failed).
 async fn cleanup_terminal_orders(
     coinbase_msg: &serde_json::Value,
-    order_id_map: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+    order_state: &Arc<ProxyOrderState>,
 ) {
     let events = match coinbase_msg.get("events").and_then(|e| e.as_array()) {
         Some(e) => e,
@@ -779,6 +1025,125 @@ async fn cleanup_terminal_orders(
             map.remove(cl_id);
         }
         tracing::debug!(count = to_remove.len(), remaining = map.len(), "Cleaned terminal orders from order_id_map");
+
+        // Update order tracking state
+        let mut orders = order_state.orders.lock().await;
+        for cl_id in &to_remove {
+            // Determine the correct terminal status
+            // (We already know it's terminal from the match above, default to Cancelled)
+            orders.update_status(cl_id, OrderStatus::Cancelled);
+        }
+    }
+}
+
+/// Extract fill data from Coinbase user WS events and record in order tracking state.
+/// This runs alongside the existing FillTracker translation but targets the proxy's
+/// own position tracking rather than the bot's execution reports.
+async fn record_ws_fills(
+    coinbase_msg: &serde_json::Value,
+    order_state: &Arc<ProxyOrderState>,
+) {
+    let events = match coinbase_msg.get("events").and_then(|e| e.as_array()) {
+        Some(e) => e,
+        None => return,
+    };
+
+    for event in events {
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Only process update events (not snapshots — those are pre-existing state)
+        if event_type == "snapshot" {
+            continue;
+        }
+        let orders = match event.get("orders").and_then(|o| o.as_array()) {
+            Some(o) => o,
+            None => continue,
+        };
+
+        for order in orders {
+            let status = order.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            // Only process orders with fill data (FILLED or OPEN with cumulative_quantity > 0)
+            if !matches!(status, "FILLED" | "OPEN") {
+                continue;
+            }
+
+            let cum_qty: f64 = order.get("cumulative_quantity")
+                .and_then(|q| q.as_str()).and_then(|q| q.parse().ok()).unwrap_or(0.0);
+            if cum_qty <= 0.0 {
+                continue;
+            }
+
+            let avg_price: f64 = order.get("avg_price")
+                .and_then(|p| p.as_str()).and_then(|p| p.parse().ok()).unwrap_or(0.0);
+            let total_fees: f64 = order.get("total_fees")
+                .and_then(|f| f.as_str()).and_then(|f| f.parse().ok()).unwrap_or(0.0);
+            let client_order_id = order.get("client_order_id")
+                .and_then(|c| c.as_str()).unwrap_or("");
+            let order_id = order.get("order_id")
+                .and_then(|o| o.as_str()).unwrap_or("");
+            let product_id = order.get("product_id")
+                .and_then(|p| p.as_str()).unwrap_or("");
+            let side = order.get("order_side")
+                .and_then(|s| s.as_str()).unwrap_or("").to_lowercase();
+            let timestamp = order.get("creation_time")
+                .and_then(|t| t.as_str()).unwrap_or("");
+
+            if client_order_id.is_empty() || product_id.is_empty() {
+                continue;
+            }
+
+            let symbol = pairs::to_internal(product_id);
+
+            // Use a synthetic fill_id based on cl_ord_id + cumulative qty to deduplicate.
+            // WS may send multiple updates for the same cumulative state.
+            let fill_id = format!("{}-ws-{:.8}", client_order_id, cum_qty);
+
+            let fill = FillRecord {
+                fill_id,
+                cl_ord_id: client_order_id.to_string(),
+                pair: symbol.clone(),
+                side: side.clone(),
+                price: avg_price,
+                qty: cum_qty, // FillLedger handles dedup; qty here is cumulative for this fill_id
+                fee: total_fees,
+                timestamp: timestamp.to_string(),
+                source: FillSource::WebSocket,
+            };
+
+            // Only record if this is a new fill_id (dedup handles cumulative duplication)
+            let recorded = order_state.fills.lock().await.record(fill);
+            if recorded {
+                // Update order registry and position tracker with the incremental fill
+                // Since we're using cumulative data with unique fill_ids per cumulative state,
+                // we need to compute the increment. The order registry's add_fill is additive,
+                // so we track via the filled_qty on the order.
+                let prev_filled = order_state.orders.lock().await
+                    .get(client_order_id)
+                    .map(|o| o.filled_qty)
+                    .unwrap_or(0.0);
+                let inc_qty = cum_qty - prev_filled;
+                if inc_qty > 1e-12 {
+                    let inc_cost = avg_price * cum_qty - avg_price * prev_filled;
+                    let inc_price = if inc_qty > 0.0 { inc_cost / inc_qty } else { avg_price };
+                    order_state.orders.lock().await.add_fill(client_order_id, inc_qty);
+                    order_state.positions.lock().await.apply_fill(&symbol, &side, inc_qty, inc_price);
+                }
+
+                // Update order status
+                if status == "FILLED" {
+                    order_state.orders.lock().await.update_status(client_order_id, OrderStatus::Filled);
+                }
+
+                tracing::debug!(
+                    cl_ord_id = client_order_id,
+                    order_id,
+                    pair = symbol.as_str(),
+                    side = side.as_str(),
+                    cum_qty,
+                    avg_price,
+                    "Recorded WS fill in order tracking state"
+                );
+            }
+        }
     }
 }
 
