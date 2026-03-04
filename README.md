@@ -1,4 +1,4 @@
-# kraken_mm_rs
+# mm_rs
 
 A cryptocurrency market-making bot written in Rust. Runs automated two-sided quoting strategies on Kraken and Coinbase, earning the spread on low-liquidity trading pairs.
 
