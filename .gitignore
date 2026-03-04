@@ -2,3 +2,26 @@
 .env
 .env.*
 secret.env
+
+# Runtime state and data
+state.json
+pnl_state.json
+pnl_analyzer_state.json
+session.json
+state_store.json
+scanned_pairs.json
+scanned_pairs_depth.json
+
+# Logs
+logs/
+*.log
+bot.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Shell scripts with local config (use .example templates)
+run_bot.sh
+monitor.sh
+scan_loop.sh

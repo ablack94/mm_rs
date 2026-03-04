@@ -7,7 +7,7 @@ Single-file web dashboard that shows portfolio, positions, PnL, and pair states.
 Data sources:
   - State Store (localhost:3040) for pair configs/states, bot connection status
   - PnL Analyzer (localhost:3031) for edge metrics, positions, realized PnL
-  - Kraken proxy (10.255.255.254:8080) for live ticker prices
+  - Exchange proxy (localhost:8080) for live ticker prices
 
 Usage:
   python3 dashboard.py          # serves on port 8888
@@ -30,11 +30,8 @@ STATE_STORE_URL = os.environ.get("STATE_STORE_URL", "http://localhost:3040")
 STATE_STORE_TOKEN = os.environ.get("STATE_STORE_TOKEN", "")
 PNL_API_URL = os.environ.get("PNL_API_URL", "http://localhost:3031")
 PNL_API_TOKEN = os.environ.get("PNL_API_TOKEN", "")
-PROXY_URL = os.environ.get("PROXY_URL", "http://10.255.255.254:8080")
-PROXY_TOKEN = os.environ.get(
-    "PROXY_TOKEN",
-    "0ba154d4e4886b262f7752ebcb5213a57ea8161b88c4b5f4eed5b0f79363d7ab",
-)
+PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8080")
+PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
 SESSION_FILE = os.environ.get("SESSION_FILE", "session.json")
 DEFAULT_PORT = 8888
 

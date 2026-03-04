@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 getcontext().prec = 50
 
-PROXY_URL = os.environ.get("PROXY_URL", "http://10.255.255.254:8080")
+PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8080")
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
 OUTPUT_FILE = "pnl_state.json"
 

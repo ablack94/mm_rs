@@ -50,8 +50,8 @@ export STATE_STORE_URL=http://localhost:3040
 export STATE_STORE_TOKEN=test-token-123   # or whatever the running instance uses
 export PNL_API_URL=http://localhost:3031
 export PNL_API_TOKEN=
-export PROXY_URL=http://10.255.255.254:8080
-python3 /workarea/kraken_mm_rs/dashboard.py
+export PROXY_URL=http://localhost:8080
+python3 ./dashboard.py
 ```
 
 ## Running services snapshot (at time of interruption)

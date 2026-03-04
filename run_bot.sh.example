@@ -1,0 +1,10 @@
+#!/bin/bash
+export PROXY_MODE=true
+export PROXY_URL="http://localhost:8080"
+export PROXY_TOKEN="<your-proxy-token>"
+export BOT_API_TOKEN="<your-bot-api-token>"
+export BOT_API_PORT="3030"
+export RUST_LOG=info
+
+cd /path/to/kraken_mm_rs
+exec ./target/release/kraken-mm 2>&1 | tee -a bot.log

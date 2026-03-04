@@ -1,8 +1,8 @@
 #!/bin/bash
-SS_TOKEN="a1fb58b5829e886cce2fa70516ac3495477834e025d8d91612584a82818acc69"
+SS_TOKEN="<your-state-store-token>"
 SS_URL="http://localhost:3040"
-BOT_PID=311221
-PROXY_PID=310494
+BOT_PID=<bot-pid>
+PROXY_PID=<proxy-pid>
 
 while true; do
     echo "=== $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
@@ -22,23 +22,6 @@ print(f'  Pairs: {len(a)} active, {len(w)} winddown, {len(l)} liquidating')
 for p in w: print(f'    WINDDOWN: {p[\"symbol\"]}')
 for p in l: print(f'    LIQUIDATING: {p[\"symbol\"]}')
 " 2>/dev/null
-    fi
-    if [ -f /workarea/pnl_state.json ]; then
-        python3 -c "
-import json
-with open('/workarea/pnl_state.json') as f: d=json.load(f)
-pnl=float(d.get('realized_pnl',0)); fees=float(d.get('total_fees',0)); trades=d.get('trade_count',0)
-pos=d.get('positions',{})
-ps=', '.join(f'{k}:{v[\"qty\"]}' for k,v in pos.items()) if pos else 'none'
-print(f'  PnL: \${pnl:.4f} | Fees: \${fees:.4f} | Trades: {trades}')
-print(f'  Positions: {ps}')
-" 2>/dev/null
-    fi
-    if [ -f /workarea/logs/trades.csv ]; then
-        LAST=$(tail -1 /workarea/logs/trades.csv 2>/dev/null)
-        if echo "$LAST" | grep -q ",20"; then
-            echo "  Last: $(echo $LAST | cut -d, -f1-3,8)"
-        fi
     fi
     echo ""
     sleep 30

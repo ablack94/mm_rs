@@ -3,16 +3,16 @@
 ## Quick Start
 
 ### Prerequisites
-- Signing proxy running at `10.255.255.254:8080`
+- Signing proxy running at `localhost:8080`
 - Rust toolchain: `export PATH="$HOME/.cargo/bin:$PATH"`
 - Built binary: `cargo build --release`
 
 ### Start the Bot
 ```bash
 export PROXY_MODE=true
-export PROXY_URL="http://10.255.255.254:8080"
-export PROXY_TOKEN="<token from .mcp.json>"
-export BOT_API_TOKEN="mcp-bot-token-2026"
+export PROXY_URL="http://localhost:8080"
+export PROXY_TOKEN="<your-proxy-token>"
+export BOT_API_TOKEN="<your-bot-api-token>"
 export BOT_API_PORT="3030"
 export RUST_LOG=info
 ./target/release/kraken-mm 2>&1 | tee -a bot.log
@@ -27,7 +27,7 @@ Or use the launch script:
 ```bash
 # Bot process
 sleep 3 && : > bot.log && \
-  export PROXY_MODE=true PROXY_URL="http://10.255.255.254:8080" \
+  export PROXY_MODE=true PROXY_URL="http://localhost:8080" \
   PROXY_TOKEN="<token>" BOT_API_TOKEN="mcp-bot-token-2026" \
   BOT_API_PORT="3030" RUST_LOG=info && \
   ./target/release/kraken-mm 2>&1 | tee -a bot.log
@@ -42,16 +42,16 @@ Run as a second background task. The system notifies Claude only when these patt
 
 ## MCP Server (Claude Code Integration)
 
-Config at `/home/node/.claude/projects/-workarea/.mcp.json`:
+Config in your Claude Code MCP settings:
 ```json
 {
   "mcpServers": {
     "kraken": {
       "command": "python3",
-      "args": ["/workarea/kraken_mm_rs/kraken_mcp.py"],
+      "args": ["kraken_mcp.py"],
       "env": {
-        "PROXY_URL": "http://10.255.255.254:8080",
-        "PROXY_TOKEN": "<token>"
+        "PROXY_URL": "http://localhost:8080",
+        "PROXY_TOKEN": "<your-proxy-token>"
       }
     }
   }
@@ -158,7 +158,7 @@ If FXS position avg_cost is above current market ask, the ask gets pinned to cos
 ```
 
 ### Bot Won't Start
-1. Check proxy is reachable: `curl http://10.255.255.254:8080/health`
+1. Check proxy is reachable: `curl http://localhost:8080/health`
 2. Check binary exists: `ls -la target/release/kraken-mm`
 3. Check env vars are set (especially PROXY_MODE, PROXY_URL, PROXY_TOKEN)
 4. Check state.json is valid JSON: `python3 -m json.tool state.json`

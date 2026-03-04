@@ -418,8 +418,8 @@ Ordered list of code changes.  Each step is independently testable.
 ### Step 1: Add PairMetrics and PairState to the Engine
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/engine/pair_eval.rs` (new)
-- `/workarea/kraken_mm_rs/crates/core/src/engine/mod.rs` (add `pub mod pair_eval;`)
+- `crates/core/src/engine/pair_eval.rs` (new)
+- `crates/core/src/engine/mod.rs` (add `pub mod pair_eval;`)
 
 **What**: Define `PairState` enum, `PairMetrics` struct, and
 `PairEvaluator` struct with the evaluation logic as pure functions.  The
@@ -432,7 +432,7 @@ assert the correct decision.
 ### Step 2: Add PairEvalConfig to Config
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/config.rs`
+- `crates/core/src/config.rs`
 
 **What**: Add `PairEvalConfig` struct and include it in `Config`.  Set
 `enabled: false` as default so the feature is opt-in.
@@ -442,8 +442,8 @@ assert the correct decision.
 ### Step 3: Add New Event and Command Variants
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/types/event.rs` -- add `TickerRefresh` variant
-- `/workarea/kraken_mm_rs/crates/core/src/types/command.rs` -- add `FetchTickers` variant
+- `crates/core/src/types/event.rs` -- add `TickerRefresh` variant
+- `crates/core/src/types/command.rs` -- add `FetchTickers` variant
 
 **What**:
 
@@ -463,7 +463,7 @@ EngineCommand::FetchTickers
 ### Step 4: Wire Per-Pair Metrics Accumulation in the Engine
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/engine/core.rs`
+- `crates/core/src/engine/core.rs`
 
 **What**:
 - Add `pair_metrics: HashMap<String, PairMetrics>` field to `Engine`.
@@ -479,7 +479,7 @@ EngineCommand::FetchTickers
 ### Step 5: Implement the Evaluation Timer and FetchTickers Command
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/engine/core.rs` (in `on_tick()`)
+- `crates/core/src/engine/core.rs` (in `on_tick()`)
 
 **What**:
 - Add `last_eval_time: Option<DateTime<Utc>>` field to `Engine`.
@@ -493,7 +493,7 @@ EngineCommand::FetchTickers
 ### Step 6: Handle TickerRefresh Event -- Run Evaluations
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/engine/core.rs` (add `on_ticker_refresh()`)
+- `crates/core/src/engine/core.rs` (add `on_ticker_refresh()`)
 
 **What**:
 - Add `EngineEvent::TickerRefresh` to the match in `handle_event()`.
@@ -526,7 +526,7 @@ The Cautious state needs a new field: `cautious_pairs: HashSet<String>`.  In
 ### Step 7: Wire FetchTickers in the Command Dispatcher
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/bot/src/main.rs` (both `run_dry` and `run_live`)
+- `crates/bot/src/main.rs` (both `run_dry` and `run_live`)
 
 **What**: Add a match arm for `EngineCommand::FetchTickers`:
 - Call `exchange.get_tickers(&pair_info)`.
@@ -550,7 +550,7 @@ predetermined ticker data.
 ### Step 8: SellOnly -> Disabled Auto-Transition on Empty Position
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/engine/core.rs` (in `on_fill()` or `on_tick()`)
+- `crates/core/src/engine/core.rs` (in `on_fill()` or `on_tick()`)
 
 **What**: After a sell fill fully unwinds a position for a pair in SellOnly
 state (due to the evaluator, not liquidation), transition that pair to Disabled
@@ -570,8 +570,8 @@ moves to Disabled.
 ### Step 9: Add Pair Evaluation Status to the REST API
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/api/server.rs`
-- `/workarea/kraken_mm_rs/crates/core/src/api/shared.rs`
+- `crates/core/src/api/server.rs`
+- `crates/core/src/api/shared.rs`
 
 **What**: Add a `GET /pairs` endpoint that returns the current state of each
 pair:
@@ -588,7 +588,7 @@ per-pair).
 ### Step 10: Logging and Observability
 
 **Files**:
-- `/workarea/kraken_mm_rs/crates/core/src/engine/core.rs` (in tick status log)
+- `crates/core/src/engine/core.rs` (in tick status log)
 
 **What**: Extend the periodic tick status log (line 666-681 of `core.rs`) to
 include pair evaluator summary:
