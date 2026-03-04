@@ -1,0 +1,225 @@
+{
+  "defaults": {
+    "order_size_usd": "100",
+    "max_inventory_usd": "200",
+    "min_spread_bps": "40",
+    "spread_capture_pct": "0.5",
+    "min_profit_pct": "0.01",
+    "stop_loss_pct": "0.03",
+    "take_profit_pct": "0.1",
+    "max_buys_before_sell": 2,
+    "use_winddown_for_stoploss": true
+  },
+  "pairs": {
+    "ROBO/USDC": {
+      "symbol": "ROBO/USDC",
+      "state": "disabled",
+      "config": {
+        "order_size_usd": "5",
+        "max_inventory_usd": "15",
+        "min_spread_bps": "0",
+        "spread_capture_pct": null,
+        "min_profit_pct": "0.001",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-02-28T21:46:43.002494651Z",
+      "updated_at": "2026-03-01T01:31:25.759048713Z"
+    },
+    "SYND/USDC": {
+      "symbol": "SYND/USDC",
+      "state": "wind_down",
+      "config": {
+        "order_size_usd": null,
+        "max_inventory_usd": null,
+        "min_spread_bps": null,
+        "spread_capture_pct": null,
+        "min_profit_pct": null,
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-03-01T01:31:34.380383745Z",
+      "updated_at": "2026-03-01T01:42:21.730712844Z"
+    },
+    "WIF/USDC": {
+      "symbol": "WIF/USDC",
+      "state": "wind_down",
+      "config": {
+        "order_size_usd": null,
+        "max_inventory_usd": null,
+        "min_spread_bps": null,
+        "spread_capture_pct": null,
+        "min_profit_pct": null,
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-03-01T01:31:34.393938887Z",
+      "updated_at": "2026-03-01T02:12:18.465675872Z"
+    },
+    "OP/USDC": {
+      "symbol": "OP/USDC",
+      "state": "wind_down",
+      "config": {
+        "order_size_usd": null,
+        "max_inventory_usd": null,
+        "min_spread_bps": null,
+        "spread_capture_pct": null,
+        "min_profit_pct": null,
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-03-01T01:31:34.387612617Z",
+      "updated_at": "2026-03-01T02:12:18.365856150Z"
+    },
+    "BTC/USDC": {
+      "symbol": "BTC/USDC",
+      "state": "disabled",
+      "config": {
+        "order_size_usd": "10",
+        "max_inventory_usd": "25",
+        "min_spread_bps": "0",
+        "spread_capture_pct": null,
+        "min_profit_pct": "0.001",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-02-28T21:37:42.461189418Z",
+      "updated_at": "2026-03-01T01:31:25.738931637Z"
+    },
+    "BTRST/USDC": {
+      "symbol": "BTRST/USDC",
+      "state": "disabled",
+      "config": {
+        "order_size_usd": "5",
+        "max_inventory_usd": "15",
+        "min_spread_bps": "0",
+        "spread_capture_pct": null,
+        "min_profit_pct": "0.001",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-02-28T21:40:41.028185302Z",
+      "updated_at": "2026-03-01T01:31:25.745158996Z"
+    },
+    "STRK/USDC": {
+      "symbol": "STRK/USDC",
+      "state": "wind_down",
+      "config": {
+        "order_size_usd": null,
+        "max_inventory_usd": null,
+        "min_spread_bps": null,
+        "spread_capture_pct": null,
+        "min_profit_pct": null,
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-03-01T01:31:34.358759759Z",
+      "updated_at": "2026-03-01T02:12:18.441464379Z"
+    },
+    "SKL/USDC": {
+      "symbol": "SKL/USDC",
+      "state": "wind_down",
+      "config": {
+        "order_size_usd": null,
+        "max_inventory_usd": null,
+        "min_spread_bps": null,
+        "spread_capture_pct": null,
+        "min_profit_pct": null,
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-03-01T01:31:34.373165553Z",
+      "updated_at": "2026-03-01T02:12:18.414494689Z"
+    },
+    "SHDW/USDC": {
+      "symbol": "SHDW/USDC",
+      "state": "liquidating",
+      "config": {
+        "order_size_usd": null,
+        "max_inventory_usd": null,
+        "min_spread_bps": null,
+        "spread_capture_pct": null,
+        "min_profit_pct": null,
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": null,
+      "auto_enable_at": null,
+      "created_at": "2026-03-01T01:31:34.366892024Z",
+      "updated_at": "2026-03-01T02:13:14.312415987Z"
+    },
+    "DOGE/USDC": {
+      "symbol": "DOGE/USDC",
+      "state": "disabled",
+      "config": {
+        "order_size_usd": "5",
+        "max_inventory_usd": "20",
+        "min_spread_bps": "0.5",
+        "spread_capture_pct": null,
+        "min_profit_pct": "0.001",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": "Zero trades for 22 hours since creation",
+      "auto_enable_at": null,
+      "created_at": "2026-02-27T06:40:31.343648250Z",
+      "updated_at": "2026-03-01T01:31:25.752066464Z"
+    },
+    "XRP/USDC": {
+      "symbol": "XRP/USDC",
+      "state": "disabled",
+      "config": {
+        "order_size_usd": "5",
+        "max_inventory_usd": "20",
+        "min_spread_bps": "0.5",
+        "spread_capture_pct": null,
+        "min_profit_pct": "0.001",
+        "stop_loss_pct": null,
+        "take_profit_pct": null,
+        "max_buys_before_sell": null,
+        "use_winddown_for_stoploss": null
+      },
+      "disabled_reason": "Zero trades for 22 hours since creation",
+      "auto_enable_at": null,
+      "created_at": "2026-02-27T06:40:31.351474260Z",
+      "updated_at": "2026-03-01T01:31:25.765276541Z"
+    }
+  },
+  "version": 1
+}

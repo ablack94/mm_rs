@@ -130,6 +130,76 @@ fn run_sync_replay(
     (engine, commands)
 }
 
+/// Synchronously replay recorded data through the engine, injecting
+/// OrderAcknowledged events for each PlaceOrder command emitted.
+/// This ensures the quoter transitions from Pending → Quoting so amend
+/// coverage is preserved (replay data has no ack events).
+fn run_sync_replay_with_auto_ack(
+    path: &str,
+    config: Config,
+    pair_info: HashMap<Ticker, PairInfo>,
+    state: BotState,
+) -> (Engine, Vec<EngineCommand>) {
+    let mut engine = Engine::new(config, pair_info, state);
+    let mut commands = vec![];
+
+    let file = File::open(path).unwrap();
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line.unwrap();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let recorded: RecordedMessage = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let proxy_event = match parse_proxy_event(&recorded.raw) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let event = match proxy_event {
+            ProxyEvent::BookSnapshot { symbol, bids, asks } => {
+                let pair = Ticker::from(symbol.as_str());
+                Some(EngineEvent::BookSnapshot {
+                    pair,
+                    bids: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                    asks: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                    timestamp: recorded.timestamp,
+                })
+            }
+            ProxyEvent::BookUpdate { symbol, bids, asks } => {
+                let pair = Ticker::from(symbol.as_str());
+                Some(EngineEvent::BookUpdate {
+                    pair,
+                    bid_updates: bids.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                    ask_updates: asks.into_iter().map(|l| LevelUpdate { price: l.price, qty: l.qty }).collect(),
+                    timestamp: recorded.timestamp,
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(e) = event {
+            let cmds = engine.handle_event(e);
+            // Auto-ack: inject OrderAcknowledged for each PlaceOrder
+            for cmd in &cmds {
+                if let EngineCommand::PlaceOrder(req) = cmd {
+                    engine.handle_event(EngineEvent::OrderAcknowledged {
+                        cl_ord_id: req.cl_ord_id.clone(),
+                        order_id: format!("auto-{}", req.cl_ord_id),
+                    });
+                }
+            }
+            commands.extend(cmds);
+        }
+    }
+
+    (engine, commands)
+}
+
 /// Extract all PlaceOrder commands from a command list.
 fn placed_orders(cmds: &[EngineCommand]) -> Vec<&OrderRequest> {
     cmds.iter()
@@ -429,7 +499,9 @@ fn amend_references_valid_order_ids() {
     }
 
     let config = test_config(default_pairs());
-    let (_, commands) = run_sync_replay(DATA_PATH, config, default_pair_info_map(), BotState::default());
+    // Use auto-ack replay so quoter transitions Pending → Quoting,
+    // allowing amends to be generated (amends require acked orders).
+    let (_, commands) = run_sync_replay_with_auto_ack(DATA_PATH, config, default_pair_info_map(), BotState::default());
 
     let mut placed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for cmd in &commands {

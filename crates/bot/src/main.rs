@@ -214,6 +214,7 @@ fn build_engine_snapshot(engine: &Engine) -> EngineSnapshot {
         let exposure_usd = pos.qty * price_estimate;
         let quoter_state = match mp.quoter.state {
             QuoteState::Idle => "idle",
+            QuoteState::Pending => "pending",
             QuoteState::Quoting => "quoting",
             QuoteState::BidFilled => "bid_filled",
             QuoteState::AskFilled => "ask_filled",

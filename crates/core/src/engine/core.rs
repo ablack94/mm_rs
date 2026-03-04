@@ -308,14 +308,16 @@ impl Engine {
             EngineEvent::OrderAcknowledged { cl_ord_id, order_id } => {
                 if let Some(order) = self.state.open_orders.get_mut(&cl_ord_id) {
                     order.acked = true;
+                    let pair = order.pair.clone();
                     tracing::info!(
                         cl_ord_id,
                         order_id,
-                        pair = %order.pair,
+                        pair = %pair,
                         side = %order.side,
                         price = %order.price,
                         "Order live on exchange"
                     );
+                    self.try_pending_transition(&pair);
                 } else {
                     tracing::debug!(cl_ord_id, order_id, "Ack for unknown order (already cancelled?)");
                 }
@@ -848,6 +850,17 @@ impl Engine {
         }));
 
         // Update quoter state
+        // A fill proves the exchange accepted the order — implicitly mark as acked
+        if let Some(order) = self.state.open_orders.get_mut(&fill.cl_ord_id) {
+            if !order.acked {
+                tracing::debug!(
+                    cl_ord_id = fill.cl_ord_id,
+                    pair = %fill.pair,
+                    "Fill for unacked order — implicitly marking as acked"
+                );
+                order.acked = true;
+            }
+        }
         if fill.is_fully_filled {
             self.state.open_orders.remove(&fill.cl_ord_id);
             if let Some(mp) = self.pairs.get_mut(&fill.pair) {
@@ -856,6 +869,7 @@ impl Engine {
                     OrderSide::Sell => mp.quoter.mark_ask_filled(),
                 }
             }
+            self.try_pending_transition(&fill.pair);
         }
 
         // Persist state
@@ -890,6 +904,7 @@ impl Engine {
         if let Some(mp) = self.pairs.get_mut(pair) {
             mp.quoter.mark_cancelled(cl_ord_id);
         }
+        self.try_pending_transition(pair);
         vec![]
     }
 
@@ -1519,6 +1534,10 @@ impl Engine {
                         );
                         self.place_fresh_quotes(pair, bid_price, ask_price, qty, mid, timestamp, &risk, pair_state)
                     }
+                    QuoteState::Pending => {
+                        tracing::debug!(pair = %pair, "Skipping quote — orders pending ack");
+                        vec![]
+                    }
                     QuoteState::Quoting => {
                         let should = quoter.should_requote(mid, &trading);
                         if should {
@@ -1761,7 +1780,7 @@ impl Engine {
         }
 
         if let Some(mp) = self.pairs.get_mut(pair) {
-            mp.quoter.state = crate::engine::quoter::QuoteState::Quoting;
+            mp.quoter.state = crate::engine::quoter::QuoteState::Pending;
             mp.quoter.last_mid = Some(mid);
             mp.quoter.last_quote_time = Some(timestamp);
             if let Some(ref bid_id) = bid_id_placed {
@@ -2042,6 +2061,7 @@ impl Engine {
                 OrderSide::Buy => quoter.bid_cl_ord_id = Some(cl_id.clone()),
                 OrderSide::Sell => quoter.ask_cl_ord_id = Some(cl_id.clone()),
             }
+            quoter.state = QuoteState::Pending;
 
             vec![EngineCommand::PlaceOrder(OrderRequest {
                 cl_ord_id: cl_id,
@@ -2053,6 +2073,27 @@ impl Engine {
                 market: false,
                 urgent: false,
             })]
+        }
+    }
+
+    /// Check if all quoter-tracked orders for a pair are acked,
+    /// and if so, transition the quoter from Pending to the correct active state.
+    fn try_pending_transition(&mut self, pair: &Ticker) {
+        let mp = match self.pairs.get(pair) {
+            Some(mp) if mp.quoter.state == QuoteState::Pending => mp,
+            _ => return,
+        };
+        let bid_acked = match &mp.quoter.bid_cl_ord_id {
+            Some(id) => self.state.open_orders.get(id).map_or(true, |o| o.acked),
+            None => true,
+        };
+        let ask_acked = match &mp.quoter.ask_cl_ord_id {
+            Some(id) => self.state.open_orders.get(id).map_or(true, |o| o.acked),
+            None => true,
+        };
+        if bid_acked && ask_acked {
+            let mp = self.pairs.get_mut(pair).unwrap();
+            mp.quoter.try_transition_from_pending(true);
         }
     }
 
@@ -2696,5 +2737,297 @@ mod tests {
             PairState::Liquidating,
             "Should escalate to Liquidating after winddown_escalation_hours"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Pessimistic order tracking (Pending state) tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_pending_blocks_requote_on_book_update() {
+        let mut engine = Engine::new(test_config(), test_pair_info(), BotState::default());
+
+        // Book snapshot → places bid → quoter goes Pending
+        let t0 = Utc::now();
+        let cmds1 = engine.handle_event(EngineEvent::BookSnapshot {
+            pair: Ticker::from("TEST/USD"),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: t0,
+        });
+        assert!(!cmds1.iter().filter(|c| matches!(c, EngineCommand::PlaceOrder(_))).collect::<Vec<_>>().is_empty(),
+            "Should place initial orders");
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().quoter.state, QuoteState::Pending);
+
+        // Book update with big price move — should be blocked by Pending
+        let t1 = t0 + chrono::Duration::seconds(30);
+        let cmds2 = engine.handle_event(EngineEvent::BookUpdate {
+            pair: Ticker::from("TEST/USD"),
+            bid_updates: vec![LevelUpdate { price: dec!(0.09), qty: dec!(100) }],
+            ask_updates: vec![LevelUpdate { price: dec!(0.11), qty: dec!(100) }],
+            timestamp: t1,
+        });
+        let orders2: Vec<_> = cmds2.iter()
+            .filter(|c| matches!(c, EngineCommand::PlaceOrder(_) | EngineCommand::AmendOrder { .. }))
+            .collect();
+        assert!(orders2.is_empty(), "Should NOT requote while Pending");
+    }
+
+    #[test]
+    fn test_ack_transitions_pending_to_quoting() {
+        let mut engine = Engine::new(test_config(), test_pair_info(), BotState::default());
+
+        // Place orders → Pending
+        let cmds = engine.handle_event(EngineEvent::BookSnapshot {
+            pair: Ticker::from("TEST/USD"),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now(),
+        });
+        assert_eq!(engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().quoter.state, QuoteState::Pending);
+
+        // Ack all placed orders
+        for cmd in &cmds {
+            if let EngineCommand::PlaceOrder(req) = cmd {
+                engine.handle_event(EngineEvent::OrderAcknowledged {
+                    cl_ord_id: req.cl_ord_id.clone(),
+                    order_id: format!("exch-{}", req.cl_ord_id),
+                });
+            }
+        }
+
+        // Quoter should now be in an active state (Quoting or BidFilled/AskFilled)
+        let state = engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().quoter.state;
+        assert_ne!(state, QuoteState::Pending, "Should transition out of Pending after acks");
+        assert_ne!(state, QuoteState::Idle, "Should not be Idle (orders are live)");
+    }
+
+    #[test]
+    fn test_fill_before_ack_requotes() {
+        let mut engine = Engine::new(test_config(), test_pair_info(), BotState::default());
+
+        // Place orders → Pending
+        let cmds = engine.handle_event(EngineEvent::BookSnapshot {
+            pair: Ticker::from("TEST/USD"),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now(),
+        });
+
+        // Find the bid order cl_ord_id
+        let bid_id = cmds.iter()
+            .filter_map(|c| match c {
+                EngineCommand::PlaceOrder(req) if req.side == OrderSide::Buy => Some(req.cl_ord_id.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("Should have placed a bid");
+
+        // Fill the bid before ack arrives
+        let fill_cmds = engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "fill-1".into(),
+            cl_ord_id: bid_id.clone(),
+            pair: Ticker::from("TEST/USD"),
+            side: OrderSide::Buy,
+            price: dec!(0.10),
+            qty: dec!(1000),
+            fee: dec!(0.023),
+            is_maker: true,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+
+        // With only bid placed (no ask), bid filled → Idle, then on_fill
+        // re-quotes immediately → places new orders → Pending again.
+        // Position should be updated correctly.
+        assert!(!engine.state.position(&Ticker::from("TEST/USD")).is_empty(),
+            "Position should be updated from fill");
+
+        // The fill handler re-quotes, so new orders should be placed
+        let new_orders: Vec<_> = fill_cmds.iter()
+            .filter(|c| matches!(c, EngineCommand::PlaceOrder(_)))
+            .collect();
+        assert!(!new_orders.is_empty(), "Fill should trigger re-quote with new orders");
+    }
+
+    #[test]
+    fn test_fill_before_ack_with_both_sides_stays_pending() {
+        // Need inventory to place both bid and ask
+        let mut state = BotState::default();
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
+            qty: dec!(50),
+            avg_cost: dec!(0.10),
+        });
+
+        let mut engine = Engine::new(test_config(), test_pair_info(), state);
+
+        // Place both bid and ask
+        let cmds = engine.handle_event(EngineEvent::BookSnapshot {
+            pair: Ticker::from("TEST/USD"),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now(),
+        });
+
+        let bid_id = cmds.iter()
+            .filter_map(|c| match c {
+                EngineCommand::PlaceOrder(req) if req.side == OrderSide::Buy => Some(req.cl_ord_id.clone()),
+                _ => None,
+            })
+            .next();
+        let ask_id = cmds.iter()
+            .filter_map(|c| match c {
+                EngineCommand::PlaceOrder(req) if req.side == OrderSide::Sell => Some(req.cl_ord_id.clone()),
+                _ => None,
+            })
+            .next();
+
+        // Need both sides for this test
+        if bid_id.is_none() || ask_id.is_none() {
+            // If only one side was placed (risk limits), skip
+            return;
+        }
+        let bid_id = bid_id.unwrap();
+        let ask_id = ask_id.unwrap();
+
+        // Fill bid before any acks
+        engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "fill-1".into(),
+            cl_ord_id: bid_id.clone(),
+            pair: Ticker::from("TEST/USD"),
+            side: OrderSide::Buy,
+            price: dec!(0.10),
+            qty: dec!(1000),
+            fee: dec!(0.023),
+            is_maker: true,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+
+        // Ask is still unacked → should stay Pending
+        assert_eq!(
+            engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().quoter.state,
+            QuoteState::Pending,
+            "Should stay Pending while ask is still unacked"
+        );
+
+        // Now ack the ask
+        engine.handle_event(EngineEvent::OrderAcknowledged {
+            cl_ord_id: ask_id.clone(),
+            order_id: "exch-ask".into(),
+        });
+
+        // Bid was filled, ask is acked → BidFilled
+        assert_eq!(
+            engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().quoter.state,
+            QuoteState::BidFilled,
+            "After bid fill + ask ack, should be BidFilled"
+        );
+    }
+
+    #[test]
+    fn test_both_fills_before_ack_requotes() {
+        let mut state = BotState::default();
+        state.positions.insert(Ticker::from("TEST/USD"), Position {
+            qty: dec!(50),
+            avg_cost: dec!(0.10),
+        });
+
+        let mut engine = Engine::new(test_config(), test_pair_info(), state);
+
+        let cmds = engine.handle_event(EngineEvent::BookSnapshot {
+            pair: Ticker::from("TEST/USD"),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now(),
+        });
+
+        let bid_id = cmds.iter()
+            .filter_map(|c| match c {
+                EngineCommand::PlaceOrder(req) if req.side == OrderSide::Buy => Some(req.cl_ord_id.clone()),
+                _ => None,
+            })
+            .next();
+        let ask_id = cmds.iter()
+            .filter_map(|c| match c {
+                EngineCommand::PlaceOrder(req) if req.side == OrderSide::Sell => Some(req.cl_ord_id.clone()),
+                _ => None,
+            })
+            .next();
+
+        if bid_id.is_none() || ask_id.is_none() {
+            return;
+        }
+        let bid_id = bid_id.unwrap();
+        let ask_id = ask_id.unwrap();
+
+        // Fill both before acks
+        engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "fill-1".into(),
+            cl_ord_id: bid_id.clone(),
+            pair: Ticker::from("TEST/USD"),
+            side: OrderSide::Buy,
+            price: dec!(0.10),
+            qty: dec!(1000),
+            fee: dec!(0.023),
+            is_maker: true,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+
+        let fill2_cmds = engine.handle_event(EngineEvent::Fill(Fill {
+            order_id: "fill-2".into(),
+            cl_ord_id: ask_id.clone(),
+            pair: Ticker::from("TEST/USD"),
+            side: OrderSide::Sell,
+            price: dec!(0.12),
+            qty: dec!(50),
+            fee: dec!(0.028),
+            is_maker: true,
+            is_fully_filled: true,
+            timestamp: Utc::now(),
+        }));
+
+        // Both sides filled → Idle, then on_fill re-quotes → Pending again.
+        // Position should reflect the fills correctly.
+        let pos = engine.state.position(&Ticker::from("TEST/USD"));
+        assert!(!pos.is_empty(), "Position should remain after partial sell");
+
+        // The second fill's re-quote should place new orders
+        let new_orders: Vec<_> = fill2_cmds.iter()
+            .filter(|c| matches!(c, EngineCommand::PlaceOrder(_)))
+            .collect();
+        assert!(!new_orders.is_empty(), "Second fill should trigger re-quote");
+    }
+
+    #[test]
+    fn test_rejection_during_pending() {
+        let mut engine = Engine::new(test_config(), test_pair_info(), BotState::default());
+
+        let cmds = engine.handle_event(EngineEvent::BookSnapshot {
+            pair: Ticker::from("TEST/USD"),
+            bids: vec![LevelUpdate { price: dec!(0.10), qty: dec!(100) }],
+            asks: vec![LevelUpdate { price: dec!(0.12), qty: dec!(100) }],
+            timestamp: Utc::now(),
+        });
+
+        let bid_id = cmds.iter()
+            .filter_map(|c| match c {
+                EngineCommand::PlaceOrder(req) if req.side == OrderSide::Buy => Some(req.cl_ord_id.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("Should have placed a bid");
+
+        // Reject the order while Pending
+        engine.handle_event(EngineEvent::OrderRejected {
+            cl_ord_id: bid_id.clone(),
+            pair: Ticker::from("TEST/USD"),
+            reason: "Insufficient funds".into(),
+        });
+
+        // Only bid was placed, it got rejected → Idle
+        let state = engine.pairs().get(&Ticker::from("TEST/USD")).unwrap().quoter.state;
+        assert_eq!(state, QuoteState::Idle, "Rejection of only order should go Idle");
     }
 }

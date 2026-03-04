@@ -8,6 +8,7 @@ use crate::types::PairInfo;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteState {
     Idle,
+    Pending,
     Quoting,
     BidFilled,
     AskFilled,
@@ -120,7 +121,7 @@ impl Quoter {
         }
     }
 
-    pub fn mark_quoted(
+    pub fn mark_pending(
         &mut self,
         mid: Decimal,
         bid_id: String,
@@ -131,13 +132,15 @@ impl Quoter {
         self.ask_cl_ord_id = Some(ask_id);
         self.last_mid = Some(mid);
         self.last_quote_time = Some(timestamp);
-        self.state = QuoteState::Quoting;
+        self.state = QuoteState::Pending;
     }
 
     pub fn mark_bid_filled(&mut self) {
         self.bid_cl_ord_id = None;
         if self.ask_cl_ord_id.is_none() {
             self.state = QuoteState::Idle;
+        } else if self.state == QuoteState::Pending {
+            // Stay Pending — engine will call try_transition_from_pending
         } else {
             self.state = QuoteState::BidFilled;
         }
@@ -147,6 +150,8 @@ impl Quoter {
         self.ask_cl_ord_id = None;
         if self.bid_cl_ord_id.is_none() {
             self.state = QuoteState::Idle;
+        } else if self.state == QuoteState::Pending {
+            // Stay Pending — engine will call try_transition_from_pending
         } else {
             self.state = QuoteState::AskFilled;
         }
@@ -162,6 +167,20 @@ impl Quoter {
         if self.bid_cl_ord_id.is_none() && self.ask_cl_ord_id.is_none() {
             self.state = QuoteState::Idle;
             self.last_mid = None;
+        }
+    }
+
+    /// Transition from Pending to the correct active state once all orders are acked.
+    /// Called by the engine after ack/fill/cancel events.
+    pub fn try_transition_from_pending(&mut self, all_acked: bool) {
+        if self.state != QuoteState::Pending || !all_acked {
+            return;
+        }
+        match (self.bid_cl_ord_id.is_some(), self.ask_cl_ord_id.is_some()) {
+            (true, true) => self.state = QuoteState::Quoting,
+            (true, false) => self.state = QuoteState::AskFilled,
+            (false, true) => self.state = QuoteState::BidFilled,
+            (false, false) => self.state = QuoteState::Idle,
         }
     }
 }
@@ -455,14 +474,14 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn mark_quoted_sets_quoting_state() {
+    fn mark_pending_sets_pending_state() {
         let mut q = make_quoter();
         assert_eq!(q.state, QuoteState::Idle);
 
         let now = Utc::now();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), now);
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), now);
 
-        assert_eq!(q.state, QuoteState::Quoting);
+        assert_eq!(q.state, QuoteState::Pending);
         assert_eq!(q.bid_cl_ord_id.as_deref(), Some("bid-1"));
         assert_eq!(q.ask_cl_ord_id.as_deref(), Some("ask-1"));
         assert_eq!(q.last_mid, Some(dec!(1.0)));
@@ -472,7 +491,8 @@ mod tests {
     #[test]
     fn mark_bid_filled_with_ask_outstanding() {
         let mut q = make_quoter();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
 
         q.mark_bid_filled();
 
@@ -484,7 +504,8 @@ mod tests {
     #[test]
     fn mark_bid_filled_without_ask_goes_idle() {
         let mut q = make_quoter();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
         q.ask_cl_ord_id = None; // simulate ask already gone
 
         q.mark_bid_filled();
@@ -497,7 +518,8 @@ mod tests {
     #[test]
     fn mark_ask_filled_with_bid_outstanding() {
         let mut q = make_quoter();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
 
         q.mark_ask_filled();
 
@@ -509,7 +531,8 @@ mod tests {
     #[test]
     fn mark_ask_filled_without_bid_goes_idle() {
         let mut q = make_quoter();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
         q.bid_cl_ord_id = None; // simulate bid already gone
 
         q.mark_ask_filled();
@@ -520,7 +543,8 @@ mod tests {
     #[test]
     fn mark_cancelled_bid_only() {
         let mut q = make_quoter();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
 
         q.mark_cancelled("bid-1");
 
@@ -534,7 +558,8 @@ mod tests {
     #[test]
     fn mark_cancelled_both_sides_goes_idle() {
         let mut q = make_quoter();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
 
         q.mark_cancelled("bid-1");
         q.mark_cancelled("ask-1");
@@ -548,12 +573,145 @@ mod tests {
     #[test]
     fn mark_cancelled_unknown_id_is_noop() {
         let mut q = make_quoter();
-        q.mark_quoted(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
 
         q.mark_cancelled("unknown-id");
 
         assert_eq!(q.state, QuoteState::Quoting);
         assert_eq!(q.bid_cl_ord_id.as_deref(), Some("bid-1"));
         assert_eq!(q.ask_cl_ord_id.as_deref(), Some("ask-1"));
+    }
+
+    // ---------------------------------------------------------------
+    // Pending state tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn pending_transition_both_acked_becomes_quoting() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        assert_eq!(q.state, QuoteState::Pending);
+
+        q.try_transition_from_pending(true);
+        assert_eq!(q.state, QuoteState::Quoting);
+    }
+
+    #[test]
+    fn pending_transition_not_acked_stays_pending() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        q.try_transition_from_pending(false);
+        assert_eq!(q.state, QuoteState::Pending);
+    }
+
+    #[test]
+    fn pending_bid_filled_stays_pending_if_ask_exists() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        q.mark_bid_filled();
+
+        assert_eq!(q.state, QuoteState::Pending, "Should stay Pending while ask is unacked");
+        assert!(q.bid_cl_ord_id.is_none());
+        assert_eq!(q.ask_cl_ord_id.as_deref(), Some("ask-1"));
+    }
+
+    #[test]
+    fn pending_bid_filled_goes_idle_if_no_ask() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.ask_cl_ord_id = None; // simulate ask already gone
+
+        q.mark_bid_filled();
+
+        assert_eq!(q.state, QuoteState::Idle);
+    }
+
+    #[test]
+    fn pending_ask_filled_stays_pending_if_bid_exists() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        q.mark_ask_filled();
+
+        assert_eq!(q.state, QuoteState::Pending, "Should stay Pending while bid is unacked");
+        assert!(q.ask_cl_ord_id.is_none());
+        assert_eq!(q.bid_cl_ord_id.as_deref(), Some("bid-1"));
+    }
+
+    #[test]
+    fn pending_both_filled_goes_idle() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        q.mark_bid_filled();
+        q.mark_ask_filled();
+
+        assert_eq!(q.state, QuoteState::Idle);
+    }
+
+    #[test]
+    fn pending_after_bid_filled_ack_transitions_to_bid_filled() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        // Bid fills (ask still pending)
+        q.mark_bid_filled();
+        assert_eq!(q.state, QuoteState::Pending);
+
+        // Ask gets acked — all remaining orders acked
+        q.try_transition_from_pending(true);
+        assert_eq!(q.state, QuoteState::BidFilled);
+    }
+
+    #[test]
+    fn pending_after_ask_filled_ack_transitions_to_ask_filled() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        q.mark_ask_filled();
+        assert_eq!(q.state, QuoteState::Pending);
+
+        q.try_transition_from_pending(true);
+        assert_eq!(q.state, QuoteState::AskFilled);
+    }
+
+    #[test]
+    fn pending_cancelled_one_side_stays_pending() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        q.mark_cancelled("bid-1");
+        // One side still exists, mark_cancelled doesn't go Idle
+        assert!(q.bid_cl_ord_id.is_none());
+        assert_eq!(q.ask_cl_ord_id.as_deref(), Some("ask-1"));
+        // State is still Pending (mark_cancelled doesn't change from Pending
+        // since ask_cl_ord_id is still Some)
+        assert_eq!(q.state, QuoteState::Pending);
+    }
+
+    #[test]
+    fn pending_cancelled_both_sides_goes_idle() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+
+        q.mark_cancelled("bid-1");
+        q.mark_cancelled("ask-1");
+
+        assert_eq!(q.state, QuoteState::Idle);
+    }
+
+    #[test]
+    fn try_transition_noop_when_not_pending() {
+        let mut q = make_quoter();
+        q.mark_pending(dec!(1.0), "bid-1".into(), "ask-1".into(), Utc::now());
+        q.try_transition_from_pending(true);
+        assert_eq!(q.state, QuoteState::Quoting);
+
+        // Calling again when already Quoting should be a no-op
+        q.try_transition_from_pending(true);
+        assert_eq!(q.state, QuoteState::Quoting);
     }
 }
