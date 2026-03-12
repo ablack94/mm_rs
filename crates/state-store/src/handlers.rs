@@ -208,6 +208,9 @@ pub async fn patch_pair(
         if let Some(v) = cfg.use_winddown_for_stoploss {
             pair.config.use_winddown_for_stoploss = v;
         }
+        if let Some(v) = cfg.limit_unwind_on_stoploss {
+            pair.config.limit_unwind_on_stoploss = v;
+        }
     }
 
     // Merge disabled_reason: if the field is present in the JSON body, update it
@@ -324,6 +327,9 @@ pub async fn patch_defaults(
     }
     if let Some(v) = body.use_winddown_for_stoploss {
         s.store_data.defaults.use_winddown_for_stoploss = v;
+    }
+    if let Some(v) = body.limit_unwind_on_stoploss {
+        s.store_data.defaults.limit_unwind_on_stoploss = v;
     }
 
     if let Err(e) = s.persist().await {

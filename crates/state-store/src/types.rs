@@ -139,6 +139,8 @@ pub struct PatchPairConfig {
     pub max_buys_before_sell: Option<Option<u32>>,
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
     pub use_winddown_for_stoploss: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    pub limit_unwind_on_stoploss: Option<Option<bool>>,
 }
 
 /// Deserialize a field that can be:
@@ -180,6 +182,7 @@ pub struct PatchDefaultsRequest {
     pub take_profit_pct: Option<Decimal>,
     pub max_buys_before_sell: Option<u32>,
     pub use_winddown_for_stoploss: Option<bool>,
+    pub limit_unwind_on_stoploss: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

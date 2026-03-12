@@ -72,6 +72,7 @@ impl Engine {
             take_profit_pct: config.risk.take_profit_pct,
             max_buys_before_sell: 2,
             use_winddown_for_stoploss: true,
+            limit_unwind_on_stoploss: false,
         };
 
         // Build ManagedPair for each pair_info entry
@@ -222,6 +223,188 @@ impl Engine {
         }
     }
 
+    /// Reconcile positions with actual exchange balances.
+    /// If the exchange balance is higher than our tracked position, bump qty up.
+    /// This handles cases where the proxy missed fills from before it started.
+    /// Preserves avg_cost from proxy restore (only adjusts qty upward).
+    pub fn reconcile_with_balances(&mut self, balances: &HashMap<String, Decimal>) {
+        let asset_to_pair: HashMap<String, Ticker> = self.pairs.iter()
+            .filter_map(|(pair, mp)| {
+                mp.pair_info.as_ref().map(|pi| (pi.exchange_base_asset.clone(), pair.clone()))
+            })
+            .collect();
+
+        for (asset, &balance) in balances {
+            if balance.is_zero() {
+                continue;
+            }
+            if let Some(pair) = asset_to_pair.get(asset) {
+                let position = self.state.positions.entry(pair.clone()).or_default();
+                if balance > position.qty {
+                    let delta = balance - position.qty;
+                    tracing::warn!(
+                        pair = %pair,
+                        asset,
+                        tracked_qty = %position.qty,
+                        exchange_balance = %balance,
+                        delta = %delta,
+                        "Exchange balance exceeds tracked position — adjusting up"
+                    );
+                    position.qty = balance;
+                } else if position.qty.is_zero() {
+                    position.qty = balance;
+                    tracing::info!(
+                        pair = %pair,
+                        asset,
+                        qty = %balance,
+                        "Restored position from exchange balance (no proxy data)"
+                    );
+                }
+            }
+        }
+
+        // Initialize buys_without_sell for any pair that has a position.
+        // On restart, the counter resets to 0, but existing inventory means
+        // a buy already happened. Set to 1 so max_buys_before_sell guard works.
+        for (pair, position) in &self.state.positions {
+            if !position.qty.is_zero() {
+                if let Some(mp) = self.pairs.get_mut(pair) {
+                    if mp.buys_without_sell == 0 {
+                        mp.buys_without_sell = 1;
+                        tracing::info!(
+                            pair = %pair,
+                            qty = %position.qty,
+                            "Setting buys_without_sell=1 for existing position (restart recovery)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runtime balance reconciliation: compare exchange balances to tracked positions.
+    /// If exchange balance is higher than our tracked position, adjust up and log a warning.
+    /// If exchange balance is lower than tracked (possible for sells we somehow double-counted),
+    /// adjust down to match reality.
+    /// This is the belt-and-suspenders catch for fills dropped by WS or reconciliation.
+    fn on_balance_update(&mut self, balances: HashMap<String, Decimal>) -> Vec<EngineCommand> {
+        // Build exchange_base_asset → pair map from pair_info
+        let asset_to_pair: HashMap<String, Ticker> = self.pairs.iter()
+            .filter_map(|(pair, mp)| {
+                mp.pair_info.as_ref().map(|pi| (pi.exchange_base_asset.clone(), pair.clone()))
+            })
+            .collect();
+
+        let mut adjusted = false;
+        for (asset, balance) in &balances {
+            if let Some(pair) = asset_to_pair.get(asset) {
+                let position = self.state.positions.entry(pair.clone()).or_default();
+                let tracked_qty = position.qty;
+
+                // Tolerance: ignore tiny differences from rounding (< 0.01% of balance or < 1e-8)
+                let diff = *balance - tracked_qty;
+                let tolerance = (*balance * dec!(0.0001)).max(dec!(0.00000001));
+                if diff.abs() <= tolerance {
+                    continue;
+                }
+
+                if *balance > tracked_qty {
+                    tracing::warn!(
+                        pair = %pair,
+                        asset,
+                        tracked_qty = %tracked_qty,
+                        exchange_balance = %balance,
+                        delta = %diff,
+                        "POSITION DRIFT: exchange balance exceeds tracked — adjusting up (missed fill?)"
+                    );
+                    position.qty = *balance;
+                    // If avg_cost is zero (unknown), leave it — the cost floor will
+                    // use mid price as fallback for sell pricing.
+                    adjusted = true;
+
+                    // If pair is Disabled but now has a real position, override to WindDown
+                    if let Some(mp) = self.pairs.get_mut(pair) {
+                        if mp.state == PairState::Disabled {
+                            let is_dust = mp.pair_info.as_ref().map_or(false, |pi| {
+                                *balance < pi.min_order_qty
+                            });
+                            if !is_dust {
+                                tracing::warn!(
+                                    pair = %pair,
+                                    qty = %balance,
+                                    "Pair is Disabled but holds position (from balance reconciliation) — overriding to WindDown"
+                                );
+                                mp.state = PairState::WindDown;
+                            }
+                        }
+                        // Update buys_without_sell if needed
+                        if mp.buys_without_sell == 0 && !balance.is_zero() {
+                            mp.buys_without_sell = 1;
+                        }
+                    }
+                } else {
+                    // Exchange balance is LOWER than tracked — we over-counted somewhere
+                    tracing::warn!(
+                        pair = %pair,
+                        asset,
+                        tracked_qty = %tracked_qty,
+                        exchange_balance = %balance,
+                        delta = %diff,
+                        "POSITION DRIFT: tracked exceeds exchange balance — adjusting down"
+                    );
+                    position.qty = *balance;
+                    adjusted = true;
+
+                    // If position is now zero, clean up
+                    if balance.is_zero() {
+                        self.state.positions.remove(pair);
+                        // If pair was WindDown and position is now empty, transition to Disabled
+                        if let Some(mp) = self.pairs.get_mut(pair) {
+                            if mp.state == PairState::WindDown {
+                                mp.state = PairState::Disabled;
+                                tracing::info!(
+                                    pair = %pair,
+                                    "WindDown complete (from balance reconciliation) — pair disabled"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check for pairs we track but exchange says zero
+        let tracked_pairs: Vec<Ticker> = self.state.positions.keys().cloned().collect();
+        for pair in tracked_pairs {
+            if let Some(mp) = self.pairs.get(&pair) {
+                if let Some(ref pi) = mp.pair_info {
+                    let exchange_balance = balances.get(&pi.exchange_base_asset).copied().unwrap_or(Decimal::ZERO);
+                    if exchange_balance.is_zero() && !self.state.positions.get(&pair).map_or(true, |p| p.qty.is_zero()) {
+                        let tracked = self.state.positions.get(&pair).map(|p| p.qty).unwrap_or(Decimal::ZERO);
+                        tracing::warn!(
+                            pair = %pair,
+                            tracked_qty = %tracked,
+                            "POSITION DRIFT: exchange has zero balance but we track a position — clearing"
+                        );
+                        self.state.positions.remove(&pair);
+                        adjusted = true;
+                        if let Some(mp) = self.pairs.get_mut(&pair) {
+                            if mp.state == PairState::WindDown {
+                                mp.state = PairState::Disabled;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if adjusted {
+            vec![EngineCommand::PersistState(self.state.clone())]
+        } else {
+            vec![]
+        }
+    }
+
     /// Mark pairs as sell-only (downtrend filter). No new buys will be placed.
     /// Sets their state to WindDown if currently Active.
     pub fn set_sell_only(&mut self, pair_symbols: std::collections::HashSet<Ticker>) {
@@ -281,6 +464,16 @@ impl Engine {
     // Helper: get resolved config for a pair
     fn resolved_config(&self, pair: &Ticker) -> Option<ResolvedConfig> {
         self.pairs.get(pair).map(|mp| mp.resolved_config(&self.global_defaults))
+    }
+
+    /// Whether this pair is in limit-unwind mode: WindDown triggered by stop-loss
+    /// with limit_unwind_on_stoploss enabled. Bypasses cost floor so sells go at market.
+    fn is_limit_unwind(&self, pair: &Ticker) -> bool {
+        self.pairs.get(pair).map_or(false, |mp| {
+            mp.state == PairState::WindDown
+                && mp.winddown_since.is_some()
+                && mp.resolved_config(&self.global_defaults).limit_unwind_on_stoploss
+        })
     }
 
     // Helper: get pair_info for a pair
@@ -415,6 +608,9 @@ impl Engine {
                     }
                 }
                 vec![]
+            }
+            EngineEvent::BalanceUpdate { balances } => {
+                self.on_balance_update(balances)
             }
         }
     }
@@ -1313,13 +1509,10 @@ impl Engine {
 
         if !stale.is_empty() {
             tracing::info!(count = stale.len(), ids = ?stale, "Cancelling stale orders");
-            for id in &stale {
-                if let Some(order) = self.state.open_orders.remove(id) {
-                    if let Some(mp) = self.pairs.get_mut(&order.pair) {
-                        mp.quoter.mark_cancelled(id);
-                    }
-                }
-            }
+            // Don't remove from open_orders or reset quoter here — let the
+            // OrderCancelled event handler do cleanup when the exchange confirms.
+            // Pre-emptive removal caused a race: quoter re-placed orders before
+            // the cancel was processed, leading to "Insufficient balance" rejections.
             cmds.push(EngineCommand::CancelOrders(stale));
         }
 
@@ -1535,8 +1728,32 @@ impl Engine {
                         self.place_fresh_quotes(pair, bid_price, ask_price, qty, mid, timestamp, &risk, pair_state)
                     }
                     QuoteState::Pending => {
-                        tracing::debug!(pair = %pair, "Skipping quote — orders pending ack");
-                        vec![]
+                        // Recover from stuck Pending: if no ack received within 30s, reset to Idle.
+                        // This handles rejected orders with empty cl_ord_id that can't be matched.
+                        let stuck_secs = quoter.last_quote_time
+                            .map(|t| (timestamp - t).num_seconds())
+                            .unwrap_or(0);
+                        if stuck_secs > 30 {
+                            tracing::warn!(
+                                pair = %pair,
+                                stuck_secs,
+                                "Pending timeout — resetting to Idle (likely unmatched rejection)"
+                            );
+                            let mp = self.pairs.get_mut(pair).unwrap();
+                            // Clean up any phantom open orders
+                            if let Some(bid_id) = mp.quoter.bid_cl_ord_id.take() {
+                                self.state.open_orders.remove(&bid_id);
+                            }
+                            if let Some(ask_id) = mp.quoter.ask_cl_ord_id.take() {
+                                self.state.open_orders.remove(&ask_id);
+                            }
+                            mp.quoter.state = QuoteState::Idle;
+                            // Re-quote immediately on next tick
+                            vec![]
+                        } else {
+                            tracing::debug!(pair = %pair, "Skipping quote — orders pending ack");
+                            vec![]
+                        }
                     }
                     QuoteState::Quoting => {
                         let should = quoter.should_requote(mid, &trading);
@@ -1615,20 +1832,31 @@ impl Engine {
         let can_sell = pair_state.allows_sells() && position.qty >= min_qty && position.qty * mid >= min_cost;
         let qty_dp = pair_info.map_or(8, |pi| pi.qty_decimals);
         let sell_qty = if can_sell {
-            // Sell the lesser of our position or the standard order qty.
+            // Sell the entire position — we want to unwind inventory in one shot.
+            // The cost floor ensures every unit sells at a profit.
             // Truncate (floor) to pair's qty precision to avoid exceeding balance.
-            truncate_decimal(qty.min(position.qty), qty_dp)
+            truncate_decimal(position.qty, qty_dp)
         } else {
             Decimal::ZERO
         };
 
         // Cost-anchored sell: never sell below avg_cost * (1 + min_profit_pct)
+        // Unless in limit-unwind mode (stop-loss WindDown), where we sell at market price.
         let price_decimals = pair_info.map_or(8, |pi| pi.price_decimals);
         let resolved = self.resolved_config(pair);
         let min_profit_pct = resolved.as_ref().map_or(self.config.trading.min_profit_pct, |r| r.min_profit_pct);
-        let (ask_price, can_sell) = if !position.avg_cost.is_zero() && can_sell {
+        let limit_unwind = self.is_limit_unwind(pair);
+        let (ask_price, can_sell) = if limit_unwind {
+            tracing::info!(
+                pair = %pair,
+                book_ask = %ask_price,
+                avg_cost = %position.avg_cost,
+                "Limit unwind: bypassing cost floor for stop-loss WindDown"
+            );
+            (ask_price, can_sell)
+        } else if !position.avg_cost.is_zero() && can_sell {
             let cost_floor = (position.avg_cost * (Decimal::ONE + min_profit_pct))
-                .round_dp(price_decimals);
+                .round_dp_with_strategy(price_decimals, rust_decimal::RoundingStrategy::AwayFromZero);
             if cost_floor > ask_price {
                 // Check if cost floor is too far above the book ask (market price protection)
                 let book_best_ask = self.books.get(pair).and_then(|b| b.best_ask()).map(|l| l.price);
@@ -1825,13 +2053,17 @@ impl Engine {
     ) -> Vec<EngineCommand> {
         let mut cmds = vec![];
 
-        // Apply cost floor to ask price, but skip if it would trigger market price protection
-        let (ask_price, skip_ask) = {
+        // Apply cost floor to ask price, but skip if it would trigger market price protection.
+        // In limit-unwind mode (stop-loss WindDown), bypass cost floor entirely.
+        let limit_unwind = self.is_limit_unwind(pair);
+        let (ask_price, skip_ask) = if limit_unwind {
+            (ask_price, false)
+        } else {
             let position = self.state.position(pair);
             if !position.avg_cost.is_zero() {
                 let price_decimals = self.pair_info(pair).map_or(8, |pi| pi.price_decimals);
                 let cost_floor = (position.avg_cost * (Decimal::ONE + resolved.min_profit_pct))
-                    .round_dp(price_decimals);
+                    .round_dp_with_strategy(price_decimals, rust_decimal::RoundingStrategy::AwayFromZero);
                 let adjusted = ask_price.max(cost_floor);
                 if cost_floor > ask_price {
                     let book_best_ask = self.books.get(pair).and_then(|b| b.best_ask()).map(|l| l.price);
@@ -1933,13 +2165,15 @@ impl Engine {
         risk: &crate::config::RiskConfig,
         resolved: &ResolvedConfig,
     ) -> Vec<EngineCommand> {
-        // Apply cost floor for sells, but skip if it would trigger market price protection
-        let price = if side == OrderSide::Sell {
+        // Apply cost floor for sells, but skip if it would trigger market price protection.
+        // In limit-unwind mode (stop-loss WindDown), bypass cost floor entirely.
+        let limit_unwind = self.is_limit_unwind(pair);
+        let price = if side == OrderSide::Sell && !limit_unwind {
             let position = self.state.position(pair);
             if !position.avg_cost.is_zero() {
                 let price_decimals = self.pair_info(pair).map_or(8, |pi| pi.price_decimals);
                 let cost_floor = (position.avg_cost * (Decimal::ONE + resolved.min_profit_pct))
-                    .round_dp(price_decimals);
+                    .round_dp_with_strategy(price_decimals, rust_decimal::RoundingStrategy::AwayFromZero);
                 if cost_floor > price {
                     let book_best_ask = self.books.get(pair).and_then(|b| b.best_ask()).map(|l| l.price);
                     let deviation_limit = book_best_ask.unwrap_or(price) * (Decimal::ONE + MAX_ASK_DEVIATION_PCT);
@@ -1996,7 +2230,7 @@ impl Engine {
             }
             vec![]
         } else {
-            // Compute actual order qty (for sells, cap to position)
+            // Compute actual order qty (for sells, use full position)
             let actual_qty = if side == OrderSide::Sell {
                 let position = self.state.position(pair);
                 let pair_info = self.pair_info(pair);
@@ -2007,7 +2241,8 @@ impl Engine {
                     return vec![];
                 }
                 let qty_dp = pair_info.map_or(8, |pi| pi.qty_decimals);
-                truncate_decimal(qty.min(position.qty), qty_dp)
+                // Sell the entire position, not just order_size_usd worth
+                truncate_decimal(position.qty, qty_dp)
             } else {
                 qty
             };

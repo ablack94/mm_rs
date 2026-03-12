@@ -416,6 +416,9 @@ async fn run_private_ws_proxy(
                                 // Extract and record fills in order tracking state
                                 record_ws_fills(&parsed, &order_state_for_upstream).await;
 
+                                // Extract filled cl_ord_ids BEFORE forwarding (need parsed msg)
+                                let filled_ids = extract_filled_cl_ord_ids(&parsed);
+
                                 let kraken_msgs =
                                     translate::coinbase_user_to_proxy_events(&parsed, &mut fill_tracker);
                                 if !kraken_msgs.is_empty() {
@@ -427,14 +430,24 @@ async fn run_private_ws_proxy(
                                         return;
                                     }
                                 }
+                                drop(writer);
+
+                                // Remove filled orders from order_id_map AFTER successfully
+                                // forwarding the fill to the bot. This ensures:
+                                // - If WS delivery succeeded: reconciler won't re-forward (entry gone)
+                                // - If WS delivery failed (returned early above): entry stays, reconciler catches it
+                                remove_filled_from_order_map(&filled_ids, &order_id_map_for_cleanup).await;
                             }
                             "heartbeats" => {
                                 let hb = translate::heartbeat();
                                 let mut writer = bot_write_for_upstream.lock().await;
                                 let _ = writer.send(ws::Message::Text(hb.into())).await;
                             }
+                            "subscriptions" => {
+                                tracing::info!("Coinbase user channel subscription confirmed");
+                            }
                             _ => {
-                                tracing::debug!(channel, "Ignoring Coinbase user WS channel");
+                                tracing::info!(channel, raw = &text_str[..text_str.len().min(300)], "Unknown Coinbase user WS channel");
                             }
                         }
                     }
@@ -982,7 +995,14 @@ async fn reconcile_fills(
     Ok(())
 }
 
-/// Remove entries from order_id_map when orders reach terminal states (filled, cancelled, expired, failed).
+/// Remove entries from order_id_map when orders reach non-fill terminal states.
+///
+/// IMPORTANT: FILLED orders are NOT removed here. They must stay in the map so
+/// the fill reconciler can match them by exchange_order_id when polling REST.
+/// If we removed them here, and the WS fill message was lost/dropped, the
+/// reconciler would skip the fill because it can't map exchange_id -> cl_ord_id.
+/// Filled orders are cleaned up by `remove_filled_from_order_map` after the
+/// fill has been successfully forwarded to the bot via WS.
 async fn cleanup_terminal_orders(
     coinbase_msg: &serde_json::Value,
     order_id_map: &Arc<Mutex<OrderIdMap>>,
@@ -994,6 +1014,7 @@ async fn cleanup_terminal_orders(
     };
 
     let mut to_remove = Vec::new();
+    let mut filled_ids = Vec::new();
     for event in events {
         let orders = match event.get("orders").and_then(|o| o.as_array()) {
             Some(o) => o,
@@ -1002,8 +1023,19 @@ async fn cleanup_terminal_orders(
         for order in orders {
             let status = order.get("status").and_then(|s| s.as_str()).unwrap_or("");
             let cl_ord_id = order.get("client_order_id").and_then(|c| c.as_str()).unwrap_or("");
-            if matches!(status, "FILLED" | "CANCELLED" | "EXPIRED" | "FAILED") && !cl_ord_id.is_empty() {
-                to_remove.push(cl_ord_id.to_string());
+            if cl_ord_id.is_empty() {
+                continue;
+            }
+            match status {
+                // FILLED: keep in order_id_map for reconciler, but update tracking state
+                "FILLED" => {
+                    filled_ids.push(cl_ord_id.to_string());
+                }
+                // Non-fill terminal: safe to remove from order_id_map immediately
+                "CANCELLED" | "EXPIRED" | "FAILED" => {
+                    to_remove.push(cl_ord_id.to_string());
+                }
+                _ => {}
             }
         }
     }
@@ -1013,16 +1045,78 @@ async fn cleanup_terminal_orders(
         for cl_id in &to_remove {
             map.remove(cl_id);
         }
-        tracing::debug!(count = to_remove.len(), remaining = map.len(), "Cleaned terminal orders from order_id_map");
+        tracing::debug!(count = to_remove.len(), remaining = map.len(), "Cleaned cancelled/expired/failed orders from order_id_map");
 
         // Update order tracking state
         let mut orders = order_state.orders.lock().await;
         for cl_id in &to_remove {
-            // Determine the correct terminal status
-            // (We already know it's terminal from the match above, default to Cancelled)
             orders.update_status(cl_id, OrderStatus::Cancelled);
         }
     }
+
+    if !filled_ids.is_empty() {
+        // Update tracking state for filled orders but keep them in order_id_map
+        let mut orders = order_state.orders.lock().await;
+        for cl_id in &filled_ids {
+            orders.update_status(cl_id, OrderStatus::Filled);
+        }
+        tracing::debug!(count = filled_ids.len(), "Marked orders as filled in tracking state (kept in order_id_map for reconciler)");
+    }
+}
+
+/// Extract cl_ord_ids of FILLED orders from a Coinbase WS message.
+/// Used to remove entries from order_id_map AFTER the fill has been
+/// successfully forwarded to the bot (not before).
+fn extract_filled_cl_ord_ids(coinbase_msg: &serde_json::Value) -> Vec<String> {
+    let mut filled = Vec::new();
+    let events = match coinbase_msg.get("events").and_then(|e| e.as_array()) {
+        Some(e) => e,
+        None => return filled,
+    };
+    for event in events {
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Only process update events (snapshots are pre-existing state)
+        if event_type == "snapshot" {
+            continue;
+        }
+        let orders = match event.get("orders").and_then(|o| o.as_array()) {
+            Some(o) => o,
+            None => continue,
+        };
+        for order in orders {
+            let status = order.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status == "FILLED" {
+                if let Some(cl_ord_id) = order.get("client_order_id").and_then(|c| c.as_str()) {
+                    if !cl_ord_id.is_empty() {
+                        filled.push(cl_ord_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    filled
+}
+
+/// Remove filled order entries from order_id_map after the fill has been
+/// successfully forwarded to the bot via WS. This is the safe cleanup path:
+/// the fill event was already sent to the bot, so the reconciler no longer
+/// needs the order_id_map entry.
+async fn remove_filled_from_order_map(
+    filled_cl_ord_ids: &[String],
+    order_id_map: &Arc<Mutex<OrderIdMap>>,
+) {
+    if filled_cl_ord_ids.is_empty() {
+        return;
+    }
+    let mut map = order_id_map.lock().await;
+    for cl_id in filled_cl_ord_ids {
+        map.remove(cl_id);
+    }
+    tracing::debug!(
+        count = filled_cl_ord_ids.len(),
+        remaining = map.len(),
+        "Removed filled orders from order_id_map (fill forwarded to bot)"
+    );
 }
 
 /// Extract fill data from Coinbase user WS events and record in order tracking state.
@@ -1256,8 +1350,21 @@ async fn run_public_ws_proxy(
         let mut backoff_secs = 1u64;
 
         loop {
+            let mut msg_count: u64 = 0;
             while let Some(Ok(msg)) = coinbase_read.next().await {
                 backoff_secs = 1;
+                msg_count += 1;
+                if msg_count <= 10 || msg_count % 500 == 0 {
+                    let mtype = match &msg {
+                        Message::Text(_) => "text",
+                        Message::Binary(_) => "binary",
+                        Message::Ping(_) => "ping",
+                        Message::Pong(_) => "pong",
+                        Message::Close(_) => "close",
+                        _ => "other",
+                    };
+                    tracing::debug!(msg_count, mtype, "Coinbase market WS msg");
+                }
                 match msg {
                     Message::Text(text) => {
                         let text_str = text.to_string();
@@ -1270,16 +1377,38 @@ async fn run_public_ws_proxy(
 
                         match channel {
                             "l2_data" => {
+                                if msg_count == 11 || msg_count == 12 {
+                                    // Dump raw Coinbase message for first update
+                                    let raw = parsed.to_string();
+                                    tracing::warn!(msg_count, raw_len = raw.len(), "RAW l2_data: {}", &raw[..raw.len().min(500)]);
+                                }
                                 let map = product_id_map.lock().await;
-                                if let Some(kraken_msg) = translate::coinbase_book_to_proxy_event_mapped(&parsed, &map) {
-                                    drop(map);
+                                let map_size = map.len();
+                                let msgs = translate::coinbase_book_to_proxy_events_mapped(&parsed, &map);
+                                drop(map);
+                                if msgs.is_empty() && msg_count <= 30 {
+                                    let events_count = parsed.get("events").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0);
+                                    let first_event_type = parsed.get("events").and_then(|e| e.as_array()).and_then(|a| a.first()).and_then(|e| e.get("type")).and_then(|t| t.as_str()).unwrap_or("?");
+                                    let first_product = parsed.get("events").and_then(|e| e.as_array()).and_then(|a| a.first()).and_then(|e| e.get("product_id")).and_then(|t| t.as_str()).unwrap_or("?");
+                                    tracing::warn!(events_count, first_event_type, first_product, msg_count, map_size, "l2_data translated to EMPTY");
+                                }
+                                if !msgs.is_empty() {
                                     let mut writer = bot_write_for_upstream.lock().await;
-                                    if writer
-                                        .send(ws::Message::Text(kraken_msg.into()))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
+                                    for kraken_msg in &msgs {
+                                        match writer
+                                            .send(ws::Message::Text(kraken_msg.clone().into()))
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                if msg_count <= 15 {
+                                                    tracing::debug!(msg_count, msg_len = kraken_msg.len(), "Sent l2_data to bot");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(error = %e, "Failed to send l2_data to bot");
+                                                return;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1300,8 +1429,47 @@ async fn run_public_ws_proxy(
                         let mut writer = bot_write_for_upstream.lock().await;
                         let _ = writer.send(ws::Message::Ping(data.into())).await;
                     }
+                    Message::Binary(data) => {
+                        tracing::debug!(len = data.len(), "Received binary message from Coinbase market WS");
+                        if let Ok(text_str) = std::str::from_utf8(&data) {
+                            let parsed: serde_json::Value = match serde_json::from_str(text_str) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let channel = parsed.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+                            match channel {
+                                "l2_data" => {
+                                    let map = product_id_map.lock().await;
+                                    let msgs = translate::coinbase_book_to_proxy_events_mapped(&parsed, &map);
+                                    drop(map);
+                                    if !msgs.is_empty() {
+                                        let mut writer = bot_write_for_upstream.lock().await;
+                                        for kraken_msg in msgs {
+                                            if writer
+                                                .send(ws::Message::Text(kraken_msg.into()))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                "heartbeats" => {
+                                    let hb = translate::heartbeat();
+                                    let mut writer = bot_write_for_upstream.lock().await;
+                                    let _ = writer.send(ws::Message::Text(hb.into())).await;
+                                }
+                                _ => {
+                                    tracing::debug!(channel, "Binary msg channel");
+                                }
+                            }
+                        }
+                    }
                     Message::Close(_) => break,
-                    _ => {}
+                    _ => {
+                        tracing::debug!("Received other WS message type from Coinbase market WS");
+                    }
                 }
             }
 

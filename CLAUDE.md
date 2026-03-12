@@ -185,3 +185,41 @@ MOCK_UPDATE_INTERVAL_MS=500 cargo run -p mock-exchange
 - US:NJ restricted pairs (SPICE, STEP, EPT) get auto-disabled on first rejection
 - Dust positions below exchange minimums are removed from state (fixed Feb 2026)
 - No-op amends (same price) are skipped to avoid Kraken rejections (fixed Feb 2026)
+
+## Live Ops Role (March 2026)
+
+Claude acts as autonomous ops operator for the Coinbase MM bot. Full authority to:
+
+### Responsibilities
+- **Monitor**: 10-min check-ins (profitability, order churn, errors), hourly full dumps, continuous alert tail
+- **Tune parameters**: Adjust any config via state store REST (PATCH /defaults, PUT /pairs/{pair})
+- **Make code changes**: Fix bugs, improve logic, rebuild + restart as needed
+- **Emergency stop**: Kill bot process if things go sideways (DMS cancels orders within 60s)
+- **Ops diary**: Maintain `/tmp/mm-run/ops_20260309.md` with timestamped notable events
+
+### Current Pair Strategy
+- **OP/USDC** — Primary pair, user is comfortable with risk. Wide spread (80+ bps). When US market volume picks up and consistent buy/sell fill cycles are observed, RAMP UP: increase `order_size_usd`, `max_inventory_usd`, `max_buys_before_sell`. Stack multiple buys to build depth on both sides. This is the volume play.
+- **STRK/USDC** — Small size ($10), conservative. Watch for fills.
+- **EIGEN/USDC** — Small size ($10), has carry-over position from prior session.
+
+### Tuning Guidelines
+- Start conservative, ramp based on observed fill data
+- Requote hysteresis: currently 1.5%, bump higher if orders are churning (Coinbase edit = cancel+replace internally, loses queue priority)
+- min_profit_pct: 0.3% (fast flips, not big margins)
+- use_winddown_for_stoploss: true (graceful exit, not panic market sell)
+- All config changes via state store REST — no rebuild needed for parameter tuning
+
+### Service Topology
+```
+State Store (:3040, token: mm-ops)
+Coinbase Proxy (:8081, token: mm-ops, creds from secret.env via node)
+PnL Analyzer (:3031, read-only against state store)
+Bot (kraken-mm from /tmp/mm-run, logs to /tmp/bot.log)
+```
+
+### Key Operational Notes
+- python3 not available — use `node -e` for JSON extraction
+- /workarea writable by claude user
+- Bot runs from /tmp/mm-run (logs/trades.csv writable there)
+- Coinbase WS user channel: subscription works, but real-time fill delivery unconfirmed — 10s REST poller is the fallback
+- Coinbase order edit API = internal cancel+replace (queue priority lost on every amend)

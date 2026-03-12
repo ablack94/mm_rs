@@ -90,7 +90,7 @@ fn to_decimal(f: f64) -> Decimal {
 /// Translate a Coinbase level2 (l2_data) message to ProxyEvent book format.
 #[cfg(test)]
 pub fn coinbase_book_to_proxy_event(coinbase_msg: &Value) -> Option<String> {
-    coinbase_book_to_proxy_event_mapped(coinbase_msg, &HashMap::new())
+    coinbase_book_to_proxy_events_mapped(coinbase_msg, &HashMap::new()).into_iter().next()
 }
 
 /// Translate a Coinbase level2 (l2_data) message to ProxyEvent book format,
@@ -98,29 +98,73 @@ pub fn coinbase_book_to_proxy_event(coinbase_msg: &Value) -> Option<String> {
 ///
 /// Coinbase merges USD/USDC order books and always returns the base-USD product_id
 /// in level2 data. The mapping allows relabeling (e.g., "DOGE-USD" → "DOGE/USDC").
-pub fn coinbase_book_to_proxy_event_mapped(
+///
+/// Returns a Vec because Coinbase may batch multiple product events in a single
+/// WebSocket message. Each event in the `events` array is translated independently.
+/// Individual update entries that fail to parse are skipped rather than aborting the
+/// entire message.
+pub fn coinbase_book_to_proxy_events_mapped(
     coinbase_msg: &Value,
     product_id_map: &HashMap<String, String>,
-) -> Option<String> {
-    let events = coinbase_msg.get("events")?.as_array()?;
+) -> Vec<String> {
+    let events = match coinbase_msg.get("events").and_then(|e| e.as_array()) {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
 
     for event in events {
-        let event_type = event.get("type")?.as_str()?;
-        let product_id = event.get("product_id")?.as_str()?;
+        let event_type = match event.get("type").and_then(|t| t.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let product_id = match event.get("product_id").and_then(|p| p.as_str()) {
+            Some(p) => p,
+            None => continue,
+        };
         // Use mapped symbol if available, otherwise fall back to simple conversion
         let symbol = product_id_map
             .get(product_id)
             .cloned()
             .unwrap_or_else(|| pairs::to_internal(product_id));
-        let updates = event.get("updates")?.as_array()?;
+        let updates = match event.get("updates").and_then(|u| u.as_array()) {
+            Some(u) => u,
+            None => continue,
+        };
 
         let mut bids = Vec::new();
         let mut asks = Vec::new();
+        let mut skipped = 0u32;
 
         for update in updates {
-            let side = update.get("side")?.as_str()?;
-            let price = Decimal::from_str(update.get("price_level")?.as_str()?).ok()?;
-            let qty = Decimal::from_str(update.get("new_quantity")?.as_str()?).ok()?;
+            let side = match update.get("side").and_then(|s| s.as_str()) {
+                Some(s) => s,
+                None => { skipped += 1; continue; }
+            };
+            let price_str = match update.get("price_level").and_then(|p| p.as_str()) {
+                Some(s) => s,
+                None => { skipped += 1; continue; }
+            };
+            let qty_str = match update.get("new_quantity").and_then(|q| q.as_str()) {
+                Some(s) => s,
+                None => { skipped += 1; continue; }
+            };
+
+            // Try standard decimal parse first, fall back to scientific notation
+            let price = match Decimal::from_str(price_str)
+                .or_else(|_| Decimal::from_scientific(price_str))
+            {
+                Ok(d) => d,
+                Err(_) => { skipped += 1; continue; }
+            };
+            let qty = match Decimal::from_str(qty_str)
+                .or_else(|_| Decimal::from_scientific(qty_str))
+            {
+                Ok(d) => d,
+                Err(_) => { skipped += 1; continue; }
+            };
+
             let level = BookLevel { price, qty };
 
             match side {
@@ -130,16 +174,23 @@ pub fn coinbase_book_to_proxy_event_mapped(
             }
         }
 
+        if skipped > 0 {
+            tracing::warn!(
+                product_id, skipped, total = updates.len(),
+                "Skipped unparseable entries in level2 update"
+            );
+        }
+
         let proxy_event = match event_type {
             "snapshot" => ProxyEvent::book_snapshot(&symbol, bids, asks),
             "update" => ProxyEvent::book_update(&symbol, bids, asks),
             _ => continue,
         };
 
-        return Some(proxy_event.to_json());
+        results.push(proxy_event.to_json());
     }
 
-    None
+    results
 }
 
 /// Translate a Coinbase user channel message to ProxyEvent format.
@@ -823,6 +874,130 @@ mod tests {
                 assert_eq!(error, "Insufficient funds");
             }
             other => panic!("Expected OrderRejected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_batched_multi_product_events() {
+        // Coinbase can batch updates for multiple products in a single message.
+        // Both products should be translated.
+        let coinbase = json!({
+            "channel": "l2_data",
+            "events": [
+                {
+                    "type": "update",
+                    "product_id": "BTC-USD",
+                    "updates": [
+                        {"side": "bid", "price_level": "71000.00", "new_quantity": "0.5", "event_time": "2024-01-01T00:00:00Z"}
+                    ]
+                },
+                {
+                    "type": "update",
+                    "product_id": "OP-USD",
+                    "updates": [
+                        {"side": "ask", "price_level": "0.121", "new_quantity": "100.0", "event_time": "2024-01-01T00:00:00Z"}
+                    ]
+                }
+            ]
+        });
+
+        let results = coinbase_book_to_proxy_events_mapped(&coinbase, &HashMap::new());
+        assert_eq!(results.len(), 2, "Both events should be translated");
+
+        match parse_proxy_event(&results[0]).unwrap() {
+            ProxyEvent::BookUpdate { symbol, bids, .. } => {
+                assert_eq!(symbol, "BTC/USDC");
+                assert_eq!(bids.len(), 1);
+            }
+            other => panic!("Expected BookUpdate for BTC, got {:?}", other),
+        }
+
+        match parse_proxy_event(&results[1]).unwrap() {
+            ProxyEvent::BookUpdate { symbol, asks, .. } => {
+                assert_eq!(symbol, "OP/USDC");
+                assert_eq!(asks.len(), 1);
+            }
+            other => panic!("Expected BookUpdate for OP, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bad_update_entry_skipped_not_fatal() {
+        // A single bad entry in the updates array should be skipped,
+        // not cause the entire message to be dropped.
+        let coinbase = json!({
+            "channel": "l2_data",
+            "events": [{
+                "type": "update",
+                "product_id": "BTC-USD",
+                "updates": [
+                    {"side": "bid", "price_level": "71000.00", "new_quantity": "0.5", "event_time": "2024-01-01T00:00:00Z"},
+                    {"side": "bid", "price_level": null, "new_quantity": "0.1", "event_time": "2024-01-01T00:00:00Z"},
+                    {"side": "ask", "price_level": "71001.00", "new_quantity": "0.3", "event_time": "2024-01-01T00:00:00Z"}
+                ]
+            }]
+        });
+
+        let result = coinbase_book_to_proxy_event(&coinbase).unwrap();
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::BookUpdate { symbol, bids, asks } => {
+                assert_eq!(symbol, "BTC/USDC");
+                assert_eq!(bids.len(), 1, "Good bid should be kept");
+                assert_eq!(asks.len(), 1, "Good ask should be kept");
+            }
+            other => panic!("Expected BookUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scientific_notation_parsed() {
+        // Coinbase might send very small values in scientific notation.
+        let coinbase = json!({
+            "channel": "l2_data",
+            "events": [{
+                "type": "update",
+                "product_id": "PEPE-USD",
+                "updates": [
+                    {"side": "bid", "price_level": "0.0000034", "new_quantity": "1000000", "event_time": "2024-01-01T00:00:00Z"},
+                    {"side": "ask", "price_level": "0.0000035", "new_quantity": "9.7e-7", "event_time": "2024-01-01T00:00:00Z"}
+                ]
+            }]
+        });
+
+        let result = coinbase_book_to_proxy_event(&coinbase).unwrap();
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::BookUpdate { symbol, bids, asks } => {
+                assert_eq!(symbol, "PEPE/USDC");
+                assert_eq!(bids.len(), 1);
+                assert_eq!(asks.len(), 1);
+            }
+            other => panic!("Expected BookUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_empty_string_fields_skipped() {
+        // Empty strings for price/qty should be skipped, not crash.
+        let coinbase = json!({
+            "channel": "l2_data",
+            "events": [{
+                "type": "update",
+                "product_id": "BTC-USD",
+                "updates": [
+                    {"side": "bid", "price_level": "", "new_quantity": "0.5", "event_time": "2024-01-01T00:00:00Z"},
+                    {"side": "ask", "price_level": "71001.00", "new_quantity": "", "event_time": "2024-01-01T00:00:00Z"},
+                    {"side": "ask", "price_level": "71002.00", "new_quantity": "0.2", "event_time": "2024-01-01T00:00:00Z"}
+                ]
+            }]
+        });
+
+        let result = coinbase_book_to_proxy_event(&coinbase).unwrap();
+        match parse_proxy_event(&result).unwrap() {
+            ProxyEvent::BookUpdate { bids, asks, .. } => {
+                assert_eq!(bids.len(), 0, "Bad bid should be skipped");
+                assert_eq!(asks.len(), 1, "Only good ask should be kept");
+            }
+            other => panic!("Expected BookUpdate, got {:?}", other),
         }
     }
 }

@@ -72,18 +72,9 @@ impl ProxyClient {
 
         let mut result = HashMap::new();
         for (pair, data) in positions {
-            let qty: Decimal = data.get("qty")
-                .and_then(|v| v.as_f64())
-                .map(|f| Decimal::try_from(f).unwrap_or_default())
-                .unwrap_or_default();
-            let avg_cost: Decimal = data.get("avg_cost")
-                .and_then(|v| v.as_f64())
-                .map(|f| Decimal::try_from(f).unwrap_or_default())
-                .unwrap_or_default();
-            let realized_pnl: Decimal = data.get("realized_pnl")
-                .and_then(|v| v.as_f64())
-                .map(|f| Decimal::try_from(f).unwrap_or_default())
-                .unwrap_or_default();
+            let qty: Decimal = parse_decimal_json(data.get("qty"));
+            let avg_cost: Decimal = parse_decimal_json(data.get("avg_cost"));
+            let realized_pnl: Decimal = parse_decimal_json(data.get("realized_pnl"));
             result.insert(pair.clone(), (qty, avg_cost, realized_pnl));
         }
         Ok(result)
@@ -245,6 +236,16 @@ fn check_error(resp: &serde_json::Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parse a Decimal from a JSON value that may be a string or a number.
+fn parse_decimal_json(val: Option<&serde_json::Value>) -> Decimal {
+    match val {
+        Some(v) if v.is_string() => v.as_str().and_then(|s| s.parse::<Decimal>().ok()).unwrap_or_default(),
+        Some(v) if v.is_f64() => Decimal::try_from(v.as_f64().unwrap()).unwrap_or_default(),
+        Some(v) if v.is_i64() => Decimal::from(v.as_i64().unwrap()),
+        _ => Decimal::ZERO,
+    }
 }
 
 fn parse_decimal_field(info: &serde_json::Value, field: &str) -> Decimal {

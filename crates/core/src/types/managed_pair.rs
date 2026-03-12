@@ -71,6 +71,7 @@ impl ManagedPair {
             take_profit_pct: self.config.take_profit_pct.unwrap_or(defaults.take_profit_pct),
             max_buys_before_sell: self.config.max_buys_before_sell.unwrap_or(defaults.max_buys_before_sell),
             use_winddown_for_stoploss: self.config.use_winddown_for_stoploss.unwrap_or(defaults.use_winddown_for_stoploss),
+            limit_unwind_on_stoploss: self.config.limit_unwind_on_stoploss.unwrap_or(defaults.limit_unwind_on_stoploss),
         }
     }
 

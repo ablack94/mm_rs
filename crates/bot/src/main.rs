@@ -128,8 +128,8 @@ async fn main() -> Result<()> {
     });
     engine.handle_event(snapshot_event);
 
-    // Restore positions: try proxy-tracked positions first (preserves avg_cost),
-    // fall back to raw exchange balances (loses avg_cost).
+    // Restore positions: proxy positions first (preserves avg_cost),
+    // then reconcile with actual exchange balances (ensures nothing missed).
     if !pairs.is_empty() {
         match proxy_client.get_proxy_positions().await {
             Ok(positions) if !positions.is_empty() => {
@@ -137,19 +137,17 @@ async fn main() -> Result<()> {
                 engine.restore_positions_from_proxy(&positions);
             }
             Ok(_) => {
-                tracing::info!("No proxy positions — falling back to exchange balances");
-                match exchange.get_balances().await {
-                    Ok(balances) => engine.restore_balances(&balances),
-                    Err(e) => tracing::warn!(error = %e, "Failed to fetch balances — positions may be stale"),
-                }
+                tracing::info!("No proxy positions");
             }
             Err(e) => {
-                tracing::info!(error = %e, "Proxy /positions not available — falling back to exchange balances");
-                match exchange.get_balances().await {
-                    Ok(balances) => engine.restore_balances(&balances),
-                    Err(e) => tracing::warn!(error = %e, "Failed to fetch balances — positions may be stale"),
-                }
+                tracing::info!(error = %e, "Proxy /positions not available");
             }
+        }
+        // Always reconcile with actual exchange balances — proxy may undercount
+        // if it missed fills from before it started.
+        match exchange.get_balances().await {
+            Ok(balances) => engine.reconcile_with_balances(&balances),
+            Err(e) => tracing::warn!(error = %e, "Failed to fetch balances for reconciliation"),
         }
     }
 
@@ -305,14 +303,24 @@ async fn run_dry(
     // Spawn book feed reader with dynamic subscription support
     let tx = event_tx.clone();
     let book_handle = tokio::spawn(async move {
+        let mut book_msg_count: u64 = 0;
         loop {
             tokio::select! {
                 raw = pub_reader.recv() => {
                     match raw {
                         Some(text) => {
+                            book_msg_count += 1;
+                            if book_msg_count <= 15 || book_msg_count % 100 == 0 {
+                                tracing::info!(book_msg_count, text_len = text.len(), "Book feed msg received");
+                            }
                             let event = match parse_proxy_event(&text) {
                                 Ok(e) => e,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    if book_msg_count <= 20 {
+                                        tracing::warn!(book_msg_count, error = %e, text_preview = &text[..text.len().min(100)], "Book feed parse error");
+                                    }
+                                    continue;
+                                }
                             };
                             let engine_event = match event {
                                 ProxyEvent::BookSnapshot { symbol, bids, asks } => {
@@ -556,6 +564,8 @@ async fn run_live(
     // Clear any ghost orders from previous sessions (one-time cleanup)
     tracing::info!("Cancelling any leftover orders from previous sessions...");
     live.cancel_all().await?;
+    // Wait for exchange to process cancellations and release locked balances
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Channel for dynamic book subscriptions (new pairs discovered via state store)
     let (book_sub_tx, book_sub_rx) = mpsc::channel::<Vec<String>>(16);
@@ -564,6 +574,9 @@ async fn run_live(
     let pair_strings: Vec<String> = pairs.iter().map(|t| t.to_string()).collect();
     let book_handle = live.spawn_book_feed(event_tx.clone(), &pair_strings, Some(book_sub_rx)).await?;
     let ticker_handle = live.spawn_ticker(event_tx.clone(), 10);
+
+    // Clone exchange before it's moved into the state store forward task
+    let balance_exchange = exchange.clone();
 
     // Forward state store commands to the engine, enriching new pairs with pair_info
     let tx_ss = event_tx.clone();
@@ -627,6 +640,29 @@ async fn run_live(
                 }
                 // Track as known even if pair_info fetch failed, to avoid retrying every message
                 known_pairs.extend(new_pairs);
+            }
+        }
+    });
+
+    // Spawn periodic balance reconciliation — catches any fills missed by WS/reconciler.
+    // Runs every 30 seconds, fetches actual exchange balances, and sends them to the engine
+    // for comparison against tracked positions.
+    let balance_tx = event_tx.clone();
+    let balance_handle = tokio::spawn(async move {
+        // Wait 15 seconds before first reconciliation to let startup settle
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            match balance_exchange.get_balances().await {
+                Ok(balances) => {
+                    if balance_tx.send(EngineEvent::BalanceUpdate { balances }).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Balance reconciliation fetch failed");
+                }
             }
         }
     });
@@ -727,6 +763,7 @@ async fn run_live(
     book_handle.abort();
     ticker_handle.abort();
     ss_forward_handle.abort();
+    balance_handle.abort();
     live.abort_tasks().await;
     drop(event_tx);
 

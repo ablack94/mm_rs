@@ -52,6 +52,8 @@ pub struct PairConfig {
     pub max_buys_before_sell: Option<u32>,
     /// Whether stop-loss should use WindDown (limit sells) instead of market liquidation.
     pub use_winddown_for_stoploss: Option<bool>,
+    /// Whether to bypass cost floor during stop-loss-triggered WindDown (sell at market as limit order).
+    pub limit_unwind_on_stoploss: Option<bool>,
 }
 
 /// Global defaults used when a pair's config field is None.
@@ -68,6 +70,8 @@ pub struct GlobalDefaults {
     pub max_buys_before_sell: u32,
     #[serde(default = "default_use_winddown_for_stoploss")]
     pub use_winddown_for_stoploss: bool,
+    #[serde(default)]
+    pub limit_unwind_on_stoploss: bool,
 }
 
 fn default_max_buys_before_sell() -> u32 {
@@ -91,6 +95,7 @@ impl Default for GlobalDefaults {
             take_profit_pct: dec!(0.10),
             max_buys_before_sell: 2,
             use_winddown_for_stoploss: true,
+            limit_unwind_on_stoploss: false,
         }
     }
 }
@@ -107,6 +112,7 @@ pub struct ResolvedConfig {
     pub take_profit_pct: Decimal,
     pub max_buys_before_sell: u32,
     pub use_winddown_for_stoploss: bool,
+    pub limit_unwind_on_stoploss: bool,
 }
 
 #[cfg(test)]

@@ -52,6 +52,13 @@ pub enum EngineEvent {
     PairInfoFetched {
         info: HashMap<Ticker, PairInfo>,
     },
+    /// Periodic balance snapshot from exchange. Used to reconcile the engine's
+    /// position tracker with actual exchange balances, catching any fills that
+    /// were dropped by WS or reconciliation.
+    BalanceUpdate {
+        /// Asset name → balance (e.g., "PEPE" → 29455081)
+        balances: HashMap<String, rust_decimal::Decimal>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

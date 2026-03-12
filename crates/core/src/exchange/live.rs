@@ -442,12 +442,19 @@ async fn run_book_feed_dynamic(
     }
 
     let mut sub_rx = sub_rx;
+    let mut ws_msg_count: u64 = 0;
     loop {
         let ws_msg = if let Some(ref mut rx) = sub_rx {
             tokio::select! {
                 raw = reader.recv() => {
                     match raw {
-                        Some(text) => Some(text),
+                        Some(text) => {
+                            ws_msg_count += 1;
+                            if ws_msg_count <= 15 || ws_msg_count % 200 == 0 {
+                                tracing::info!(ws_msg_count, text_len = text.len(), "Book WS msg");
+                            }
+                            Some(text)
+                        },
                         None => break,
                     }
                 }
